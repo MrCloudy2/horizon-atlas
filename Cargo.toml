@@ -1,0 +1,15 @@
+[package]
+name = "horizon-waypoints"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "Waypoints for Horizon: N to create, M to list, names and distances in the world"
+publish = false
+
+[lib]
+# This exact source is also injected as the `crate::game::waypoints_mod`
+# module of Horizon's client by horizon-mixins.
+path = "mixins/waypoints/runtime.rs"
+
+[workspace]
