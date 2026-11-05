@@ -293,12 +293,20 @@ impl Scan<'_> {
                 // See-through: the bottom shows under shallow water.
                 let under = self.look(x, below, z);
                 let bottom = self.color(under, x, below, z);
-                let a = (0.5 + f32::from(depth) * 0.05).min(0.92);
-                let ch = |s: u32| {
-                    let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
-                    ((w * a + g * (1.0 - a)).round() as u32) << s
+                // In steps, measured from Xaero's map.
+                let a = match depth {
+                    0 | 1 => 0.72,
+                    2 => 0.86,
+                    3 => 0.94,
+                    _ => 1.0,
                 };
-                rgb = ch(16) | ch(8) | ch(0);
+                // The map grades water apart from land: the bottom is graded
+                // as land here, undoing the water's grade to come.
+                let ch = |s: u32, land: f32| {
+                    let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
+                    ((w * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
+                };
+                rgb = ch(16, 0.84) | ch(8, 1.06) | ch(0, 1.2);
             }
             return (m::WATER | rgb, y as i16, depth);
         }

@@ -161,10 +161,10 @@ impl DotKind {
     /// White players, yellow mobs, red items, purple the rest.
     pub fn color(self) -> u32 {
         match self {
-            DotKind::Player => 0xFFF6_F6F6,
-            DotKind::Mob => 0xFFF2_CE52,
-            DotKind::Item => 0xFFE8_6A58,
-            DotKind::Other => 0xFFB8_84EE,
+            DotKind::Player => 0xFFFF_FFFF,
+            DotKind::Mob => 0xFFFF_F050,
+            DotKind::Item => 0xFFFF_2020,
+            DotKind::Other => 0xFFB8_60FF,
         }
     }
     fn layer(self) -> u8 {
@@ -249,6 +249,12 @@ pub fn fade(argb: u32, light: f32, near: f32) -> u32 {
     let alpha = (f32::from(a) * (0.3 + 0.7 * near)).round() as u32;
     let ch = |c: u8| (f32::from(c) * light).round().clamp(0.0, 255.0) as u32;
     alpha << 24 | ch(r) << 16 | ch(g) << 8 | ch(b)
+}
+
+/// A diamond `r` from the middle to each point.
+pub fn diamond(draws: &mut Vec<Draw>, at: [f32; 2], r: f32, argb: u32) {
+    let [x, y] = at;
+    draws.push(Draw::Quad([[x, y - r], [x + r, y], [x, y + r], [x - r, y]], argb));
 }
 
 /// A round dot of radius `r` at `at` (an octagon: three quads).
@@ -620,21 +626,34 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
     } else if color & KIND == WATER {
         if how.transparency { 1.0 - f32::from(depth.min(14)) * 0.012 } else { 1.0 }
     } else {
-        // A soft curve: a one block step is a gentle change, a cliff no
-        // harsher than a few blocks, so rough ground doesn't turn to noise.
-        let dn = f32::from(height - north.unwrap_or(height));
-        let dw = f32::from(height - west.unwrap_or(height));
-        let k = [0.0, 1.0, 1.7][how.slopes.min(2)];
-        let lit = ((dn + dw * 0.6) / 3.0).tanh();
-        let slope = 1.0 + k * if lit < 0.0 { lit * 0.2 } else { lit * 0.15 };
-        let up = if how.terrain_depth { (f32::from(height) - 64.0) / 512.0 } else { 0.0 };
-        slope * (1.0 + up.clamp(-0.15, 0.15))
+        // As Xaero's, measured from its map: flat ground is one even colour
+        // and each step in height a crisp line. The light comes from the
+        // north west: a block under a higher north neighbour is in hard
+        // shadow, under a higher west neighbour in soft shadow.
+        let dn = height - north.unwrap_or(height);
+        let dw = height - west.unwrap_or(height);
+        let shadow = if dn < 0 {
+            0.57
+        } else if dw < 0 {
+            0.83
+        } else if dn > 0 || dw > 0 {
+            1.08
+        } else {
+            1.0
+        };
+        let k = [0.0, 1.0, 1.3][how.slopes.min(2)];
+        let slope = 1.0 + (shadow - 1.0) * k;
+        // Flats in even bands by height.
+        let band = (f32::from(height) - 62.0).div_euclid(16.0);
+        let up = if how.terrain_depth { (band * 0.06).clamp(-0.12, 0.12) } else { 0.0 };
+        slope * (1.0 + up)
     };
-    // A touch less saturated than the textures: a softer, cleaner map.
+    // The colour grade from the blocks' averages to Xaero's: measured on
+    // grass, sand and gravel of the same world.
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
-    let grey = r * 0.3 + g * 0.59 + b * 0.11;
-    let ch = |c: f32| ((c * 0.9 + grey * 0.1) * f).round().clamp(0.0, 255.0) as u8;
-    [ch(r), ch(g), ch(b), 255]
+    let grade = if color & KIND == WATER { [1.0, 0.81, 0.75] } else { [0.84, 0.86, 0.9] };
+    let ch = |c: f32, grade: f32| (c * grade * f).round().clamp(0.0, 255.0) as u8;
+    [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
 }
 
 /// The colour of column `(x, z)` from `column`, shaded against the columns
@@ -3931,12 +3950,11 @@ impl State {
                     }
                     _ => {
                         let r = if d.kind == DotKind::Player { dot * 1.3 } else { dot };
-                        // A soft shadow, a shaded body and a lit top.
+                        // A diamond with a black outline, as Xaero's.
                         let light = 0.35 + 0.65 * near;
-                        disc(&mut draws, p, r + 0.7, fade(0x7010_1018, 1.0, near));
-                        disc(&mut draws, p, r, fade(d.kind.color(), light * 0.7, near));
-                        let lit = [p[0] - r * 0.18, p[1] - r * 0.18];
-                        disc(&mut draws, lit, r * 0.62, fade(d.kind.color(), light, near));
+                        let r = r * 1.5;
+                        diamond(&mut draws, p, r + 0.8, fade(0xFF00_0000, 1.0, near));
+                        diamond(&mut draws, p, r, fade(d.kind.color(), light, near));
                     }
                 }
                 let wanted = st.names == 2 || (st.names == 1 && d.kind == DotKind::Player);
@@ -4887,10 +4905,9 @@ mod tests {
         assert_eq!(texts, ["F", "N", "E", "S", "W", "0, 64, 0", "Dark Forest", "Day 1, 12:00"]);
         assert!(draws.iter().any(|d| matches!(d, Draw::ModImage(..))));
         // The near mob's dot shows; the far item's doesn't.
-        // A dot is three quads.
         let yellow = draws.iter().filter(|d| matches!(d, Draw::Quad(_, c) if *c == DotKind::Mob.color())).count();
         let red = draws.iter().filter(|d| matches!(d, Draw::Quad(_, c) if *c == DotKind::Item.color())).count();
-        assert_eq!((yellow, red), (3, 0));
+        assert_eq!((yellow, red), (1, 0));
         // The far waypoint's letter sits on the right edge.
         let at = draws
             .iter()
@@ -5002,14 +5019,20 @@ mod tests {
             Shading { slopes: 0, terrain_depth: false, transparency: true },
             Shading { slopes: 2, terrain_depth: false, transparency: true },
         );
-        let at = |how| shade(LAND | 0x808080, 70, Some(68), Some(70), 0, how)[0];
-        assert_eq!(at(flat), 0x80);
-        assert!(at(Shading { slopes: 1, ..flat }) > 0x80);
-        assert!(at(strong) > at(Shading { slopes: 1, ..flat }));
+        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, 0, how)[0];
+        let flat_at = at(flat, Some(68), Some(70));
+        assert_eq!(flat_at, 108, "the grade alone");
+        let normal = Shading { slopes: 1, ..flat };
+        assert!(at(normal, Some(68), Some(70)) > flat_at, "lit");
+        assert!(at(strong, Some(68), Some(70)) > at(normal, Some(68), Some(70)));
+        // A higher north neighbour is hard shadow, a higher west one soft.
+        let (hard, soft) = (at(normal, Some(71), Some(70)), at(normal, Some(70), Some(71)));
+        assert!(hard < soft && soft < flat_at);
+        assert_eq!(hard, 61);
         // Deep water is darker unless transparency is off.
         let water = |how| shade(WATER | 0x808080, 60, None, None, 10, how)[0];
-        assert!(water(flat) < 0x80);
-        assert_eq!(water(Shading { transparency: false, ..flat }), 0x80);
+        assert!(water(flat) < 128);
+        assert_eq!(water(Shading { transparency: false, ..flat }), 128);
         // Auto waits for the timer; other modes don't.
         let mut s = State::default();
         s.want_cut(Cut::Below(31));
@@ -5195,7 +5218,7 @@ mod tests {
 
     /// Everything the logic draws and decides, for settings `st`.
     fn everything(st: Settings) -> String {
-        let h = Here { pos: [8.5, 64.0, 8.5], dimension: OVERWORLD.into(), yaw: 30.0 };
+        let h = Here { pos: [8.5, 100.0, 8.5], dimension: OVERWORLD.into(), yaw: 30.0 };
         let info = MiniInfo {
             biome: Some("minecraft:plains".into()),
             day_time: Some(18000),
@@ -5203,12 +5226,12 @@ mod tests {
             weather: Some((0.0, 0.0)),
         };
         let dots = [
-            Dot { pos: [12.0, 64.0, 8.0], kind: DotKind::Mob, icon: Icon::Mob("minecraft:zombie".into()), name: Some("Zombie".into()) },
-            Dot { pos: [4.0, 90.0, 8.0], kind: DotKind::Player, icon: Icon::Skin("s".into()), name: Some("P".into()) },
-            Dot { pos: [8.0, 200.0, 12.0], kind: DotKind::Item, icon: Icon::Item("minecraft:apple".into()), name: Some("Apple".into()) },
-            Dot { pos: [8.0, 66.0, 4.0], kind: DotKind::Other, icon: Icon::None, name: Some("Boat".into()) },
+            Dot { pos: [12.0, 100.0, 8.0], kind: DotKind::Mob, icon: Icon::Mob("minecraft:zombie".into()), name: Some("Zombie".into()) },
+            Dot { pos: [4.0, 126.0, 8.0], kind: DotKind::Player, icon: Icon::Skin("s".into()), name: Some("P".into()) },
+            Dot { pos: [8.0, 236.0, 12.0], kind: DotKind::Item, icon: Icon::Item("minecraft:apple".into()), name: Some("Apple".into()) },
+            Dot { pos: [8.0, 102.0, 4.0], kind: DotKind::Other, icon: Icon::None, name: Some("Boat".into()) },
         ];
-        let camera = Camera { pos: [8.5, 65.6, 8.5], yaw: 0.0, pitch: 5.0, fov: 70.0 };
+        let camera = Camera { pos: [8.5, 101.6, 8.5], yaw: 0.0, pitch: 5.0, fov: 70.0 };
         let gui = [480.0, 270.0];
         let mut out = String::new();
         for (enlarged, cut, tab, picked) in [
@@ -5226,8 +5249,8 @@ mod tests {
             s.selected = picked;
             s.faces.insert("minecraft:zombie".into(), [0.0, 0.0, 8.0, 8.0]);
             s.face_slot = Some(1);
-            let mut t = grass(64);
-            t.height[5] = 70;
+            let mut t = grass(100);
+            t.height[5] = 106;
             t.color[9] = WATER | 0x3F_76E4;
             t.depth[9] = 9;
             s.maps.store(cut).put(0, 0, t);
@@ -5235,7 +5258,7 @@ mod tests {
                 s.waypoints.push(Waypoint {
                     name: "Wp".into(),
                     // 120 blocks off and 11 degrees to the side.
-                    pos: [32 + i as i32, 66, 128 + i as i32 * 900],
+                    pos: [32 + i as i32, 102, 128 + i as i32 * 900],
                     set: if i == 0 { DEFAULT_SET.into() } else { set.into() },
                     ..Waypoint::default()
                 });
@@ -5243,7 +5266,7 @@ mod tests {
             s.update_minimap_lit(8.5, 8.5, 30.0, &|_, _, _| 4);
             s.mini_ready = true;
             let image: u64 = s.mini_image.iter().fold(7, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
-            let shown = s.visible_dots(dots.to_vec(), 64.0);
+            let shown = s.visible_dots(dots.to_vec(), 100.0);
             let hud = s.minimap_hud(gui, [0.0, 0.0], &h, &info, &shown, &measure);
             let labels = s.labels(camera, h.pos, OVERWORLD, gui, &measure);
             s.open_list(None);
