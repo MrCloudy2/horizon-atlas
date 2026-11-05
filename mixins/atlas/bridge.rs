@@ -594,9 +594,18 @@ pub(super) fn paint(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
                 batch.text_styled(&game.gui.atlas, &text, at[0], at[1], color, shadow);
                 batch.scale_since(start, at[0], at[1], scale, scale);
             }
-            m::Draw::Image(slot, src, dst) => {
-                if let Some(name) = horizon_client::hud::map_slot_sprite(slot) {
-                    game.native_sprite(batch, name, src, dst);
+            m::Draw::Image(slot, src, dst, tint) => {
+                let rect = horizon_client::hud::map_slot_sprite(slot)
+                    .and_then(|name| game.gui.atlas.sprites.get(name).copied());
+                if let Some(mut r) = rect {
+                    let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
+                    r.u0 += src[0] * du;
+                    r.v0 += src[1] * dv;
+                    r.u1 = r.u0 + src[2] * du;
+                    r.v1 = r.v0 + src[3] * dv;
+                    let [a, red, g, bl] = tint.to_be_bytes();
+                    let color = horizon_client::hud::rgba(red, g, bl, a);
+                    batch.rect_uv(dst[0], dst[1], dst[2], dst[3], r, color);
                 }
             }
         }
@@ -641,8 +650,11 @@ pub(super) fn hud(
     if !settings.minimap || m::with(|s| s.map_visible()) {
         return;
     }
+    if settings.hide_under_screen && !game.native_playing() {
+        return;
+    }
     let corner = horizon_client::extras::Corner::ALL[settings.corner.min(3)];
-    if !game.native_corner_shown(corner) {
+    if settings.hide_under_f3 && !game.native_corner_shown(corner) {
         return;
     }
     let p = horizon_core::geometry::Vec3::new(here.pos[0], here.pos[1], here.pos[2]);
@@ -650,7 +662,7 @@ pub(super) fn hud(
         biome: game.biome_name_at(p),
         day_time: game.native_clock().map(|c| c.day_time),
     };
-    let reach = f64::from(m::MINI as u32) * f64::from(settings.zoom);
+    let reach = f64::from(m::MINI as u32) * f64::from(m::with(|s| s.mini_zoom()));
     let dots = if settings.dots {
         let all = dots(game, &here, reach);
         m::with(|s| s.visible_dots(all, here.pos[1]))
@@ -658,7 +670,12 @@ pub(super) fn hud(
         Vec::new()
     };
     let [w, h] = m::with(|s| s.minimap_box(gui, &here, &info, &measure));
-    let (x, y) = corners.place(corner, w, h);
+    let centered = settings.center_enlarged && m::with(|s| s.enlarged);
+    let (x, y) = if centered {
+        ((gui[0] - w) / 2.0, (gui[1] - h) / 2.0)
+    } else {
+        corners.place(corner, w, h)
+    };
     let draws = m::with(|s| s.minimap_hud(gui, [x, y], &here, &info, &dots, &measure));
     paint(game, batch, draws);
 }

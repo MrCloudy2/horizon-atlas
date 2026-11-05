@@ -3,7 +3,25 @@
 // settings key (Y) the settings screen.
 fn atlas_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     use crate::game::atlas_mod as m;
-    if !pressed || !game.native_on(m::ID) || !game.native_playing() {
+    if !game.native_on(m::ID) {
+        return;
+    }
+    // The enlarge key is heard going up too, wherever that happens.
+    if key == game.native_mod_key(m::ID, m::KEY_ENLARGE, m::DEFAULT_ENLARGE) {
+        if !pressed || game.native_playing() {
+            m::with(|s| s.enlarge_key(pressed));
+        }
+        return;
+    }
+    if !pressed || !game.native_playing() {
+        return;
+    }
+    if key == game.native_mod_key(m::ID, m::KEY_ZOOM_IN, m::DEFAULT_ZOOM_IN) {
+        m::with(|s| s.zoom_key(true));
+        return;
+    }
+    if key == game.native_mod_key(m::ID, m::KEY_ZOOM_OUT, m::DEFAULT_ZOOM_OUT) {
+        m::with(|s| s.zoom_key(false));
         return;
     }
     let map = game.native_mod_key(m::ID, m::KEY_MAP, m::DEFAULT_MAP);

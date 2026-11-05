@@ -30,6 +30,12 @@ pub const SETTINGS_FILE: &str = "settings.txt";
 /// The keys' names and defaults (`key.atlas.map` in `horizon-mods.txt`).
 pub const KEY_SETTINGS: &str = "settings";
 pub const DEFAULT_SETTINGS: &str = "key.keyboard.y";
+pub const KEY_ENLARGE: &str = "enlarge";
+pub const DEFAULT_ENLARGE: &str = "key.keyboard.z";
+pub const KEY_ZOOM_IN: &str = "zoom_in";
+pub const DEFAULT_ZOOM_IN: &str = "key.keyboard.right.bracket";
+pub const KEY_ZOOM_OUT: &str = "zoom_out";
+pub const DEFAULT_ZOOM_OUT: &str = "key.keyboard.left.bracket";
 pub const KEY_MAP: &str = "map";
 pub const KEY_CREATE: &str = "create";
 pub const KEY_LIST: &str = "list";
@@ -145,12 +151,12 @@ pub struct Dot {
 /// What a hook draws, in GUI pixels: a filled `[x, y, w, h]` in ARGB, a
 /// line of text at its top left in RGB with or without a shadow, part `src`
 /// (`[x, y, w, h]` in texels) of the image in map texture slot `slot`
-/// stretched into `dst`, or a four-cornered shape in ARGB.
+/// stretched into `dst` and tinted ARGB, or a four-cornered shape in ARGB.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Draw {
     Fill([f32; 4], u32),
     Text(String, [f32; 2], u32, bool),
-    Image(usize, [f32; 4], [f32; 4]),
+    Image(usize, [f32; 4], [f32; 4], u32),
     Quad([[f32; 2]; 4], u32),
     /// A vanilla GUI sprite (`gui/sprites/widget/button`) nine-sliced into a
     /// rectangle, tinted ARGB.
@@ -1048,6 +1054,41 @@ macro_rules! settings {
 
 const SHAPES: &[(&str, &str)] = &[("square", "Square"), ("round", "Round")];
 const STYLES: &[(&str, &str)] = &[("frame", "Default"), ("thin", "Thin"), ("none", "None")];
+const ENLARGED_ZOOMS: &[(&str, &str)] = &[
+    ("auto", "Auto"),
+    ("0.5", "0.5"),
+    ("1", "1"),
+    ("2", "2"),
+    ("4", "4"),
+    ("8", "8"),
+];
+const FRAME_COLORS: &[(&str, &str)] = &[
+    ("default", "Default"),
+    ("black", "Black"),
+    ("white", "White"),
+    ("red", "Red"),
+    ("green", "Green"),
+    ("blue", "Blue"),
+    ("gold", "Gold"),
+    ("purple", "Purple"),
+];
+/// The frame's bands in colour `i` of `FRAME_COLORS`: middle, light, dark.
+fn frame_bands(i: usize) -> (u32, u32, u32) {
+    let c: u32 = [0x9C9C9C, 0x2A2A2A, 0xF0F0F0, 0xC03030, 0x30A040, 0x3050D0, 0xD0A020, 0x9040C0]
+        .get(i)
+        .copied()
+        .unwrap_or(0x9C9C9C);
+    let mix = |t: u32, k: f32| {
+        let ch = |s: u32| {
+            let v = (c >> s & 255) as f32;
+            let w = (t >> s & 255) as f32;
+            ((v + (w - v) * k).round() as u32) << s
+        };
+        0xFF00_0000 | ch(16) | ch(8) | ch(0)
+    };
+    (0xFF00_0000 | c, mix(0xFFFFFF, 0.55), mix(0x000000, 0.45))
+}
+
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
     ("top_left", "Top Left"),
@@ -1066,7 +1107,21 @@ settings! {
     lock_north: bool = false, "lock_north", "Lock Minimap North", View, Kind::Toggle;
     zoom: f32 = 1.0, "zoom", "Blocks per Pixel", View,
         Kind::Steps { steps: &[25, 50, 100, 200, 400, 800, 1600], div: 100, unit: "" };
+    lighting: bool = true, "lighting", "Lighting", View, Kind::Toggle;
+    cave_zoom: i32 = 2, "cave_zoom", "Cave Mode Zoom In", View,
+        Kind::Slider { min: 1, max: 4, div: 1, unit: "x", zero: None };
+    enlarged_zoom: usize = 0, "enlarged_zoom", "Zoom Level When Enlarged", View, Kind::Choice(ENLARGED_ZOOMS);
+    opacity: i32 = 100, "opacity", "Opacity", View,
+        Kind::Slider { min: 10, max: 100, div: 1, unit: "", zero: None };
+    undiscovered: i32 = 50, "undiscovered", "Undiscovered Opacity", View,
+        Kind::Slider { min: 0, max: 100, div: 1, unit: "", zero: None };
     style: Style = Style::Frame, "style", "Frame Style", View, Kind::Choice(STYLES);
+    frame_color: usize = 0, "frame_color", "Frame Color", View, Kind::Choice(FRAME_COLORS);
+    center_enlarged: bool = false, "center_enlarged", "Center When Enlarged", View, Kind::Toggle;
+    keep_rotation: bool = false, "keep_rotation", "Keep Rotation When Enlarged", View, Kind::Toggle;
+    toggle_enlarged: bool = false, "toggle_enlarged", "Toggled Enlarged Minimap", View, Kind::Toggle;
+    hide_under_screen: bool = true, "hide_under_screen", "Hide When Under Screen", View, Kind::Toggle;
+    hide_under_f3: bool = true, "hide_under_f3", "Hide When Under F3", View, Kind::Toggle;
 
     mode: MapMode = MapMode::Auto, "mode", "Cave Mode", BlockMap, Kind::Choice(MODES);
     layer_y: i32 = 64, "layer", "Layer Mode Height", BlockMap,
@@ -1285,11 +1340,6 @@ impl Settings {
     pub fn rotate(&self) -> bool {
         !self.lock_north
     }
-
-    /// (side in percent, blocks per texel)
-    pub fn view(&self) -> (f32, f32) {
-        (self.size as f32, self.zoom)
-    }
 }
 
 /// The world's directions (x, z) that point right and down on the minimap:
@@ -1356,10 +1406,12 @@ impl MiniGrid {
 pub fn compose_minimap(
     grid: &MiniGrid,
     round: bool,
+    undiscovered: i32,
     column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>,
     out: &mut Vec<u8>,
 ) {
     out.resize(MINI * MINI * 4, 0);
+    let unseen = [UNKNOWN[0], UNKNOWN[1], UNKNOWN[2], (undiscovered.clamp(0, 100) * 255 / 100) as u8];
     let half = f64::from(MINI_SHOWN) / 2.0;
     let centre = [
         f64::from(grid.shift[0]) + half,
@@ -1377,7 +1429,7 @@ pub fn compose_minimap(
                 }
             }
             let (x, z) = grid.block(i, j);
-            let rgba = shaded(column, x, z, 1).unwrap_or(UNKNOWN);
+            let rgba = shaded(column, x, z, 1).unwrap_or(unseen);
             out[o..o + 4].copy_from_slice(&rgba);
         }
     }
@@ -1445,6 +1497,7 @@ pub struct MiniKey {
     pub stamp: u64,
     /// The seed slime chunks were shown for.
     pub slime: Option<i64>,
+    pub undiscovered: i32,
 }
 
 // ---- The world map -----------------------------------------------------------------
@@ -1731,6 +1784,8 @@ pub struct State {
     pub mini_image: Vec<u8>,
     /// The map texture slot the minimap's image is in, once uploaded.
     pub mini_slot: Option<usize>,
+    /// The enlarge key is held, or toggled on.
+    pub enlarged: bool,
     pub map: MapView,
     pub images: MapImages,
     /// The size the mod's screen was last drawn at, and the pointer then.
@@ -1768,6 +1823,7 @@ impl Default for State {
             mini_grid: None,
             mini_image: Vec::new(),
             mini_slot: None,
+            enlarged: false,
             map: MapView::default(),
             images: MapImages::default(),
             screen_size: [480.0, 270.0],
@@ -1928,6 +1984,13 @@ fn next_dimension(id: &str) -> &'static str {
         NETHER => END,
         _ => OVERWORLD,
     }
+}
+
+/// How light the world is at day time `ticks`: 1 by day, 0.45 at night.
+pub fn daylight(ticks: i64) -> f32 {
+    let t = (ticks.rem_euclid(24_000) - 6000) as f32 / 24_000.0;
+    let sun = (t * std::f32::consts::TAU).cos();
+    0.45 + 0.55 * (0.5 + sun * 2.0).clamp(0.0, 1.0)
 }
 
 /// `minecraft:dark_forest` as `Dark Forest`.
@@ -2337,8 +2400,9 @@ impl State {
     pub fn update_minimap(&mut self, x: f64, z: f64, yaw: f32) -> bool {
         let seed = self.seed;
         let st = self.settings();
-        let (_, bpp) = st.view();
-        let grid = mini_grid(x, z, yaw, st.rotate(), bpp);
+        let bpp = self.mini_zoom();
+        let turning = self.turning();
+        let grid = mini_grid(x, z, yaw, turning, bpp);
         self.mini_grid = Some(grid);
         let slime = seed.filter(|_| st.slime);
         // The blocks the image can reach.
@@ -2348,20 +2412,21 @@ impl State {
         let stamp = self.maps.store(cut).stamp(bx - reach, bz - reach, bx + reach, bz + reach);
         let key = MiniKey {
             origin: grid.origin,
-            yaw_bits: if st.rotate() { yaw.to_bits() } else { 0 },
+            yaw_bits: if turning { yaw.to_bits() } else { 0 },
             bpp_bits: bpp.to_bits(),
             round: st.round,
-            rotate: st.rotate(),
+            rotate: turning,
             cut,
             stamp,
             slime,
+            undiscovered: st.undiscovered,
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
             return false;
         }
         let store = self.maps.store(cut);
         let mut column = |x: i32, z: i32| store.column(x, z);
-        compose_minimap(&grid, st.round, &mut column, &mut self.mini_image);
+        compose_minimap(&grid, st.round, st.undiscovered, &mut column, &mut self.mini_image);
         if let Some(seed) = slime {
             tint_slime(&grid, st.round, seed, &mut self.mini_image);
         }
@@ -3027,8 +3092,52 @@ impl State {
     /// The minimap's side on a `gui` sized screen: the share of its height
     /// chosen (never wider than 45% of it, never under 24 pixels).
     pub fn mini_side(&self, gui: [f32; 2]) -> f32 {
+        if self.enlarged {
+            return (gui[1] * 0.7).min(gui[0] * 0.7).floor();
+        }
         let share = self.settings().size as f32 / 100.0;
         (gui[1] * share).min(gui[0] * 0.45).max(24.0).floor()
+    }
+
+    /// Whether the minimap turns with the player now.
+    pub fn turning(&self) -> bool {
+        let st = self.settings();
+        st.rotate() && (!self.enlarged || st.keep_rotation)
+    }
+
+    /// Blocks per minimap pixel now: closer in caves, as set when enlarged.
+    pub fn mini_zoom(&self) -> f32 {
+        let st = self.settings();
+        if self.enlarged && st.enlarged_zoom > 0 {
+            return [0.5, 1.0, 2.0, 4.0, 8.0][(st.enlarged_zoom - 1).min(4)];
+        }
+        if self.cut == Cut::Surface { st.zoom } else { st.zoom / st.cave_zoom.max(1) as f32 }
+    }
+
+    /// The enlarge key went down or up.
+    pub fn enlarge_key(&mut self, pressed: bool) {
+        if self.settings().toggle_enlarged {
+            if pressed {
+                self.enlarged = !self.enlarged;
+            }
+        } else {
+            self.enlarged = pressed;
+        }
+        self.mini_key = None;
+    }
+
+    /// The zoom keys: `steps` towards more detail or less.
+    pub fn zoom_key(&mut self, closer: bool) {
+        let mut st = self.settings();
+        let i = Opt::index("zoom").unwrap_or(0);
+        let Kind::Steps { steps, .. } = OPTS[i].kind else {
+            return;
+        };
+        let now = st.raw(i);
+        let at = steps.iter().position(|&v| v >= now).unwrap_or(steps.len() - 1);
+        let to = if closer { at.saturating_sub(1) } else { (at + 1).min(steps.len() - 1) };
+        st.put(i, steps[to]);
+        self.change_settings(st);
     }
 
     /// How far the frame reaches out of the map on each side.
@@ -3077,12 +3186,13 @@ impl State {
         let mid = [x + half, y + half];
 
         // The frame, under the map.
+        let (band, light, dark) = frame_bands(st.frame_color);
         if st.round {
             match st.style {
                 Style::Frame => {
                     ring(&mut draws, mid, half + 2.0, 5.0, 0xFF10_1010);
-                    ring(&mut draws, mid, half + 2.0, 3.0, 0xFF9C_9C9C);
-                    ring(&mut draws, mid, half + 1.5, 1.0, 0xFFD8_D8D8);
+                    ring(&mut draws, mid, half + 2.0, 3.0, band);
+                    ring(&mut draws, mid, half + 1.5, 1.0, light);
                 }
                 Style::Thin => ring(&mut draws, mid, half + 0.5, 1.0, 0xFF10_1010),
                 Style::Bare => {}
@@ -3092,18 +3202,26 @@ impl State {
             match st.style {
                 Style::Frame => {
                     draws.push(Draw::Fill(r(4.0), 0xFF10_1010));
-                    draws.push(Draw::Fill(r(3.0), 0xFF9C_9C9C));
-                    draws.push(Draw::Fill(r(2.0), 0xFFD8_D8D8));
-                    draws.push(Draw::Fill(r(1.0), 0xFF56_5656));
+                    draws.push(Draw::Fill(r(3.0), band));
+                    draws.push(Draw::Fill(r(2.0), light));
+                    draws.push(Draw::Fill(r(1.0), dark));
                 }
                 Style::Thin => draws.push(Draw::Fill(r(1.0), 0xFF10_1010)),
                 Style::Bare => {}
             }
         }
+        // Lit by the time of day on the surface, as see-through as set.
+        let lit = match info.day_time {
+            Some(t) if st.lighting && self.cut == Cut::Surface => daylight(t),
+            _ => 1.0,
+        };
+        let shade = (lit * 255.0) as u32;
+        let alpha = st.opacity.clamp(0, 100) as u32 * 255 / 100;
         draws.push(Draw::Image(
             slot,
             [grid.shift[0], grid.shift[1], MINI_SHOWN, MINI_SHOWN],
             [x, y, side, side],
+            alpha << 24 | shade << 16 | shade << 8 | shade,
         ));
 
         // Where a world point lands, pulled onto the edge when past it.
@@ -3158,7 +3276,7 @@ impl State {
         }
 
         // The player: a red arrow, as Xaero's.
-        let facing = if st.rotate() { 0.0 } else { 180.0 + here.yaw };
+        let facing = if self.turning() { 0.0 } else { 180.0 + here.yaw };
         arrow(&mut draws, mid, facing, (side / 14.0).clamp(5.0, 9.0), 0xFFE0_3030);
 
         // N E S W on the frame.
@@ -3239,7 +3357,7 @@ impl State {
         for (key, dst) in self.map.tiles(size, self.cut) {
             if let Some(&slot) = self.images.slots.get(&key) {
                 let t = MAP_TEXELS as f32;
-                out.draws.push(Draw::Image(slot, [0.0, 0.0, t, t], dst));
+                out.draws.push(Draw::Image(slot, [0.0, 0.0, t, t], dst, 0xFFFF_FFFF));
             }
         }
         let dimension = here.map(|h| h.dimension.as_str()).unwrap_or(OVERWORLD);
@@ -3955,7 +4073,7 @@ mod tests {
         let grid = mini_grid(8.0, 8.0, 0.0, false, 1.0);
         let mut img = Vec::new();
         let mut column = |x, z| live.column(x, z);
-        compose_minimap(&grid, true, &mut column, &mut img);
+        compose_minimap(&grid, true, 78, &mut column, &mut img);
         assert_eq!(img.len(), MINI * MINI * 4);
         // The corner is outside the circle; the middle is the grass.
         assert_eq!(&img[0..4], &[0, 0, 0, 0]);
@@ -3965,8 +4083,9 @@ mod tests {
         // Far off nothing was seen.
         let mut column = |x, z| live.column(x, z);
         let far = mini_grid(5000.0, 5000.0, 0.0, false, 1.0);
-        compose_minimap(&far, false, &mut column, &mut img);
-        assert_eq!(&img[mid..mid + 4], &UNKNOWN);
+        compose_minimap(&far, false, 78, &mut column, &mut img);
+        assert_eq!(&img[mid..mid + 3], &UNKNOWN[..3]);
+        assert_eq!(img[mid + 3], 198);
     }
 
     #[test]
@@ -4115,7 +4234,6 @@ mod tests {
     fn settings_round_trip_and_commands_set_them() {
         let s = Settings::read(|_| None);
         assert_eq!(s, Settings::default());
-        assert_eq!(s.view(), (25.0, 1.0));
         let mut s = s;
         assert_eq!(s.command("size 30"), ("Atlas: size 30".to_string(), true));
         assert!(!s.command("size 120").1);
@@ -4140,6 +4258,27 @@ mod tests {
         assert_eq!(s, Settings::default());
         s.click(1);
         assert!(!s.minimap);
+    }
+
+    #[test]
+    fn the_enlarged_minimap_and_zoom_keys_work() {
+        let mut s = State::default();
+        let gui = [480.0, 270.0];
+        let small = s.mini_side(gui);
+        s.enlarge_key(true);
+        assert!(s.mini_side(gui) > small && !s.turning());
+        s.enlarge_key(false);
+        assert_eq!(s.mini_side(gui), small);
+        assert!(s.turning());
+        s.zoom_key(true);
+        assert_eq!(s.settings().zoom, 0.5);
+        s.zoom_key(false);
+        s.zoom_key(false);
+        assert_eq!(s.settings().zoom, 2.0);
+        s.set_cut(Cut::Below(31));
+        assert_eq!(s.mini_zoom(), 1.0, "closer in caves");
+        assert_eq!(daylight(6000), 1.0);
+        assert!(daylight(18000) < 0.5);
     }
 
     #[test]
