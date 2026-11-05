@@ -517,9 +517,6 @@ fn slot_for(game: &mut Game<'_>, id: i32) -> (usize, bool) {
     if let Some(old) = old {
         m::with(|s| {
             s.images.forget_id(old);
-            if old == m::MINIMAP_SLOT_KEY {
-                s.mini_slot = None;
-            }
         });
     }
     (slot, true)
@@ -549,15 +546,22 @@ fn upload_minimap(game: &mut Game<'_>) {
         return;
     };
     let (x, z, yaw) = (p.x, p.z, p.yaw);
+    if let Some([pw, ph]) = game.native_physical_window_size() {
+        let (w, h) = game.gui_size();
+        m::with(|s| s.size_image([w, h], [pw as f32, ph as f32]));
+    }
     let world = &game.world;
     let light = |x: i32, y: i32, z: i32| world.light(x, y, z) & 15;
     let changed = m::with(|s| s.update_minimap_lit(x, z, yaw, &light));
-    let (slot, fresh) = slot_for(game, m::MINIMAP_SLOT_KEY);
-    if changed || fresh || m::with(|s| s.mini_slot != Some(slot)) {
-        let image = m::with(|s| s.mini_image.clone());
-        if upload(game, slot, image) {
-            m::with(|s| s.mini_slot = Some(slot));
-        }
+    // Again now and then: the atlas is replaced when resources reload.
+    let due = m::with(|s| s.mini_upload_due());
+    if changed || due {
+        let (n, image) = m::with(|s| (s.mini_n as u32, std::mem::take(&mut s.mini_image)));
+        let done = game.native_mod_image(n, n, &image);
+        m::with(|s| {
+            s.mini_image = image;
+            s.mini_ready = done;
+        });
     }
 }
 
@@ -759,22 +763,37 @@ pub(super) fn paint(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
                 batch.text_styled(&game.gui.atlas, &text, at[0], at[1], color, shadow);
                 batch.scale_since(start, at[0], at[1], scale, scale);
             }
+            m::Draw::ModImage(src, dst, tint) => {
+                paint_image(game, batch, horizon_client::hud::MOD_IMAGE_SPRITE, src, dst, tint);
+            }
             m::Draw::Image(slot, src, dst, tint) => {
-                let rect = horizon_client::hud::map_slot_sprite(slot)
-                    .and_then(|name| game.gui.atlas.sprites.get(name).copied());
-                if let Some(mut r) = rect {
-                    let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
-                    r.u0 += src[0] * du;
-                    r.v0 += src[1] * dv;
-                    r.u1 = r.u0 + src[2] * du;
-                    r.v1 = r.v0 + src[3] * dv;
-                    let [a, red, g, bl] = tint.to_be_bytes();
-                    let color = horizon_client::hud::rgba(red, g, bl, a);
-                    batch.rect_uv(dst[0], dst[1], dst[2], dst[3], r, color);
+                if let Some(name) = horizon_client::hud::map_slot_sprite(slot) {
+                    paint_image(game, batch, name, src, dst, tint);
                 }
             }
         }
     }
+}
+
+/// Part `src` of sprite `name`, in texels, stretched into `dst`, tinted.
+fn paint_image(
+    game: &Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    name: &str,
+    src: [f32; 4],
+    dst: [f32; 4],
+    tint: u32,
+) {
+    let Some(mut r) = game.gui.atlas.sprites.get(name).copied() else {
+        return;
+    };
+    let (du, dv) = ((r.u1 - r.u0) / r.w as f32, (r.v1 - r.v0) / r.h as f32);
+    r.u0 += src[0] * du;
+    r.v0 += src[1] * dv;
+    r.u1 = r.u0 + src[2] * du;
+    r.v1 = r.v0 + src[3] * dv;
+    let [a, red, g, bl] = tint.to_be_bytes();
+    batch.rect_uv(dst[0], dst[1], dst[2], dst[3], r, horizon_client::hud::rgba(red, g, bl, a));
 }
 
 /// The HUD: the minimap in its corner and the waypoints' labels in the world.
@@ -830,7 +849,7 @@ pub(super) fn hud(
         light: Some(game.native_light(here.pos.map(|v| v.floor() as i32))),
         weather: Some(game.native_weather()),
     };
-    let reach = f64::from(m::MINI as u32) * f64::from(m::with(|s| s.mini_zoom()));
+    let reach = m::with(|s| s.mini_reach());
     let dots = if settings.dots {
         let all = dots(game, &here, reach, &settings, skins);
         m::with(|s| s.visible_dots(all, here.pos[1]))

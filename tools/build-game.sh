@@ -18,4 +18,7 @@ if [ ! -d "$GAME" ]; then
 fi
 rm -f "$GAME/horizon-client"
 cp "$CARGO_TARGET_DIR/fast/horizon-client" "$GAME/horizon-client"
+# Marks it as built with native mods, as the launcher does: the game only
+# makes room for a mod's image then.
+echo '{"mods":[{"id":"atlas","version":"0.1.0"}]}' > "$GAME/native-mods.json"
 echo "game: $GAME/horizon-client"

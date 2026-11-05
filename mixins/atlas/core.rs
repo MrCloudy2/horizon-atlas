@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// The mod's id (its data folder and its keys' lines), name and version.
@@ -207,6 +208,8 @@ pub enum Draw {
     Fill([f32; 4], u32),
     Text(String, [f32; 2], u32, bool),
     Image(usize, [f32; 4], [f32; 4], u32),
+    /// The same of the mod's image (Horizon's `native_mod_image`).
+    ModImage([f32; 4], [f32; 4], u32),
     Quad([[f32; 2]; 4], u32),
     /// An item's icon with its top left at the point, the size square.
     Item(String, [f32; 2], f32),
@@ -590,6 +593,23 @@ impl Default for Shading {
     }
 }
 
+/// A chunk's 256 columns as the maps show them, all zero where unseen.
+pub type ShadedChunk = [[u8; 4]; 256];
+
+/// Chunk `chunk` of `store`, shaded.
+fn shade_chunk(store: &mut Store, chunk: (i32, i32), how: Shading) -> Rc<ShadedChunk> {
+    let mut out = [[0u8; 4]; 256];
+    let mut column = |x: i32, z: i32| store.column(x, z);
+    for z in 0..16 {
+        for x in 0..16 {
+            if let Some(rgba) = shaded(&mut column, chunk.0 * 16 + x, chunk.1 * 16 + z, 1, how) {
+                out[(z * 16 + x) as usize] = rgba;
+            }
+        }
+    }
+    Rc::new(out)
+}
+
 /// A column as the maps show it: land lit by its slope (lighter where it
 /// rises from the north and the west, darker where it falls) and its height,
 /// water darker the deeper it is, cut walls dark.
@@ -949,11 +969,13 @@ impl Store {
 
 // ---- The minimap ----------------------------------------------------------------
 
-/// The minimap image's side in texels.
+/// The side of a map texture slot in texels (the world map's images), and
+/// the minimap's image until the screen's size is known.
 pub const MINI: usize = 128;
-/// The texels the minimap shows across: one less than the image, so that a
-/// fraction of a texel can be scrolled into view.
-pub const MINI_SHOWN: f32 = 127.0;
+/// The minimap's image at most: Horizon's mod image is 1024 square.
+pub const MINI_MAX: usize = 1024;
+/// A block on the minimap at zoom 1, in screen pixels, as Xaero draws it.
+pub const PIXELS_PER_BLOCK: f32 = 2.0;
 
 /// How the minimap's edge looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1569,7 +1591,9 @@ pub fn mini_axes(rotate: bool, yaw: f32) -> ([f64; 2], [f64; 2]) {
 /// Where the minimap's texels lie: the texel grid is fixed to the world in
 /// the map's turned frame, `origin` is the grid cell of texel (0, 0) and
 /// `shift` how far into texel space the shown area starts, so the player
-/// stays in the middle of what shows (`shift + MINI_SHOWN / 2`).
+/// stays in the middle of what shows (`shift + (n - 1) / 2`). The image is
+/// `n` texels square, one a screen pixel, one more than it shows so a
+/// fraction of a texel can scroll into view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MiniGrid {
     pub right: [f64; 2],
@@ -1577,24 +1601,32 @@ pub struct MiniGrid {
     pub bpp: f64,
     pub origin: [i64; 2],
     pub shift: [f32; 2],
+    pub n: usize,
 }
 
-pub fn mini_grid(x: f64, z: f64, yaw: f32, rotate: bool, bpp: f32) -> MiniGrid {
+/// The grid of an `n` texel image (`n` is even), `bpp` blocks a texel.
+pub fn mini_grid(x: f64, z: f64, yaw: f32, rotate: bool, bpp: f32, n: usize) -> MiniGrid {
     let (right, down) = mini_axes(rotate, yaw);
     let bpp = f64::from(bpp);
     let a = (x * right[0] + z * right[1]) / bpp - 0.5;
     let b = (x * down[0] + z * down[1]) / bpp - 0.5;
     let (fa, fb) = (a.floor(), b.floor());
+    let back = (n / 2) as i64 - 1;
     MiniGrid {
         right,
         down,
         bpp,
-        origin: [fa as i64 - 63, fb as i64 - 63],
+        origin: [fa as i64 - back, fb as i64 - back],
         shift: [(a - fa) as f32, (b - fb) as f32],
+        n,
     }
 }
 
 impl MiniGrid {
+    /// The texels that show across.
+    pub fn shown(&self) -> f32 {
+        self.n as f32 - 1.0
+    }
     /// The block under texel `(i, j)`'s centre.
     pub fn block(&self, i: usize, j: usize) -> (i32, i32) {
         let la = (self.origin[0] + i as i64) as f64 + 0.5;
@@ -1606,7 +1638,7 @@ impl MiniGrid {
     /// A world offset from the player as GUI pixels from the minimap's
     /// centre, for a minimap `size` pixels wide.
     pub fn to_screen(&self, dx: f64, dz: f64, size: f32) -> [f32; 2] {
-        let scale = f64::from(size / MINI_SHOWN) / self.bpp;
+        let scale = f64::from(size / self.shown()) / self.bpp;
         [
             ((dx * self.right[0] + dz * self.right[1]) * scale) as f32,
             ((dx * self.down[0] + dz * self.down[1]) * scale) as f32,
@@ -1614,37 +1646,32 @@ impl MiniGrid {
     }
 }
 
-/// The minimap's image for `grid` into `out` (`MINI` x `MINI` RGBA), round
-/// or square, from `column`.
+/// The minimap's image for `grid` into `out` (`n` x `n` RGBA), round or
+/// square; `pixel` gives a block's colour, None where nothing was seen.
 pub fn compose_minimap(
     grid: &MiniGrid,
     round: bool,
     undiscovered: i32,
-    how: Shading,
-    column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>,
+    pixel: &mut dyn FnMut(i32, i32) -> Option<[u8; 4]>,
     out: &mut Vec<u8>,
 ) {
-    out.resize(MINI * MINI * 4, 0);
+    let n = grid.n;
+    out.resize(n * n * 4, 0);
     let unseen = [UNKNOWN[0], UNKNOWN[1], UNKNOWN[2], (undiscovered.clamp(0, 100) * 255 / 100) as u8];
-    let half = f64::from(MINI_SHOWN) / 2.0;
-    let centre = [
-        f64::from(grid.shift[0]) + half,
-        f64::from(grid.shift[1]) + half,
-    ];
-    for j in 0..MINI {
-        for i in 0..MINI {
-            let o = (j * MINI + i) * 4;
+    let half = f64::from(grid.shown()) / 2.0;
+    let centre = [f64::from(grid.shift[0]) + half, f64::from(grid.shift[1]) + half];
+    for j in 0..n {
+        for i in 0..n {
+            let o = (j * n + i) * 4;
             if round {
                 let (u, v) = (i as f64 + 0.5 - centre[0], j as f64 + 0.5 - centre[1]);
-                let d = (u * u + v * v).sqrt();
-                if d > half {
+                if (u * u + v * v).sqrt() > half {
                     out[o..o + 4].copy_from_slice(&[0; 4]);
                     continue;
                 }
             }
             let (x, z) = grid.block(i, j);
-            let rgba = shaded(column, x, z, 1, how).unwrap_or(unseen);
-            out[o..o + 4].copy_from_slice(&rgba);
+            out[o..o + 4].copy_from_slice(&pixel(x, z).unwrap_or(unseen));
         }
     }
 }
@@ -1680,9 +1707,10 @@ pub fn is_slime_chunk(seed: i64, cx: i32, cz: i32) -> bool {
 pub fn tint_slime(grid: &MiniGrid, round: bool, seed: i64, image: &mut [u8]) {
     let _ = round;
     let mut known: HashMap<(i32, i32), bool> = HashMap::new();
-    for j in 0..MINI {
-        for i in 0..MINI {
-            let o = (j * MINI + i) * 4;
+    let n = grid.n;
+    for j in 0..n {
+        for i in 0..n {
+            let o = (j * n + i) * 4;
             if image.len() < o + 4 || image[o + 3] == 0 {
                 continue;
             }
@@ -1708,9 +1736,10 @@ fn tint(image: &mut [u8], o: usize, rgb: [u16; 3]) {
 pub fn tint_grid(grid: &MiniGrid, color: usize, width: i32, image: &mut [u8]) {
     let rgb = GRID_RGB[color.min(GRID_RGB.len() - 1)];
     let blocks = ((f64::from(width) * grid.bpp).ceil() as i32).clamp(1, 8);
-    for j in 0..MINI {
-        for i in 0..MINI {
-            let o = (j * MINI + i) * 4;
+    let n = grid.n;
+    for j in 0..n {
+        for i in 0..n {
+            let o = (j * n + i) * 4;
             if image.len() < o + 4 || image[o + 3] == 0 {
                 continue;
             }
@@ -1736,6 +1765,7 @@ pub struct MiniKey {
     /// The seed slime chunks were shown for.
     pub slime: Option<i64>,
     pub undiscovered: i32,
+    pub n: usize,
     pub grid: (usize, i32),
     pub light: Option<i32>,
 }
@@ -1839,7 +1869,9 @@ impl MapView {
     /// `at` where it is.
     pub fn zoom(&mut self, steps: f64, at: [f32; 2], size: [f32; 2]) {
         let before = self.world(at, size);
-        self.bpp = (self.bpp * 0.8f64.powf(steps)).clamp(MIN_BPP, MAX_BPP);
+        // Powers of two: every block a whole number of screen pixels.
+        let notch = if steps > 0.0 { 0.5 } else { 2.0 };
+        self.bpp = (self.bpp * notch).clamp(MIN_BPP, MAX_BPP);
         let after = self.world(at, size);
         self.centre[0] += before[0] - after[0];
         self.centre[1] += before[1] - after[1];
@@ -1882,9 +1914,7 @@ pub struct MapImages {
     pub slots: HashMap<TileKey, usize>,
 }
 
-/// The minimap's own slot key: far below the world map's.
-pub const MINIMAP_SLOT_KEY: i32 = i32::MIN + 7;
-/// The mob face sheet's slot key.
+/// The mob face sheet's slot key: far below the world map's.
 pub const FACES_SLOT_KEY: i32 = i32::MIN + 8;
 
 impl MapImages {
@@ -2036,8 +2066,14 @@ pub struct State {
     pub mini_key: Option<MiniKey>,
     pub mini_grid: Option<MiniGrid>,
     pub mini_image: Vec<u8>,
-    /// The map texture slot the minimap's image is in, once uploaded.
-    pub mini_slot: Option<usize>,
+    /// The image's side in texels: the minimap's in screen pixels, plus one.
+    pub mini_n: usize,
+    /// The image has been uploaded.
+    pub mini_ready: bool,
+    pub mini_uploaded: Option<Instant>,
+    /// Shaded chunks of `shade_cut`, for composing the image every frame.
+    pub shade_cache: HashMap<(i32, i32), Rc<ShadedChunk>>,
+    pub shade_cut: Option<Cut>,
     /// The enlarge key is held, or toggled on.
     pub enlarged: bool,
     /// The player list key is held: icons show.
@@ -2088,7 +2124,11 @@ impl Default for State {
             mini_key: None,
             mini_grid: None,
             mini_image: Vec::new(),
-            mini_slot: None,
+            mini_n: MINI,
+            mini_ready: false,
+            mini_uploaded: None,
+            shade_cache: HashMap::new(),
+            shade_cut: None,
             enlarged: false,
             tab_held: false,
             faces: HashMap::new(),
@@ -2575,6 +2615,7 @@ impl State {
         self.maps.open(dir);
         self.map_dimension = dimension;
         self.scans.clear();
+        self.shade_cache.clear();
         self.images.clear();
         self.mini_key = None;
         self.map.follow = true;
@@ -2631,6 +2672,9 @@ impl State {
         if scan(&old) != scan(&st) {
             self.scans.clear();
         }
+        if old.shading() != st.shading() {
+            self.shade_cache.clear();
+        }
         self.settings = Some(st);
         self.settings_changed = true;
         self.mini_key = None;
@@ -2684,7 +2728,12 @@ impl State {
     /// Chunk `chunk` was scanned for `cut` at world revision `revision`.
     pub fn put_scan(&mut self, cut: Cut, chunk: (i32, i32), revision: u64, tile: Tile) {
         self.scans.insert((cut, chunk), (revision, Instant::now()));
-        self.maps.store(cut).put(chunk.0, chunk.1, tile);
+        if self.maps.store(cut).put(chunk.0, chunk.1, tile) && self.shade_cut == Some(cut) {
+            // Its columns, and those shaded against them to the south and east.
+            for c in [chunk, (chunk.0 + 1, chunk.1), (chunk.0, chunk.1 + 1)] {
+                self.shade_cache.remove(&c);
+            }
+        }
     }
 
     /// Forgets the scans of chunks more than `radius` chunks from `centre`
@@ -2720,20 +2769,22 @@ impl State {
     pub fn update_minimap_lit(&mut self, x: f64, z: f64, yaw: f32, light: &dyn Fn(i32, i32, i32) -> u8) -> bool {
         let seed = self.seed;
         let st = self.settings();
-        let bpp = self.mini_zoom();
+        let bpp = self.mini_zoom() / PIXELS_PER_BLOCK;
         let turning = self.turning();
-        let grid = mini_grid(x, z, yaw, turning, bpp);
+        let n = self.mini_n;
+        let grid = mini_grid(x, z, yaw, turning, bpp, n);
         self.mini_grid = Some(grid);
         let slime = seed.filter(|_| st.slime);
         // The blocks the image can reach.
-        let reach = (f64::from(MINI as u32) * grid.bpp * std::f64::consts::SQRT_2 / 2.0).ceil() as i32 + 2;
+        let reach = (n as f64 * grid.bpp * std::f64::consts::SQRT_2 / 2.0).ceil() as i32 + 2;
         let (bx, bz) = (x.floor() as i32, z.floor() as i32);
         let cut = self.cut;
         let stamp = self.maps.store(cut).stamp(bx - reach, bz - reach, bx + reach, bz + reach);
         let key = MiniKey {
             origin: grid.origin,
             yaw_bits: if turning { yaw.to_bits() } else { 0 },
-            bpp_bits: bpp.to_bits(),
+            bpp_bits: (bpp).to_bits(),
+            n,
             round: st.round,
             rotate: turning,
             cut,
@@ -2746,9 +2797,25 @@ impl State {
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
             return false;
         }
+        if self.shade_cut != Some(cut) || self.shade_cache.len() > 8192 {
+            self.shade_cache.clear();
+            self.shade_cut = Some(cut);
+        }
+        let how = st.shading();
         let store = self.maps.store(cut);
-        let mut column = |x: i32, z: i32| store.column(x, z);
-        compose_minimap(&grid, st.round, st.undiscovered, st.shading(), &mut column, &mut self.mini_image);
+        let cache = &mut self.shade_cache;
+        // Rows of texels stay in one chunk for a while: remember the last.
+        let mut last: Option<((i32, i32), Rc<ShadedChunk>)> = None;
+        let mut pixel = |x: i32, z: i32| {
+            let chunk = (x >> 4, z >> 4);
+            if last.as_ref().is_none_or(|l| l.0 != chunk) {
+                let shaded = cache.entry(chunk).or_insert_with(|| shade_chunk(store, chunk, how));
+                last = Some((chunk, shaded.clone()));
+            }
+            let rgba = last.as_ref().map_or([0; 4], |l| l.1[((z & 15) * 16 + (x & 15)) as usize]);
+            (rgba != [0; 4]).then_some(rgba)
+        };
+        compose_minimap(&grid, st.round, st.undiscovered, &mut pixel, &mut self.mini_image);
         if let Some(seed) = slime {
             tint_slime(&grid, st.round, seed, &mut self.mini_image);
         }
@@ -2756,9 +2823,10 @@ impl State {
             tint_grid(&grid, st.chunk_grid, st.grid_width, &mut self.mini_image);
         }
         if st.light_overlay {
-            for j in 0..MINI {
-                for i in 0..MINI {
-                    let o = (j * MINI + i) * 4;
+            let store = self.maps.store(cut);
+            for j in 0..n {
+                for i in 0..n {
+                    let o = (j * n + i) * 4;
                     let (x, z) = grid.block(i, j);
                     let Some((c, h, _)) = store.column(x, z) else {
                         continue;
@@ -3648,6 +3716,29 @@ impl State {
         (gui[1] * share).min(gui[0] * 0.45).max(24.0).floor()
     }
 
+    /// Sizes the minimap's image for a `gui` screen of `physical` pixels:
+    /// a texel a screen pixel, so nothing is stretched.
+    pub fn size_image(&mut self, gui: [f32; 2], physical: [f32; 2]) {
+        let scale = if gui[1] > 0.0 { physical[1] / gui[1] } else { 1.0 };
+        let n = (self.mini_side(gui) * scale).round() as usize + 1;
+        // Even, so the player sits on the grid.
+        self.mini_n = (n + n % 2).clamp(32, MINI_MAX);
+    }
+
+    /// Whether the image should be uploaded though it didn't change.
+    pub fn mini_upload_due(&mut self) -> bool {
+        let due = self.mini_uploaded.is_none_or(|t| t.elapsed().as_secs() >= 2);
+        if due {
+            self.mini_uploaded = Some(Instant::now());
+        }
+        due
+    }
+
+    /// How far the minimap reaches from the player, in blocks.
+    pub fn mini_reach(&self) -> f64 {
+        self.mini_n as f64 * f64::from(self.mini_zoom() / PIXELS_PER_BLOCK)
+    }
+
     /// Whether the minimap turns with the player now.
     pub fn turning(&self) -> bool {
         let st = self.settings();
@@ -3724,7 +3815,7 @@ impl State {
     ) -> Vec<Draw> {
         let st = self.settings();
         let mut draws = Vec::new();
-        let (Some(grid), Some(slot)) = (self.mini_grid, self.mini_slot) else {
+        let Some(grid) = self.mini_grid.filter(|_| self.mini_ready) else {
             return draws;
         };
         let [bw, _] = self.minimap_box(gui, here, info, measure);
@@ -3767,9 +3858,8 @@ impl State {
         };
         let shade = (lit * 255.0) as u32;
         let alpha = st.opacity.clamp(0, 100) as u32 * 255 / 100;
-        draws.push(Draw::Image(
-            slot,
-            [grid.shift[0], grid.shift[1], MINI_SHOWN, MINI_SHOWN],
+        draws.push(Draw::ModImage(
+            [grid.shift[0], grid.shift[1], grid.shown(), grid.shown()],
             [x, y, side, side],
             alpha << 24 | shade << 16 | shade << 8 | shade,
         ));
@@ -4683,19 +4773,19 @@ mod tests {
     fn the_minimap_grid_is_fixed_to_the_world_and_shifts_smoothly() {
         // North up, 1 block a texel: moving a tenth of a block shifts the
         // shown area a tenth of a texel and keeps the grid.
-        let a = mini_grid(100.0, 50.0, 0.0, false, 1.0);
-        let b = mini_grid(100.1, 50.0, 0.0, false, 1.0);
+        let a = mini_grid(100.0, 50.0, 0.0, false, 1.0, MINI);
+        let b = mini_grid(100.1, 50.0, 0.0, false, 1.0, MINI);
         assert_eq!(a.origin, b.origin);
         assert!((b.shift[0] - a.shift[0] - 0.1).abs() < 1e-4);
         // The player is in the middle of what shows.
         let mid = |g: &MiniGrid| {
-            let i = (g.shift[0] + MINI_SHOWN / 2.0).floor() as usize;
-            let j = (g.shift[1] + MINI_SHOWN / 2.0).floor() as usize;
+            let i = (g.shift[0] + (MINI as f32 - 1.0) / 2.0).floor() as usize;
+            let j = (g.shift[1] + (MINI as f32 - 1.0) / 2.0).floor() as usize;
             g.block(i, j)
         };
         assert_eq!(mid(&a), (100, 50));
         // Crossing into the next block moves the grid by one.
-        let c = mini_grid(101.0, 50.0, 0.0, false, 1.0);
+        let c = mini_grid(101.0, 50.0, 0.0, false, 1.0, MINI);
         assert_eq!(c.origin[0], a.origin[0] + 1);
         assert_eq!(mid(&c), (101, 50));
         // Turning: where the player looks is up.
@@ -4703,8 +4793,8 @@ mod tests {
         // Facing south (+z): up on the map is +z, so down is -z; right is west (-x).
         assert_eq!(down.map(|v| v.round()), [0.0, -1.0]);
         assert_eq!(right.map(|v| v.round()), [-1.0, 0.0]);
-        let g = mini_grid(0.0, 0.0, 0.0, true, 1.0);
-        let ahead = g.to_screen(0.0, 10.0, MINI_SHOWN);
+        let g = mini_grid(0.0, 0.0, 0.0, true, 1.0, MINI);
+        let ahead = g.to_screen(0.0, 10.0, g.shown());
         assert!(ahead[1] < -9.0 && ahead[0].abs() < 1e-3);
     }
 
@@ -4712,10 +4802,14 @@ mod tests {
     fn the_minimap_image_shades_like_a_map_and_rounds() {
         let mut live = Store::default();
         live.put(0, 0, grass(64));
-        let grid = mini_grid(8.0, 8.0, 0.0, false, 1.0);
+        let grid = mini_grid(8.0, 8.0, 0.0, false, 1.0, MINI);
         let mut img = Vec::new();
-        let mut column = |x, z| live.column(x, z);
-        compose_minimap(&grid, true, 78, Shading::default(), &mut column, &mut img);
+        let how = Shading::default();
+        let mut pixel = |x, z| {
+            let mut column = |x, z| live.column(x, z);
+            shaded(&mut column, x, z, 1, how)
+        };
+        compose_minimap(&grid, true, 78, &mut pixel, &mut img);
         assert_eq!(img.len(), MINI * MINI * 4);
         // The corner is outside the circle; the middle is the grass.
         assert_eq!(&img[0..4], &[0, 0, 0, 0]);
@@ -4723,9 +4817,8 @@ mod tests {
         assert_eq!(img[mid + 3], 255);
         assert_ne!(&img[mid..mid + 4], &UNKNOWN);
         // Far off nothing was seen.
-        let mut column = |x, z| live.column(x, z);
-        let far = mini_grid(5000.0, 5000.0, 0.0, false, 1.0);
-        compose_minimap(&far, false, 78, Shading::default(), &mut column, &mut img);
+        let far = mini_grid(5000.0, 5000.0, 0.0, false, 1.0, MINI);
+        compose_minimap(&far, false, 78, &mut pixel, &mut img);
         assert_eq!(&img[mid..mid + 3], &UNKNOWN[..3]);
         assert_eq!(img[mid + 3], 198);
     }
@@ -4760,7 +4853,7 @@ mod tests {
         assert!(s.minimap_hud(gui, [0.0, 0.0], &h, &info, &[], &measure).is_empty());
         assert!(s.update_minimap(0.5, 0.5, 0.0));
         assert!(!s.update_minimap(0.6, 0.5, 0.0));
-        s.mini_slot = Some(3);
+        s.mini_ready = true;
         let dots = [
             Dot { pos: [5.0, 64.0, 0.0], kind: DotKind::Mob, ..Dot::default() },
             Dot { pos: [900.0, 64.0, 0.0], kind: DotKind::Item, ..Dot::default() },
@@ -4778,7 +4871,7 @@ mod tests {
         assert_eq!(facing_text(-90.0), "East");
         texts.dedup();
         assert_eq!(texts, ["F", "N", "E", "S", "W", "0, 64, 0", "Dark Forest", "Day 1, 12:00"]);
-        assert!(matches!(draws.iter().find(|d| matches!(d, Draw::Image(..))), Some(Draw::Image(3, ..))));
+        assert!(draws.iter().any(|d| matches!(d, Draw::ModImage(..))));
         // The near mob's dot shows; the far item's doesn't.
         // A dot is three quads.
         let yellow = draws.iter().filter(|d| matches!(d, Draw::Quad(_, c) if *c == DotKind::Mob.color())).count();
@@ -4845,7 +4938,7 @@ mod tests {
         let mut s = State::default();
         let h = Here { pos: [0.5, 64.0, 0.5], dimension: OVERWORLD.into(), yaw: 0.0 };
         s.update_minimap(0.5, 0.5, 0.0);
-        s.mini_slot = Some(3);
+        s.mini_ready = true;
         s.face_slot = Some(4);
         s.faces.insert("minecraft:zombie".into(), [0.0, 0.0, 8.0, 8.0]);
         let dots = [
@@ -5178,6 +5271,6 @@ mod tests {
         let b = images.id(TileKey { cut: Cut::Surface, level: 0, x: 1, z: 0 });
         assert!(a < 0 && b < 0 && a != b);
         assert_eq!(images.id(TileKey { cut: Cut::Surface, level: 0, x: 0, z: 0 }), a);
-        assert!(a > MINIMAP_SLOT_KEY && b > MINIMAP_SLOT_KEY);
+        assert!(a > FACES_SLOT_KEY && b > FACES_SLOT_KEY);
     }
 }
