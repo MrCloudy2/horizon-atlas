@@ -1199,7 +1199,7 @@ settings! {
     minimap: bool = true, "minimap", "Minimap", Main, Kind::Toggle;
     corner: usize = 0, "corner", "Position", Main, Kind::Choice(CORNER_CHOICES);
 
-    size: i32 = 25, "size", "Size", View,
+    size: i32 = 35, "size", "Size", View,
         Kind::Slider { min: 10, max: 60, div: 1, unit: "%", zero: None };
     round: bool = false, "shape", "Shape", View, Kind::Choice(SHAPES);
     lock_north: bool = false, "lock_north", "Lock Minimap North", View, Kind::Toggle;
@@ -4663,9 +4663,9 @@ mod tests {
             .unwrap();
         let [bw, _] = s.minimap_box(gui, &h, &info, &measure);
         assert!(at[0] > bw / 2.0 + s.mini_side(gui) / 2.0 - 8.0, "{at:?}");
-        // A quarter of the window's height, whatever its size.
-        assert_eq!(s.mini_side(gui), 67.0);
-        assert_eq!(s.mini_side([200.0, 120.0]), 30.0);
+        // A share of the window's height, whatever its size.
+        assert_eq!(s.mini_side(gui), 94.0);
+        assert_eq!(s.mini_side([200.0, 120.0]), 42.0);
     }
 
     #[test]
