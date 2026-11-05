@@ -45,7 +45,7 @@ Delete. Dying leaves a deathpoint, which goes away when you reach it.
 
 ## Settings
 
-**Y** opens the settings: about a hundred options on pages, with a search across them all.
+**Y** opens the settings: over 90 options on pages, with a search across them all.
 
 | | |
 |---|---|
@@ -80,7 +80,7 @@ Delete. Dying leaves a deathpoint, which goes away when you reach it.
 | **[** and **]** | Zoom the minimap |
 | **Tab** | Faces and icons on the minimap |
 
-All can be changed in Options > Mods > Atlas.
+All but Tab can be changed in Options > Mods > Atlas.
 
 ## Install
 
