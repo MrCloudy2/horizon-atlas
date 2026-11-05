@@ -1,45 +1,64 @@
 # Atlas for Horizon
 
-A minimap, a world map of everywhere you have been, and waypoints on both, in the style of Xaero's
-Minimap and World Map (no code or art from them), as a native Horizon mod
-(Minecraft 26.3, Horizon Nightly 2026-11-05, `f319701`).
+**A sharp minimap, a world map of everywhere you've been, and waypoints on both.**
+A native mod for [Horizon](https://github.com/horizon-rust/horizon) (Minecraft 26.3), in the style of Xaero's Minimap and
+World Map.
 
-Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT). The map columns and
-their shading follow Horizon's own minimap (MIT).
+![Atlas in the game: the minimap in the corner and waypoints floating over the land](docs/images/hero.jpg)
 
-## In the game
+## Minimap
 
-- **Minimap** (top left by default): scrolls smoothly, turns with you if you like, and shrinks with the
-  window. It shows:
-  - dots: white for players, yellow for mobs, red for dropped items, purple for other entities
-  - waypoints as their first letter on their colour (on the edge when far)
-  - N, E, S and W arrows
-  - your coordinates, biome and the time of day underneath
-  - slime chunks, once you give the world's seed
-- **M**: the world map. Drag to move, wheel to zoom. **B** (or a right click) makes a waypoint at the spot
-  under the pointer, and a click on a waypoint edits it.
-- **B** in the game: a new waypoint where you stand.
-- **U**: the waypoint screen: waypoint sets, a filter, and for the waypoint you click, Add/Edit,
-  Teleport (T, operators only), Share, Enable/Disable and Delete.
-- **H**: a temporary waypoint where you stand. Dying leaves a deathpoint, gone when you reach it.
-- **Z**: hold for the enlarged minimap. **[** and **]**: zoom the minimap.
-- **Map modes**, shared by both maps:
-  - **Auto**: the surface in the open, the cave around you underground, under a roof and in the Nether
-  - **Cave**: always the cave around you
-  - **Layer**: a cut at a height you choose
+Drawn at your screen's own resolution, so every block is crisp. It scrolls smoothly, turns with you (or locks north),
+and scales with your window. Height steps are drawn as fine contour lines, so cliffs and hills read at a glance.
 
-  Each mode is kept on disk, so the world map remembers caves too.
-- **Waypoints in the world**: a small square with the letter and the name under it; the distance
-  shows while you look at it.
-- **Tab**: faces and item icons on the minimap instead of dots.
-- **Overlays**: chunk grid, dark spots where mobs can spawn, slime chunks.
+Entities show as diamonds: yellow mobs, white players, red dropped items, purple everything else, fading the further
+they are above or below you. **Hold Tab** for mob faces, player faces and item icons.
+
+<p align="center"><img src="docs/images/minimap-tab.png" width="640" alt="The minimap with dots, and with mob faces while Tab is held"></p>
+
+## World map
+
+Press **M**. It shows everything you have explored, saved per world, server and dimension. Drag to move, scroll to
+zoom, and press **B** over any spot to make a waypoint there.
+
+![The world map](docs/images/world-map.jpg)
+
+### Map modes
+
+Both maps share three modes, and each keeps its own saved map:
+
+- **Auto**: the surface in the open, the cave around you underground, under a roof and in the Nether
+- **Cave**: always a cross-section around you
+- **Layer**: a cut at any height you choose
+
+![Cave mode on the world map](docs/images/cave-mode.jpg)
+
+## Waypoints
+
+**B** makes one where you stand, **H** a temporary one. They show on both maps and in the world, as a small square
+with their letter and name, and their distance while you look at them.
+
+**U** opens the waypoint screen: sets, a filter, and Add/Edit, Teleport (T, for operators), Share, Enable/Disable and
+Delete. Dying leaves a deathpoint, which goes away when you reach it.
+
+![The waypoint screen](docs/images/waypoints.jpg)
 
 ## Settings
 
-**Y** opens the settings screen, laid out as Xaero's: pages of buttons and sliders, and a search
-across them all. Options > Mods > Atlas has the main switches and the keys.
+**Y** opens the settings: about a hundred options on pages, with a search across them all.
 
-`/atlas <setting> <value>` in chat sets any setting exactly (`/atlas help` lists them):
+| | |
+|---|---|
+| ![The settings menu](docs/images/settings.jpg) | ![A settings page](docs/images/settings-page.jpg) |
+
+- **View**: size, shape, zoom, opacity, lighting, frame style and colour, enlarged minimap (hold **Z**)
+- **Block map**: colour mode, cave mode, slopes, transparency, grass, flowers, leaves
+- **Entity radar**: categories, dot size, icons, names, height limit, depth fade, player cross or arrow
+- **Overlays**: chunk grid, light overlay, slime chunks
+- **Information**: coordinates, biome, time, facing, dimension, chunk, light and weather lines
+- **Waypoints**: scales, opacity, render distance, deathpoints, compass
+
+`/atlas <setting> <value>` in chat sets any of them exactly, and `/atlas help` lists them:
 
 ```
 /atlas size 30           minimap side, percent of the window's height
@@ -48,35 +67,53 @@ across them all. Options > Mods > Atlas has the main switches and the keys.
 /atlas seed <seed>       this world's seed, for slime chunks (a server never sends it)
 ```
 
-## Where it keeps things
+## Keys
 
-Everything goes in `horizon-mods/.horizon-mod-data/atlas/` inside the game folder:
+| Key | Does |
+|---|---|
+| **M** | World map |
+| **B** | New waypoint (under the pointer on the world map) |
+| **U** | Waypoint screen |
+| **H** | Temporary waypoint |
+| **Y** | Settings |
+| **Z** | Enlarged minimap |
+| **[** and **]** | Zoom the minimap |
+| **Tab** | Faces and icons on the minimap |
 
-- the settings, in `settings.txt`
-- waypoints and seeds, one file per single player world folder and per server address
-- the maps, in `maps/<world>/<dimension>/<mode layer>/`
+All can be changed in Options > Mods > Atlas.
 
-## Build and install
+## Install
 
-Uses the Horizon launcher's own Rust and Horizon source (nothing else to install):
+Download `atlas-0.1.0.hnmod` from [Releases](https://github.com/MrCloudy2/horizon-atlas/releases), add it to your native
+mods in the Horizon launcher, and build. Atlas is pinned to Horizon Nightly 2026-11-05 (`f319701`), because it reads the
+game's world directly, so a newer Nightly may need a new release. Turn off Horizon's own Minimap so you don't get two.
+
+Everything Atlas keeps is in `horizon-mods/.horizon-mod-data/atlas/` in the game folder: `settings.txt`, waypoints and
+seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
+
+## Credits
+
+- Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT)
+- The map columns follow Horizon's minimap (MIT)
+- The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
+  affiliated with them.
+
+Licence: MIT.
+
+## Build from source
+
+Uses the Horizon launcher's own Rust and Horizon source:
 
 ```sh
 L=~/.local/share/horizon-launcher
 export PATH=$L/rust/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH CARGO_HOME=$L/cargo
 cargo test --offline                      # the mod's logic
-tools/check.sh                            # applies the bundle to Horizon f319701 and type-checks the game
-python3 tools/package.py --install        # target/atlas-0.1.0.hnmod, copied into the launcher's native mods
+tools/check.sh                            # applies the bundle to Horizon and type-checks the game
+python3 tools/package.py --install        # makes target/atlas-0.1.0.hnmod and installs it in the launcher
+tools/build-game.sh && tools/play.sh      # an Atlas-only game, offscreen, for testing; drive it with tools/ctl.sh
 ```
 
-Then build the game with its mods in the launcher. The mod is pinned to Horizon `f319701`. Besides the
-stable hook points, it reads the window's world, its map texture slots and its entities, so a newer
-Nightly may need the pin in `compatibility.json` and `mixins/atlas/horizon-mixin.toml` moved.
-
-## Layout
-
-- `mixins/atlas/core.rs`: all the logic, std only, with its unit tests (also the module the game gets)
+- `mixins/atlas/core.rs`: all the logic, std only, with its tests
 - `mixins/atlas/bridge.rs`: the game side: chunk scans, map images, entities, drawing
-- `mixins/atlas/*.rs`: one small hook adapter per hook point
+- `mixins/atlas/*.rs`: one small adapter per hook point
 - `mixins/atlas/horizon-mixin.toml`: where each hook goes
-- `tools/package.py`: makes the `.hnmod`
-- `tools/check.sh`: builds the bundle into Horizon's source to check it compiles
