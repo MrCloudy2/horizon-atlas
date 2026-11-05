@@ -375,6 +375,16 @@ pub(super) fn frame(game: &mut Game<'_>) {
         game.native_chat(&format!("Atlas: can't teleport ({e})"));
     }
 
+    if let Some(line) = m::with(|s| s.take_say())
+        && let Err(e) = game.native_send_chat(&line)
+    {
+        game.native_chat(&format!("Atlas: can't share ({e})"));
+    }
+    if let Some(here) = here(game) {
+        let dead = game.screen == crate::game::Screen::Dead;
+        m::with(|s| s.track_death(dead, &here));
+    }
+
     let close = m::with(|s| s.take_close());
     if close {
         game.native_mod_screen_close(m::ID);

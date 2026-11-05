@@ -18,8 +18,10 @@ their shading follow Horizon's own minimap (MIT).
 - **M**: the world map. Drag to move, wheel to zoom. **B** (or a right click) makes a waypoint at the spot
   under the pointer, and a click on a waypoint edits it.
 - **B** in the game: a new waypoint where you stand.
-- **U**: the waypoint list. Click a waypoint, then use the buttons below the list: Teleport (operators
-  only), Edit, Hide/Show and Delete.
+- **U**: the waypoint screen: waypoint sets, a filter, and for the waypoint you click, Add/Edit,
+  Teleport (T, operators only), Share, Enable/Disable and Delete.
+- **H**: a temporary waypoint where you stand. Dying leaves a deathpoint, gone when you reach it.
+- **Z**: hold for the enlarged minimap. **[** and **]**: zoom the minimap.
 - **Map modes**, shared by both maps:
   - **Auto**: the surface in the open, the cave around you underground, under a roof and in the Nether
   - **Cave**: always the cave around you

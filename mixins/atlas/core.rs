@@ -36,6 +36,8 @@ pub const KEY_ZOOM_IN: &str = "zoom_in";
 pub const DEFAULT_ZOOM_IN: &str = "key.keyboard.right.bracket";
 pub const KEY_ZOOM_OUT: &str = "zoom_out";
 pub const DEFAULT_ZOOM_OUT: &str = "key.keyboard.left.bracket";
+pub const KEY_TEMP: &str = "temporary";
+pub const DEFAULT_TEMP: &str = "key.keyboard.h";
 pub const KEY_MAP: &str = "map";
 pub const KEY_CREATE: &str = "create";
 pub const KEY_LIST: &str = "list";
@@ -74,6 +76,20 @@ const LABEL_BG: u32 = 0x9000_0000;
 /// The world map where nothing has been seen, and its bars.
 const MAP_VOID: u32 = 0xFF00_0000;
 
+/// What sort of waypoint one is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WpKind {
+    #[default]
+    Normal,
+    /// Where the player died.
+    Death,
+    /// Gone when the game closes.
+    Temporary,
+}
+
+/// The set a waypoint is in unless told otherwise.
+pub const DEFAULT_SET: &str = "Default";
+
 /// One waypoint. `pos` is a block position; `color` is `0xRRGGBB`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Waypoint {
@@ -82,6 +98,22 @@ pub struct Waypoint {
     pub dimension: String,
     pub color: u32,
     pub hidden: bool,
+    pub set: String,
+    pub kind: WpKind,
+}
+
+impl Default for Waypoint {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            pos: [0; 3],
+            dimension: OVERWORLD.to_owned(),
+            color: 0xFFFFFF,
+            hidden: false,
+            set: DEFAULT_SET.to_owned(),
+            kind: WpKind::Normal,
+        }
+    }
 }
 
 /// Where the player is, as the hooks read it: feet position, dimension and
@@ -354,10 +386,7 @@ pub enum Mode {
 /// What a click on the screen does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    NewWaypoint,
-    Filter(Filter),
     Toggle(usize),
-    Edit(usize),
     Delete(usize),
     Focus(Field),
     Color(u32),
@@ -367,8 +396,6 @@ pub enum Action {
     Save,
     Cancel,
     Close,
-    /// The world map, from the list.
-    OpenMap,
     /// The list, from the map.
     OpenList,
     /// The map follows the player again.
@@ -384,6 +411,19 @@ pub enum Action {
     SubPage(i32),
     SettingsBack,
     FocusSearch,
+    /// The next dimension filter of the list.
+    CycleFilter,
+    /// The next waypoint set.
+    CycleSet,
+    /// A new set, named after the filter text.
+    NewSet,
+    /// Delete every waypoint of the set (click twice).
+    ClearSet,
+    FocusFilter,
+    /// Edit the picked waypoint, else a new one.
+    AddEdit,
+    /// Say a waypoint in chat.
+    Share(usize),
     /// A row of the list: pick that waypoint.
     Select(usize),
     /// Teleport to a waypoint (operators).
@@ -1151,6 +1191,13 @@ settings! {
         Kind::Slider { min: 1, max: 180, div: 1, unit: "", zero: None };
     angle_h: i32 = 10, "angle_h", "WP Dist. Horis. Angle", Waypoints,
         Kind::Slider { min: 1, max: 180, div: 1, unit: "", zero: None };
+    render_all_sets: bool = false, "render_all_sets", "Render All Waypoint Sets", Waypoints, Kind::Toggle;
+    deathpoints: bool = true, "deathpoints", "Deathpoints", Waypoints, Kind::Toggle;
+    keep_deathpoints: bool = true, "keep_deathpoints", "Keep Old Deathpoints", Waypoints, Kind::Toggle;
+    delete_reached: bool = true, "delete_reached", "Delete Reached Deathpoints", Waypoints, Kind::Toggle;
+    cross_dim_tp: bool = true, "cross_dim_tp", "Cross-Dimensional TP", Waypoints, Kind::Toggle;
+    new_to_bottom: bool = false, "new_to_bottom", "New Waypoints to Bottom", Waypoints, Kind::Toggle;
+    hide_coords: bool = false, "hide_coords", "Hide Waypoint Coordinates", Waypoints, Kind::Toggle;
     max_render: i32 = 0, "max_render", "Max WP Render Dist.", Waypoints,
         Kind::Slider { min: 0, max: 10000, div: 1, unit: "m", zero: Some((0, "Unlimited")) };
     min_render: i32 = 0, "min_render", "Min WP Render Dist.", Waypoints,
@@ -1799,6 +1846,16 @@ pub struct State {
     pub can_teleport: bool,
     /// A teleport asked for: the dimension and block, sent by the next frame.
     pub teleport: Option<(String, [i32; 3])>,
+    /// A chat line asked for (Share), sent by the next frame.
+    pub say: Option<String>,
+    /// The set shown and new waypoints go in.
+    pub set: String,
+    /// The list's filter text, and whether typing goes there.
+    pub list_filter: String,
+    pub filter_focus: bool,
+    pub confirm_clear: bool,
+    /// The player was dead last frame.
+    pub was_dead: bool,
     /// Map columns of every cut seen, kept on disk.
     pub maps: Maps,
     /// When each loaded chunk was last scanned for a cut, and the world's
@@ -1844,6 +1901,12 @@ impl Default for State {
             slider: None,
             can_teleport: false,
             teleport: None,
+            say: None,
+            set: DEFAULT_SET.to_owned(),
+            list_filter: String::new(),
+            filter_focus: false,
+            confirm_clear: false,
+            was_dead: false,
             maps: Maps::default(),
             scans: HashMap::new(),
             map_dimension: None,
@@ -1907,19 +1970,22 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// One line per waypoint: name, x, y, z, dimension, colour, hidden.
+/// One line per waypoint: name, x, y, z, dimension, colour, hidden, set and
+/// kind. Temporary waypoints aren't kept.
 pub fn encode(list: &[Waypoint]) -> String {
     let mut out = String::from("# waypoints 1\n");
-    for w in list {
+    for w in list.iter().filter(|w| w.kind != WpKind::Temporary) {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{:06X}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\t{}\n",
             escape(&w.name),
             w.pos[0],
             w.pos[1],
             w.pos[2],
             w.dimension,
             w.color & 0xFF_FFFF,
-            u8::from(w.hidden)
+            u8::from(w.hidden),
+            escape(&w.set),
+            if w.kind == WpKind::Death { "d" } else { "w" }
         ));
     }
     out
@@ -1940,6 +2006,8 @@ pub fn decode(text: &str) -> Vec<Waypoint> {
                 dimension: f[4].to_owned(),
                 color: u32::from_str_radix(f[5], 16).ok()? & 0xFF_FFFF,
                 hidden: f[6].trim() == "1",
+                set: f.get(7).map_or(DEFAULT_SET.to_owned(), |t| unescape(t.trim())),
+                kind: if f.get(8).is_some_and(|k| k.trim() == "d") { WpKind::Death } else { WpKind::Normal },
             })
         })
         .collect()
@@ -2283,6 +2351,8 @@ impl State {
         if self.world == key {
             return;
         }
+        self.set = DEFAULT_SET.to_owned();
+        self.selected = None;
         self.waypoints = key
             .as_deref()
             .and_then(|k| std::fs::read_to_string(dir.join(world_file(k))).ok())
@@ -2507,6 +2577,8 @@ impl State {
 
     pub fn open_list(&mut self, skip: Option<char>) {
         self.mode = Mode::List;
+        self.filter_focus = false;
+        self.confirm_clear = false;
         self.confirm_delete = None;
         self.skip_char = skip;
     }
@@ -2634,6 +2706,7 @@ impl State {
             dimension: editor.dimension.clone(),
             color: editor.color,
             hidden: editor.hidden,
+            ..Waypoint::default()
         };
         let (index, back) = (editor.index, editor.back);
         let waypoint = if waypoint.name.is_empty() {
@@ -2645,11 +2718,92 @@ impl State {
             waypoint
         };
         match index.filter(|&i| i < self.waypoints.len()) {
-            Some(i) => self.waypoints[i] = waypoint,
-            None => self.waypoints.push(waypoint),
+            Some(i) => {
+                let old = &self.waypoints[i];
+                let waypoint = Waypoint { set: old.set.clone(), kind: old.kind, ..waypoint };
+                self.waypoints[i] = waypoint;
+            }
+            None => self.add_waypoint(Waypoint { set: self.set.clone(), ..waypoint }),
         }
         self.persist();
         self.leave_editor(back);
+    }
+
+    /// Adds a waypoint at the top of the list, or the bottom if so set.
+    fn add_waypoint(&mut self, w: Waypoint) {
+        if self.settings().new_to_bottom {
+            self.waypoints.push(w);
+        } else {
+            self.waypoints.insert(0, w);
+            self.selected = self.selected.map(|i| i + 1);
+        }
+    }
+
+    /// Whether a waypoint shows on the maps and in the world.
+    fn shows(&self, w: &Waypoint) -> bool {
+        let st = self.settings();
+        !w.hidden && (st.render_all_sets || w.set == self.set) && (w.kind != WpKind::Death || st.deathpoints)
+    }
+
+    /// The sets there are, the default one first.
+    pub fn sets(&self) -> Vec<String> {
+        let mut sets = vec![DEFAULT_SET.to_owned()];
+        for w in &self.waypoints {
+            if !sets.contains(&w.set) {
+                sets.push(w.set.clone());
+            }
+        }
+        if !sets.contains(&self.set) {
+            sets.push(self.set.clone());
+        }
+        sets
+    }
+
+    /// A temporary waypoint where the player stands.
+    pub fn add_temporary(&mut self, here: &Here) {
+        let n = self.waypoints.iter().filter(|w| w.kind == WpKind::Temporary).count() + 1;
+        self.add_waypoint(Waypoint {
+            name: format!("Temp {n}"),
+            pos: here.pos.map(|v| v.floor() as i32),
+            dimension: here.dimension.clone(),
+            color: 0xFFFF55,
+            set: self.set.clone(),
+            kind: WpKind::Temporary,
+            ..Waypoint::default()
+        });
+    }
+
+    /// The player is (not) dead, last seen at `here`: a deathpoint where
+    /// they died, and old ones go when they reach them.
+    pub fn track_death(&mut self, dead: bool, here: &Here) {
+        let st = self.settings();
+        if dead && !self.was_dead && st.deathpoints {
+            if !st.keep_deathpoints {
+                self.waypoints.retain(|w| w.kind != WpKind::Death);
+                self.selected = None;
+            }
+            self.add_waypoint(Waypoint {
+                name: "Death".to_owned(),
+                pos: here.pos.map(|v| v.floor() as i32),
+                dimension: here.dimension.clone(),
+                color: 0xFF5555,
+                set: self.set.clone(),
+                kind: WpKind::Death,
+                ..Waypoint::default()
+            });
+            self.persist();
+        }
+        self.was_dead = dead;
+        if !dead && st.delete_reached {
+            let near = |w: &Waypoint| {
+                w.kind == WpKind::Death && w.dimension == here.dimension && distance(here.pos, centre(w)) < 3.0
+            };
+            if self.waypoints.iter().any(near) {
+                self.waypoints.retain(|w| !near(w));
+                self.selected = None;
+                self.persist();
+            }
+        }
     }
 
     fn delete(&mut self, index: usize) {
@@ -2682,15 +2836,6 @@ impl State {
             self.confirm_delete = None;
         }
         match action {
-            Action::NewWaypoint => {
-                if let Some(here) = here {
-                    self.open_create(here, Back::List, None);
-                }
-            }
-            Action::Filter(filter) => {
-                self.filter = filter;
-                self.scroll = 0;
-            }
             Action::Opt(i) => {
                 let mut st = self.settings();
                 st.put(i, OPTS[i].next(st.raw(i)));
@@ -2719,8 +2864,54 @@ impl State {
                 if let Some(w) = self.waypoints.get(i)
                     && self.can_teleport
                 {
-                    self.teleport = Some((w.dimension.clone(), w.pos));
-                    self.close();
+                    let same = here.is_none_or(|h| h.dimension == w.dimension);
+                    if self.settings().cross_dim_tp || same {
+                        self.teleport = Some((w.dimension.clone(), w.pos));
+                        self.close();
+                    }
+                }
+            }
+            Action::CycleFilter => {
+                let at = Filter::ALL.iter().position(|f| *f == self.filter).unwrap_or(0);
+                self.filter = Filter::ALL[(at + 1) % Filter::ALL.len()];
+                self.scroll = 0;
+            }
+            Action::CycleSet => {
+                let sets = self.sets();
+                let at = sets.iter().position(|n| *n == self.set).unwrap_or(0);
+                self.set = sets[(at + 1) % sets.len()].clone();
+                self.selected = None;
+                self.confirm_clear = false;
+            }
+            Action::NewSet => {
+                let name = self.list_filter.trim().to_owned();
+                self.set = if name.is_empty() { format!("Set {}", self.sets().len() + 1) } else { name };
+                self.list_filter.clear();
+                self.selected = None;
+            }
+            Action::ClearSet => {
+                if std::mem::take(&mut self.confirm_clear) {
+                    let set = self.set.clone();
+                    self.waypoints.retain(|w| w.set != set);
+                    self.selected = None;
+                    self.persist();
+                } else {
+                    self.confirm_clear = true;
+                }
+            }
+            Action::FocusFilter => self.filter_focus = true,
+            Action::AddEdit => match self.selected {
+                Some(i) => self.open_edit(i, Back::List),
+                None => {
+                    if let Some(here) = here {
+                        self.open_create(here, Back::List, None);
+                    }
+                }
+            },
+            Action::Share(i) => {
+                if let Some(w) = self.waypoints.get(i) {
+                    let [x, y, z] = w.pos;
+                    self.say = Some(format!("[Waypoint] {} at {x} {y} {z} ({})", w.name, dimension_label(&w.dimension)));
                 }
             }
             Action::Toggle(i) => {
@@ -2729,7 +2920,6 @@ impl State {
                     self.persist();
                 }
             }
-            Action::Edit(i) => self.open_edit(i, Back::List),
             Action::MapWaypoint(i) => self.open_edit(i, Back::Map),
             Action::Delete(i) => self.delete(i),
             Action::Close => self.close(),
@@ -2767,7 +2957,6 @@ impl State {
                     e.error = None;
                 }
             }
-            Action::OpenMap => self.open_map(here, None),
             Action::OpenList => self.open_list(None),
             Action::CycleMapMode => {
                 let mut st = self.settings();
@@ -2804,8 +2993,20 @@ impl State {
                 k if k == settings_key && !v.searching => self.close(),
                 _ => {}
             },
+            Mode::List if self.filter_focus => match key {
+                "key.keyboard.escape" | "key.keyboard.enter" => self.filter_focus = false,
+                "key.keyboard.backspace" => {
+                    self.list_filter.pop();
+                }
+                _ => {}
+            },
             Mode::List => match key {
                 "key.keyboard.escape" => self.close(),
+                "key.keyboard.t" => {
+                    if let Some(i) = self.selected {
+                        self.act(Action::Teleport(i), here);
+                    }
+                }
                 "key.keyboard.up" => self.scroll = self.scroll.saturating_sub(1),
                 "key.keyboard.down" => self.scroll += 1,
                 k if k == list_key => self.close(),
@@ -2879,6 +3080,13 @@ impl State {
         {
             return;
         }
+        if self.mode == Mode::List {
+            if self.filter_focus && !c.is_control() && self.list_filter.chars().count() < NAME_MAX {
+                self.list_filter.push(c);
+                self.scroll = 0;
+            }
+            return;
+        }
         if let Mode::Settings(v) = &mut self.mode {
             if v.searching && !c.is_control() && v.search.chars().count() < NAME_MAX {
                 v.search.push(c);
@@ -2946,6 +3154,11 @@ impl State {
             1 => self.create_at_pointer(mouse, here, None),
             _ => {}
         }
+    }
+
+    /// The chat line asked for, once.
+    pub fn take_say(&mut self) -> Option<String> {
+        self.say.take()
     }
 
     /// The teleport asked for, once: `/execute in <dimension> run tp @s x y z`.
@@ -3067,7 +3280,7 @@ impl State {
         let mut shown: Vec<(f64, [f32; 2], &Waypoint)> = self
             .waypoints
             .iter()
-            .filter(|w| !w.hidden && w.dimension == dimension)
+            .filter(|w| self.shows(w) && w.dimension == dimension)
             .filter_map(|w| {
                 let d = distance(player, centre(w));
                 if d < f64::from(st.min_render) || (st.max_render > 0 && d > f64::from(st.max_render)) {
@@ -3329,7 +3542,7 @@ impl State {
         }
 
         // Waypoints: their letter on their colour, on the edge when far.
-        let marks = self.waypoints.iter().filter(|w| st.on_map && !w.hidden && w.dimension == here.dimension);
+        let marks = self.waypoints.iter().filter(|w| st.on_map && self.shows(w) && w.dimension == here.dimension);
         let map_alpha = st.map_opacity.clamp(0, 100) as u32 * 255 / 100;
         for w in marks {
             let c = centre(w);
@@ -3428,7 +3641,7 @@ impl State {
         // Waypoints: their letter, and their name over it.
         let mut hot = None;
         for (i, w) in self.waypoints.iter().enumerate() {
-            if w.dimension != dimension {
+            if w.dimension != dimension || (w.hidden && !live) || !(w.hidden || self.shows(w)) {
                 continue;
             }
             let c = centre(w);
@@ -3587,128 +3800,150 @@ impl State {
         );
     }
 
-    /// The waypoint list: every waypoint (or a dimension's), one a row;
-    /// a click picks one, and the buttons under the list act on it.
+    /// The waypoint screen, as Xaero's: the world and dimension on top, the
+    /// set with its buttons, the filter, the list, and a row of buttons for
+    /// the picked waypoint.
     fn draw_list(&mut self, out: &mut Out<'_>, size: [f32; 2], here: Option<&Here>) {
         let st = self.settings();
-        let pw = (size[0] - 16.0).min(360.0);
-        let ph = (size[1] - 16.0).max(140.0);
-        let (px, py) = (((size[0] - pw) / 2.0).round(), 8.0);
-        out.boxed([px, py, pw, ph], PANEL_EDGE, PANEL);
-        let right = px + pw - 6.0;
+        let w = (size[0] - 16.0).min(400.0).floor();
+        let left = ((size[0] - w) / 2.0).floor();
+        let half = ((w - 4.0) / 2.0).floor();
+        let boxed = |out: &mut Out<'_>, rect: [f32; 4], text: &str| {
+            out.boxed(rect, 0xFF20_2030, 0xFF10_1420);
+            let t = out.fit(text, rect[2] - 6.0);
+            let tw = out.width(&t);
+            out.text(&t, [(rect[0] + (rect[2] - tw) / 2.0).round(), rect[1] + 2.0], INK);
+        };
 
-        let title = format!("Waypoints ({})", self.waypoints.len());
-        out.text(&title, [px + 6.0, py + 6.0], INK);
-        let mut x = right;
-        for (label, action) in [("Close", Action::Close), ("+ New", Action::NewWaypoint), ("Map", Action::OpenMap)] {
-            let w = out.width(label) + 8.0;
-            x -= w;
-            out.button([x, py + 4.0, w, 12.0], label, action, false);
-            x -= 4.0;
+        // World and dimension.
+        let world = self.world.as_deref().unwrap_or("?");
+        let world = world.strip_prefix("world-").or(world.strip_prefix("server-")).unwrap_or(world).to_owned();
+        for (x, label) in [(left, "World/Server"), (left + half + 4.0, "Sub-World/Dimension")] {
+            let tw = out.width(label);
+            out.text(label, [(x + (half - tw) / 2.0).round(), 3.0], MUTED);
         }
+        boxed(out, [left, 13.0, half, 12.0], &world);
+        let dim_rect = [left + half + 4.0, 13.0, half, 12.0];
+        boxed(out, dim_rect, self.filter.label());
+        out.widgets.push(Widget { rect: dim_rect, action: Action::CycleFilter });
 
-        let mut fx = px + 6.0;
-        for filter in Filter::ALL {
-            let on = self.filter == filter;
-            fx += out.button_auto(fx, py + 20.0, filter.label(), Action::Filter(filter), on) + 3.0;
+        // Options, the set, Clear Set.
+        let side = 64.0;
+        mc_button(out, [left, 28.0, side, 16.0], "Options", Some(Action::GoPage(Page::Waypoints)));
+        let clear = if self.confirm_clear { "Sure?" } else { "Clear Set" };
+        mc_button(out, [left + w - side, 28.0, side, 16.0], clear, Some(Action::ClearSet));
+        let set_w = w - side * 2.0 - 8.0 - 20.0;
+        let set_rect = [left + side + 4.0, 30.0, set_w, 12.0];
+        boxed(out, set_rect, &self.set.clone());
+        out.widgets.push(Widget { rect: set_rect, action: Action::CycleSet });
+        mc_button(out, [left + side + 6.0 + set_w, 28.0, 16.0, 16.0], "+", Some(Action::NewSet));
+        out.fill([0.0, 47.0, size[0], 1.0], 0x60FF_FFFF);
+
+        // The filter.
+        let frect = [left, 51.0, side + 40.0, 13.0];
+        out.fill(frect, if self.filter_focus { 0xFFFF_FFFF } else { 0xFFA0_A0A0 });
+        out.fill([frect[0] + 1.0, frect[1] + 1.0, frect[2] - 2.0, frect[3] - 2.0], 0xFF00_0000);
+        let shown = if self.filter_focus { format!("{}_", self.list_filter) } else { self.list_filter.clone() };
+        if shown.is_empty() {
+            out.text("Filter...", [frect[0] + 3.0, frect[1] + 3.0], 0x707070);
+        } else {
+            let t = out.fit(&shown, frect[2] - 6.0);
+            out.text(&t, [frect[0] + 3.0, frect[1] + 3.0], INK);
         }
+        out.widgets.push(Widget { rect: frect, action: Action::FocusFilter });
 
+        let wanted = self.list_filter.trim().to_lowercase();
         let rows: Vec<usize> = self
             .waypoints
             .iter()
             .enumerate()
-            .filter(|(_, w)| self.filter.matches(&w.dimension))
+            .filter(|(_, p)| self.filter.matches(&p.dimension) && p.set == self.set)
+            .filter(|(_, p)| wanted.is_empty() || p.name.to_lowercase().contains(&wanted))
             .map(|(i, _)| i)
             .collect();
         if self.selected.is_some_and(|i| !rows.contains(&i)) {
             self.selected = None;
         }
-        let bar = 24.0;
-        let top = py + 38.0;
-        let bottom = py + ph - bar - 14.0;
+        let top = 67.0;
+        let bottom = size[1] - 50.0;
         let fits = (((bottom - top) / ROW).floor() as usize).max(1);
         self.scroll = self.scroll.min(rows.len().saturating_sub(fits));
 
         if rows.is_empty() {
-            let msg = if self.waypoints.is_empty() {
-                "No waypoints yet. Press B in game, or on the world map."
-            } else {
-                "No waypoints in this dimension."
-            };
-            out.text(msg, [px + 8.0, top + 6.0], MUTED);
+            let msg = "No waypoints here. Press B in the game or on the world map.";
+            let msg = out.fit(msg, w - 8.0);
+            out.text(&msg, [left + 4.0, top + 6.0], MUTED);
         }
         for (slot, &i) in rows.iter().skip(self.scroll).take(fits).enumerate() {
-            let w = &self.waypoints[i];
+            let wp = &self.waypoints[i];
             let ry = top + slot as f32 * ROW;
-            let rect = [px + 4.0, ry, pw - 8.0, ROW - 2.0];
-            let picked = self.selected == Some(i);
-            let hover = inside(rect, out.mouse);
-            if picked {
+            let rect = [left, ry, w, ROW - 2.0];
+            if self.selected == Some(i) {
                 out.boxed(rect, FIELD_FOCUS, 0x6040_4060);
             } else {
-                out.fill(rect, if hover { 0x5040_4050 } else { ROW_BG });
+                out.fill(rect, if inside(rect, out.mouse) { 0x5040_4050 } else { ROW_BG });
             }
-
-            // Letter on its colour, name and coordinates.
             let mut marks = Vec::new();
-            letter_marker(&mut marks, [px + 14.0, ry + 11.0], w, 5.0, false, 255);
+            letter_marker(&mut marks, [left + 11.0, ry + 11.0], wp, 5.0, false, 255);
             out.draws.extend(marks);
-            let dim = dimension_label(&w.dimension);
+            let dim = dimension_label(&wp.dimension);
             let dist = match here {
                 _ if !st.list_distance => String::new(),
-                Some(h) if h.dimension == w.dimension => {
-                    distance_text(distance(h.pos, centre(w)), st.km_at, st.precision)
+                Some(h) if h.dimension == wp.dimension => {
+                    distance_text(distance(h.pos, centre(wp)), st.km_at, st.precision)
                 }
                 _ => "other dimension".into(),
             };
             let (dim_w, dist_w) = (out.width(&dim), out.width(&dist));
-            let info_right = right - 4.0;
-            out.text(&dim, [info_right - dim_w, ry + 3.0], dimension_color(&w.dimension));
+            let info_right = left + w - 4.0;
+            out.text(&dim, [info_right - dim_w, ry + 3.0], dimension_color(&wp.dimension));
             out.text(&dist, [info_right - dist_w, ry + 3.0 + LINE], MUTED);
-            let text_x = px + 24.0;
+            let text_x = left + 21.0;
             let room = info_right - dim_w.max(dist_w) - 6.0 - text_x;
-            let name = out.fit(&w.name, room);
-            out.text(&name, [text_x, ry + 3.0], if w.hidden { MUTED } else { INK });
-            let coords = format!("{} {} {}{}", w.pos[0], w.pos[1], w.pos[2], if w.hidden { "  (hidden)" } else { "" });
+            let tag = match wp.kind {
+                WpKind::Normal => "",
+                WpKind::Death => " (deathpoint)",
+                WpKind::Temporary => " (temporary)",
+            };
+            let name = out.fit(&format!("{}{tag}", wp.name), room);
+            out.text(&name, [text_x, ry + 3.0], if wp.hidden { MUTED } else { INK });
+            let coords = if st.hide_coords {
+                String::new()
+            } else {
+                format!("{} {} {}{}", wp.pos[0], wp.pos[1], wp.pos[2], if wp.hidden { "  (disabled)" } else { "" })
+            };
             let coords = out.fit(&coords, room);
             out.text(&coords, [text_x, ry + 3.0 + LINE], MUTED);
-            out.widgets.push(Widget {
-                rect,
-                action: Action::Select(i),
-            });
+            out.widgets.push(Widget { rect, action: Action::Select(i) });
         }
-
         let more = rows.len().saturating_sub(self.scroll + fits);
-        let hint = if self.scroll > 0 || more > 0 {
-            format!("Scroll for more ({} above, {} below)", self.scroll, more)
-        } else if self.selected.is_none() && !rows.is_empty() {
-            "Click a waypoint for its buttons".to_owned()
-        } else {
-            "B new waypoint  -  M map  -  U or Esc close".to_owned()
-        };
-        out.text(&hint, [px + 6.0, bottom + 2.0], MUTED);
+        if self.scroll > 0 || more > 0 {
+            let hint = format!("{} above, {} below", self.scroll, more);
+            let tw = out.width(&hint);
+            out.text(&hint, [left + w - tw, 54.0], MUTED);
+        }
 
-        // The button row, as Minecraft's screens lay theirs out.
-        let by = py + ph - bar - 2.0;
-        let mut buttons: Vec<(String, Option<Action>)> = Vec::new();
-        let picked = self.selected.and_then(|i| self.waypoints.get(i).map(|w| (i, w.hidden)));
-        let act = |a: Action| picked.map(|_| a);
-        let i = picked.map_or(0, |p| p.0);
-        if self.can_teleport {
-            buttons.push(("Teleport".into(), act(Action::Teleport(i))));
-        }
-        buttons.push(("Edit".into(), act(Action::Edit(i))));
-        let vis = if picked.is_some_and(|p| p.1) { "Show" } else { "Hide" };
-        buttons.push((vis.into(), act(Action::Toggle(i))));
-        let del = if picked.is_some() && self.confirm_delete == picked.map(|p| p.0) { "Sure?" } else { "Delete" };
-        buttons.push((del.into(), act(Action::Delete(i))));
-        let n = buttons.len() as f32;
-        let gap = 4.0;
-        let bw = ((pw - 12.0 - gap * (n - 1.0)) / n).floor();
+        // Add/Edit, Teleport (T), Share, Enable, Delete; Done.
+        out.fill([0.0, size[1] - 48.0, size[0], 1.0], 0x60FF_FFFF);
+        let picked = self.selected.and_then(|i| self.waypoints.get(i).map(|p| (i, p.hidden)));
+        let act = |a: fn(usize) -> Action| picked.map(|p| a(p.0));
+        let enable = if picked.is_some_and(|p| p.1) { "Enable" } else { "Disable" };
+        let del = if picked.is_some_and(|p| self.confirm_delete == Some(p.0)) { "Sure?" } else { "Delete" };
+        let tp = if self.can_teleport { act(Action::Teleport) } else { None };
+        let buttons: [(&str, Option<Action>); 5] = [
+            ("Add/Edit", Some(Action::AddEdit)),
+            ("Teleport (T)", tp),
+            ("Share", act(Action::Share)),
+            (enable, act(Action::Toggle)),
+            (del, act(Action::Delete)),
+        ];
+        let gap = 3.0;
+        let bw = ((w - gap * 4.0) / 5.0).floor();
         for (k, (label, action)) in buttons.into_iter().enumerate() {
-            let rect = [px + 6.0 + k as f32 * (bw + gap), by, bw, 20.0];
-            mc_button(out, rect, &label, action);
+            mc_button(out, [left + k as f32 * (bw + gap), size[1] - 45.0, bw, 18.0], label, action);
         }
+        let done_w = 150.0_f32.min(w);
+        mc_button(out, [((size[0] - done_w) / 2.0).round(), size[1] - 24.0, done_w, 20.0], "Done", Some(Action::Close));
     }
 }
 
@@ -3880,6 +4115,7 @@ mod tests {
                 dimension: NETHER.into(),
                 color: 0xFF5555,
                 hidden: true,
+                ..Waypoint::default()
             },
             Waypoint {
                 name: "Ünïcode ⛏".into(),
@@ -3887,6 +4123,7 @@ mod tests {
                 dimension: OVERWORLD.into(),
                 color: 0x00AA00,
                 hidden: false,
+                ..Waypoint::default()
             },
         ];
         assert_eq!(decode(&encode(&list)), list);
@@ -3963,7 +4200,8 @@ mod tests {
         s.open_list(None);
         s.act(Action::Toggle(0), None);
         assert!(s.waypoints[0].hidden);
-        s.act(Action::Edit(0), None);
+        s.selected = Some(0);
+        s.act(Action::AddEdit, None);
         s.act(Action::CycleDimension, None);
         s.act(Action::Save, None);
         assert_eq!(s.waypoints[0].dimension, NETHER);
@@ -3996,21 +4234,21 @@ mod tests {
             dimension: OVERWORLD.into(),
             color: 0xFFAA00,
             hidden: false,
+            ..Waypoint::default()
         });
         s.open_list(None);
         let (draws, widgets) = s.screen([480.0, 270.0], [0.0, 0.0], Some(&here(OVERWORLD)), &measure);
         assert!(draws.iter().any(|d| matches!(d, Draw::Text(t, _, _, _) if t == "Overworld")));
-        // Nothing picked: the button row is inert.
-        assert!(!widgets.iter().any(|w| w.action == Action::Edit(0)));
+        // Nothing picked: the buttons for one are inert.
+        assert!(!widgets.iter().any(|w| w.action == Action::Share(0)));
         let row = widgets.iter().find(|w| w.action == Action::Select(0)).unwrap();
         let at = [row.rect[0] + 1.0, row.rect[1] + 1.0];
         s.press(0, at, &widgets, None);
         assert_eq!(s.selected, Some(0));
         let (_, widgets) = s.screen([480.0, 270.0], [0.0, 0.0], Some(&here(OVERWORLD)), &measure);
-        let edit = widgets.iter().find(|w| w.action == Action::Edit(0)).unwrap();
-        let at = [edit.rect[0] + 1.0, edit.rect[1] + 1.0];
-        assert_eq!(hit(&widgets, at), Some(Action::Edit(0)));
-        assert!(widgets.iter().any(|w| w.action == Action::OpenMap));
+        let share = widgets.iter().find(|w| w.action == Action::Share(0)).unwrap();
+        let at = [share.rect[0] + 1.0, share.rect[1] + 1.0];
+        assert_eq!(hit(&widgets, at), Some(Action::Share(0)));
         // Teleport only for operators, and it closes the screen.
         assert!(!widgets.iter().any(|w| w.action == Action::Teleport(0)));
         s.can_teleport = true;
@@ -4024,7 +4262,8 @@ mod tests {
         assert!(s.take_close());
         s.open_list(None);
 
-        s.act(Action::Edit(0), None);
+        s.selected = Some(0);
+        s.act(Action::AddEdit, None);
         let (_, widgets) = s.screen([480.0, 270.0], [0.0, 0.0], None, &measure);
         assert!(widgets.iter().any(|w| w.action == Action::Color(0xFF55FF)));
         assert!(widgets.iter().any(|w| w.action == Action::Save));
@@ -4045,6 +4284,7 @@ mod tests {
             dimension: dim.into(),
             color: 0x55FFFF,
             hidden,
+            ..Waypoint::default()
         };
         s.waypoints = vec![mk("A", OVERWORLD, false), mk("B", OVERWORLD, true), mk("C", NETHER, false)];
         let draws = s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], &measure);
@@ -4170,6 +4410,7 @@ mod tests {
             dimension: OVERWORLD.into(),
             color: 0xFF0000,
             hidden: false,
+            ..Waypoint::default()
         });
         let h = Here {
             pos: [0.5, 64.0, 0.5],
@@ -4286,6 +4527,53 @@ mod tests {
         s.set_cut(Cut::Below(31));
         assert!(kept(&mut s, 20.0));
         assert!(!kept(&mut s, 65.0));
+    }
+
+    #[test]
+    fn sets_deathpoints_and_temporary_waypoints() {
+        let dir = std::env::temp_dir().join(format!("atlas-sets-{}", std::process::id()));
+        let mut s = State::default();
+        s.load_world(Some("w".into()), dir.clone());
+        let h = here(OVERWORLD);
+        s.open_create(&h, Back::List, None);
+        s.act(Action::Save, None);
+        assert_eq!(s.waypoints[0].set, DEFAULT_SET);
+        // A new set is empty, and what is in another set doesn't show.
+        s.list_filter = "Mine".into();
+        s.act(Action::NewSet, None);
+        assert_eq!(s.set, "Mine");
+        let camera = Camera { pos: h.pos, yaw: 0.0, pitch: 0.0, fov: 70.0 };
+        assert!(!s.shows(&s.waypoints[0].clone()));
+        s.open_create(&h, Back::List, None);
+        s.act(Action::Save, None);
+        assert_eq!(s.sets(), [DEFAULT_SET, "Mine"]);
+        let _ = camera;
+        // Clearing the set takes two clicks and leaves the others.
+        s.act(Action::ClearSet, None);
+        assert_eq!(s.waypoints.len(), 2);
+        s.act(Action::ClearSet, None);
+        assert_eq!(s.waypoints.len(), 1);
+        s.act(Action::CycleSet, None);
+        assert_eq!(s.set, DEFAULT_SET);
+        // A deathpoint comes once, and goes when reached.
+        s.track_death(true, &h);
+        s.track_death(true, &h);
+        let deaths = |s: &State| s.waypoints.iter().filter(|w| w.kind == WpKind::Death).count();
+        assert_eq!(deaths(&s), 1);
+        let far = Here { pos: [500.0, 64.0, 500.0], ..h.clone() };
+        s.track_death(false, &far);
+        assert_eq!(deaths(&s), 1);
+        s.track_death(false, &h);
+        assert_eq!(deaths(&s), 0);
+        // Temporary waypoints aren't kept; sets and deathpoints are.
+        s.add_temporary(&h);
+        s.track_death(true, &far);
+        let back = decode(&encode(&s.waypoints));
+        assert_eq!(back.len(), s.waypoints.len() - 1);
+        assert!(back.iter().any(|w| w.kind == WpKind::Death));
+        s.act(Action::Share(0), None);
+        assert!(s.take_say().is_some_and(|l| l.contains("Death")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

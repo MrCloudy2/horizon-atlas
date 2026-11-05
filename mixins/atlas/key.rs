@@ -16,6 +16,12 @@ fn atlas_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if !pressed || !game.native_playing() {
         return;
     }
+    if key == game.native_mod_key(m::ID, m::KEY_TEMP, m::DEFAULT_TEMP) {
+        if let Some(here) = crate::game::atlas_bridge::here(game) {
+            m::with(|s| s.add_temporary(&here));
+        }
+        return;
+    }
     if key == game.native_mod_key(m::ID, m::KEY_ZOOM_IN, m::DEFAULT_ZOOM_IN) {
         m::with(|s| s.zoom_key(true));
         return;
