@@ -549,7 +549,9 @@ fn upload_minimap(game: &mut Game<'_>) {
         return;
     };
     let (x, z, yaw) = (p.x, p.z, p.yaw);
-    let changed = m::with(|s| s.update_minimap(x, z, yaw));
+    let world = &game.world;
+    let light = |x: i32, y: i32, z: i32| world.light(x, y, z) & 15;
+    let changed = m::with(|s| s.update_minimap_lit(x, z, yaw, &light));
     let (slot, fresh) = slot_for(game, m::MINIMAP_SLOT_KEY);
     if changed || fresh || m::with(|s| s.mini_slot != Some(slot)) {
         let image = m::with(|s| s.mini_image.clone());

@@ -1186,6 +1186,8 @@ const ARROW_RGB: [u32; 5] = [0xE03030, 0xF0F0F0, 0xFFD030, 0x40D050, 0x4080F0];
 const COLOR_MODES: &[(&str, &str)] = &[("accurate", "Accurate"), ("vanilla", "Vanilla")];
 const AUTO_CAVE: &[(&str, &str)] = &[("ceiling3", "3x3 Ceiling"), ("ceiling1", "1x1 Ceiling"), ("off", "OFF")];
 const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Normal"), ("strong", "Strong")];
+const GRID_COLORS: &[(&str, &str)] = &[("off", "OFF"), ("black", "Black"), ("white", "White"), ("red", "Red")];
+const GRID_RGB: [[u16; 3]; 4] = [[0, 0, 0], [0, 0, 0], [255, 255, 255], [230, 40, 40]];
 const DISTANCE_MODES: &[(&str, &str)] = &[("off", "OFF"), ("looking", "Looking At"), ("always", "Always")];
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
@@ -1264,6 +1266,12 @@ settings! {
         Kind::Slider { min: 10, max: 100, div: 1, unit: "", zero: None };
     hide_invisible: bool = true, "hide_invisible", "Hide Invisible Entities", Radar, Kind::Toggle;
 
+    chunk_grid: usize = 0, "chunk_grid", "Chunk Grid", Overlay, Kind::Choice(GRID_COLORS);
+    grid_width: i32 = 1, "grid_width", "Chunk Grid Line Width", Overlay,
+        Kind::Slider { min: 1, max: 4, div: 1, unit: "", zero: None };
+    light_overlay: bool = false, "light_overlay", "Light Overlay", Overlay, Kind::Toggle;
+    light_level: i32 = 1, "light_level", "Light Overlay Below Level", Overlay,
+        Kind::Slider { min: 1, max: 15, div: 1, unit: "", zero: None };
     slime: bool = false, "slime", "Slime Chunks", Overlay, Kind::Toggle;
 
     coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
@@ -1663,8 +1671,32 @@ pub fn tint_slime(grid: &MiniGrid, round: bool, seed: i64, image: &mut [u8]) {
             if !*known.entry(chunk).or_insert_with(|| is_slime_chunk(seed, chunk.0, chunk.1)) {
                 continue;
             }
-            for (k, green) in [40u16, 200, 60].into_iter().enumerate() {
-                image[o + k] = ((u16::from(image[o + k]) * 3 + green * 2) / 5) as u8;
+            tint(image, o, [40, 200, 60]);
+        }
+    }
+}
+
+/// Mixes `rgb` two fifths into texel `o` of an image.
+fn tint(image: &mut [u8], o: usize, rgb: [u16; 3]) {
+    for (k, c) in rgb.into_iter().enumerate() {
+        image[o + k] = ((u16::from(image[o + k]) * 3 + c * 2) / 5) as u8;
+    }
+}
+
+/// Draws the chunk borders on a composed minimap image, `width` texels wide
+/// in colour `GRID_RGB[color]`.
+pub fn tint_grid(grid: &MiniGrid, color: usize, width: i32, image: &mut [u8]) {
+    let rgb = GRID_RGB[color.min(GRID_RGB.len() - 1)];
+    let blocks = ((f64::from(width) * grid.bpp).ceil() as i32).clamp(1, 8);
+    for j in 0..MINI {
+        for i in 0..MINI {
+            let o = (j * MINI + i) * 4;
+            if image.len() < o + 4 || image[o + 3] == 0 {
+                continue;
+            }
+            let (x, z) = grid.block(i, j);
+            if (x & 15) < blocks || (z & 15) < blocks {
+                tint(image, o, rgb);
             }
         }
     }
@@ -1684,6 +1716,8 @@ pub struct MiniKey {
     /// The seed slime chunks were shown for.
     pub slime: Option<i64>,
     pub undiscovered: i32,
+    pub grid: (usize, i32),
+    pub light: Option<i32>,
 }
 
 // ---- The world map -----------------------------------------------------------------
@@ -2650,7 +2684,13 @@ impl State {
     /// Lays the minimap's grid over the player at `(x, z)` facing `yaw` and
     /// recomposes its image when what it shows changed: true when it did
     /// (upload `mini_image` then).
+    #[cfg(test)]
     pub fn update_minimap(&mut self, x: f64, z: f64, yaw: f32) -> bool {
+        self.update_minimap_lit(x, z, yaw, &|_, _, _| 15)
+    }
+
+    /// `update_minimap`, with `light` for the block light at a position.
+    pub fn update_minimap_lit(&mut self, x: f64, z: f64, yaw: f32, light: &dyn Fn(i32, i32, i32) -> u8) -> bool {
         let seed = self.seed;
         let st = self.settings();
         let bpp = self.mini_zoom();
@@ -2673,6 +2713,8 @@ impl State {
             stamp,
             slime,
             undiscovered: st.undiscovered,
+            grid: (st.chunk_grid, st.grid_width),
+            light: st.light_overlay.then_some(st.light_level),
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
             return false;
@@ -2682,6 +2724,24 @@ impl State {
         compose_minimap(&grid, st.round, st.undiscovered, st.shading(), &mut column, &mut self.mini_image);
         if let Some(seed) = slime {
             tint_slime(&grid, st.round, seed, &mut self.mini_image);
+        }
+        if st.chunk_grid > 0 {
+            tint_grid(&grid, st.chunk_grid, st.grid_width, &mut self.mini_image);
+        }
+        if st.light_overlay {
+            for j in 0..MINI {
+                for i in 0..MINI {
+                    let o = (j * MINI + i) * 4;
+                    let (x, z) = grid.block(i, j);
+                    let Some((c, h, _)) = store.column(x, z) else {
+                        continue;
+                    };
+                    let dark = i32::from(light(x, i32::from(h) + 1, z)) < st.light_level;
+                    if c & KIND == LAND && c & WALL == 0 && dark {
+                        tint(&mut self.mini_image, o, [230, 30, 30]);
+                    }
+                }
+            }
         }
         self.mini_key = Some(key);
         true
@@ -4734,6 +4794,28 @@ mod tests {
         assert_eq!(count(&s), (0, 0, 0));
         s.tab_held = true;
         assert_eq!(count(&s), (1, 1, 1));
+    }
+
+    #[test]
+    fn overlays_mark_chunks_and_dark_blocks() {
+        let mut s = State::default();
+        s.maps.store(Cut::Surface).put(0, 0, grass(64));
+        s.settings = Some(Settings { lock_north: true, ..Settings::default() });
+        s.update_minimap(8.5, 8.5, 0.0);
+        let plain = s.mini_image.clone();
+        let mut st = s.settings();
+        st.chunk_grid = 3;
+        s.change_settings(st);
+        assert!(s.update_minimap(8.5, 8.5, 0.0));
+        assert_ne!(s.mini_image, plain, "the grid shows");
+        st.chunk_grid = 0;
+        st.light_overlay = true;
+        s.change_settings(st);
+        assert!(s.update_minimap_lit(8.5, 8.5, 0.0, &|_, _, _| 0));
+        assert_ne!(s.mini_image, plain, "dark blocks show");
+        s.change_settings(Settings { light_level: 0, ..st });
+        assert!(s.update_minimap_lit(8.5, 8.5, 0.0, &|_, _, _| 0));
+        assert_eq!(s.mini_image, plain);
     }
 
     #[test]
