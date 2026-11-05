@@ -621,28 +621,33 @@ fn shade_chunk(store: &mut Store, chunk: (i32, i32), how: Shading) -> Rc<ShadedC
 /// water darker the deeper it is, cut walls dark.
 pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, depth: u8, how: Shading) -> [u8; 4] {
     let rgb = color & RGB;
+    // As Xaero's, measured from its map: flat ground is one even colour and
+    // each step in height a crisp line. The light comes from the north
+    // west: a block under a higher north neighbour is in hard shadow, under
+    // a higher west neighbour in soft shadow.
+    let dn = height - north.unwrap_or(height);
+    let dw = height - west.unwrap_or(height);
+    let shadow = if dn < 0 {
+        0.57
+    } else if dw < 0 {
+        0.83
+    } else if dn > 0 || dw > 0 {
+        1.08
+    } else {
+        1.0
+    };
+    let k = [0.0, 1.0, 1.3][how.slopes.min(2)];
+    let slope = 1.0 + (shadow - 1.0) * k;
     let f = if color & WALL != 0 {
         0.38
     } else if color & KIND == WATER {
-        if how.transparency { 1.0 - f32::from(depth.min(14)) * 0.012 } else { 1.0 }
-    } else {
-        // As Xaero's, measured from its map: flat ground is one even colour
-        // and each step in height a crisp line. The light comes from the
-        // north west: a block under a higher north neighbour is in hard
-        // shadow, under a higher west neighbour in soft shadow.
-        let dn = height - north.unwrap_or(height);
-        let dw = height - west.unwrap_or(height);
-        let shadow = if dn < 0 {
-            0.57
-        } else if dw < 0 {
-            0.83
-        } else if dn > 0 || dw > 0 {
-            1.08
+        // `height` is the bottom's here: its relief shows through, faintly.
+        if how.transparency {
+            (1.0 + (slope - 1.0) * 0.25) * (1.0 - f32::from(depth.min(14)) * 0.006)
         } else {
             1.0
-        };
-        let k = [0.0, 1.0, 1.3][how.slopes.min(2)];
-        let slope = 1.0 + (shadow - 1.0) * k;
+        }
+    } else {
         // Flats in even bands by height.
         let band = (f32::from(height) - 62.0).div_euclid(16.0);
         let up = if how.terrain_depth { (band * 0.06).clamp(-0.12, 0.12) } else { 0.0 };
@@ -651,7 +656,7 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
     // The colour grade from the blocks' averages to Xaero's: measured on
     // grass, sand and gravel of the same world.
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
-    let grade = if color & KIND == WATER { [1.0, 0.81, 0.75] } else { [0.84, 0.86, 0.9] };
+    let grade = if color & KIND == WATER { [0.89, 0.745, 0.66] } else { [0.84, 0.86, 0.9] };
     let ch = |c: f32, grade: f32| (c * grade * f).round().clamp(0.0, 255.0) as u8;
     [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
 }
@@ -669,10 +674,13 @@ fn shaded(
     if color & KIND == 0 {
         return Some(UNKNOWN);
     }
-    let land = |c: &(u32, i16, u8)| c.0 & KIND == LAND && c.0 & WALL == 0;
-    let north = column(x, z - step).filter(land).map(|c| c.1);
-    let west = column(x - step, z).filter(land).map(|c| c.1);
-    Some(shade(color, height, north, west, depth, how))
+    // Land against land; water against water, by the height of its bottom.
+    let water = color & KIND == WATER;
+    let like = |c: &(u32, i16, u8)| c.0 & WALL == 0 && c.0 & KIND == if water { WATER } else { LAND };
+    let level = |c: (u32, i16, u8)| if water { c.1 - i16::from(c.2) } else { c.1 };
+    let north = column(x, z - step).filter(like).map(level);
+    let west = column(x - step, z).filter(like).map(level);
+    Some(shade(color, level((color, height, depth)), north, west, depth, how))
 }
 
 /// Chunk offsets at Chebyshev distance `ring`.
@@ -5031,8 +5039,8 @@ mod tests {
         assert_eq!(hard, 61);
         // Deep water is darker unless transparency is off.
         let water = |how| shade(WATER | 0x808080, 60, None, None, 10, how)[0];
-        assert!(water(flat) < 128);
-        assert_eq!(water(Shading { transparency: false, ..flat }), 128);
+        assert!(water(flat) < 114);
+        assert_eq!(water(Shading { transparency: false, ..flat }), 114);
         // Auto waits for the timer; other modes don't.
         let mut s = State::default();
         s.want_cut(Cut::Below(31));

@@ -290,23 +290,24 @@ impl Scan<'_> {
             let water = Look { rgb: self.palette.water, map_rgb: look.map_rgb, tint: Tint::Water, flags: look.flags };
             let mut rgb = self.color(water, x, y, z);
             if self.transparency {
-                // See-through: the bottom shows under shallow water.
+                // See-through at every depth: the bottom keeps showing under
+                // a blue tint, more of it in the shallows. Measured from
+                // Xaero's map, as is the tint under it.
                 let under = self.look(x, below, z);
                 let bottom = self.color(under, x, below, z);
-                // In steps, measured from Xaero's map.
                 let a = match depth {
                     0 | 1 => 0.72,
-                    2 => 0.86,
-                    3 => 0.94,
-                    _ => 1.0,
+                    2 => 0.8,
+                    3 => 0.85,
+                    _ => 0.9,
                 };
                 // The map grades water apart from land: the bottom is graded
                 // as land here, undoing the water's grade to come.
-                let ch = |s: u32, land: f32| {
+                let ch = |s: u32, tint: f32, land: f32| {
                     let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
-                    ((w * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
+                    ((w * tint * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
                 };
-                rgb = ch(16, 0.84) | ch(8, 1.06) | ch(0, 1.2);
+                rgb = ch(16, 0.83, 0.94) | ch(8, 0.99, 1.15) | ch(0, 1.15, 1.36);
             }
             return (m::WATER | rgb, y as i16, depth);
         }
