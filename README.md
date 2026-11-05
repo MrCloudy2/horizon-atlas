@@ -1,6 +1,7 @@
 # Atlas for Horizon
 
-A minimap, a world map of everywhere you have been, and waypoints on both, as a native Horizon mod
+A minimap, a world map of everywhere you have been, and waypoints on both, in the style of Xaero's
+Minimap and World Map (no code or art from them), as a native Horizon mod
 (Minecraft 26.3, Horizon Nightly 2026-11-05, `f319701`).
 
 Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT). The map columns and
@@ -28,7 +29,10 @@ their shading follow Horizon's own minimap (MIT).
   - **Layer**: a cut at a height you choose
 
   Each mode is kept on disk, so the world map remembers caves too.
-- **Waypoint labels in the world**: name, distance and letter.
+- **Waypoints in the world**: a small square with the letter and the name under it; the distance
+  shows while you look at it.
+- **Tab**: faces and item icons on the minimap instead of dots.
+- **Overlays**: chunk grid, dark spots where mobs can spawn, slime chunks.
 
 ## Settings
 

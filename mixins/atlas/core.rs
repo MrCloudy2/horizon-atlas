@@ -58,8 +58,6 @@ pub const PALETTE: [u32; 16] = [
 const NAME_MAX: usize = 32;
 const COORD_MAX: usize = 9;
 const LINE: f32 = 10.0;
-/// The lines under the minimap, smaller than the GUI's font.
-const INFO_SCALE: f32 = 0.7;
 const ROW: f32 = 24.0;
 
 const INK: u32 = 0xFFFFFF;
@@ -142,6 +140,10 @@ pub struct Camera {
 pub struct MiniInfo {
     pub biome: Option<String>,
     pub day_time: Option<i64>,
+    /// Block and sky light where the player stands.
+    pub light: Option<(u8, u8)>,
+    /// Rain and thunder, 0 to 1.
+    pub weather: Option<(f32, f32)>,
 }
 
 /// What a dot on the minimap stands for.
@@ -256,11 +258,12 @@ pub fn disc(draws: &mut Vec<Draw>, at: [f32; 2], r: f32, argb: u32) {
 }
 
 /// Text in `rgb` with a black outline, as Xaero's compass letters.
-pub fn outlined(draws: &mut Vec<Draw>, text: &str, at: [f32; 2], rgb: u32) {
+pub fn outlined(draws: &mut Vec<Draw>, text: &str, at: [f32; 2], rgb: u32, scale: f32) {
     for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-        draws.push(Draw::Text(text.into(), [at[0] + dx, at[1] + dy], 0x10_1010, false));
+        let p = [at[0] + dx * scale, at[1] + dy * scale];
+        draws.push(Draw::Label(text.into(), p, 0xFF10_1010, scale, false));
     }
-    draws.push(Draw::Text(text.into(), at, rgb, false));
+    draws.push(Draw::Label(text.into(), at, 0xFF00_0000 | rgb, scale, false));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1188,6 +1191,9 @@ const AUTO_CAVE: &[(&str, &str)] = &[("ceiling3", "3x3 Ceiling"), ("ceiling1", "
 const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Normal"), ("strong", "Strong")];
 const GRID_COLORS: &[(&str, &str)] = &[("off", "OFF"), ("black", "Black"), ("white", "White"), ("red", "Red")];
 const GRID_RGB: [[u16; 3]; 4] = [[0, 0, 0], [0, 0, 0], [255, 255, 255], [230, 40, 40]];
+const ALIGNMENTS: &[(&str, &str)] = &[("center", "Center"), ("left", "Left"), ("right", "Right")];
+const NORTH_COLORS: &[(&str, &str)] = &[("default", "Default"), ("red", "Red"), ("yellow", "Yellow"), ("blue", "Blue")];
+const NORTH_RGB: [u32; 4] = [INK, 0xFF5555, 0xFFFF55, 0x5599FF];
 const DISTANCE_MODES: &[(&str, &str)] = &[("off", "OFF"), ("looking", "Looking At"), ("always", "Always")];
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
@@ -1277,6 +1283,17 @@ settings! {
     coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
     biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
     time: bool = true, "time", "Time of Day", Info, Kind::Toggle;
+    facing: bool = false, "facing", "Facing", Info, Kind::Toggle;
+    dimension_line: bool = false, "dimension", "Dimension", Info, Kind::Toggle;
+    chunk_line: bool = false, "chunk", "Chunk", Info, Kind::Toggle;
+    light_line: bool = false, "light", "Light Level", Info, Kind::Toggle;
+    weather_line: bool = false, "weather", "Weather", Info, Kind::Toggle;
+    info_bg: i32 = 40, "info_bg", "Info Display Background Opacity", Info,
+        Kind::Slider { min: 0, max: 100, div: 1, unit: "", zero: None };
+    info_align: usize = 0, "info_align", "Info Text Alignment", Info, Kind::Choice(ALIGNMENTS);
+
+    info_scale: f32 = 0.7, "ui_scale", "UI Scale", Misc,
+        Kind::Slider { min: 40, max: 150, div: 100, unit: "x", zero: None };
 
     on_map: bool = true, "on_map", "On-Map Waypoints", Waypoints, Kind::Toggle;
     labels: bool = true, "labels", "In-World Waypoints", Waypoints, Kind::Toggle;
@@ -1315,6 +1332,9 @@ settings! {
     map_scale: f32 = 1.0, "map_scale", "On-Map Waypoint Scale", Waypoints,
         Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
     compass: bool = true, "compass", "Compass", Waypoints, Kind::Toggle;
+    compass_scale: f32 = 1.0, "compass_scale", "Compass Scale", Waypoints,
+        Kind::Slider { min: 50, max: 200, div: 100, unit: "x", zero: None };
+    north_color: usize = 0, "north_color", "North Compass Color", Waypoints, Kind::Choice(NORTH_COLORS);
 }
 
 /// What Options > Mods > Atlas shows: the main switches. The rest are on the
@@ -2240,6 +2260,13 @@ fn next_dimension(id: &str) -> &'static str {
     }
 }
 
+/// Where yaw `yaw` looks: `South`, `North West`.
+pub fn facing_text(yaw: f32) -> String {
+    let names = ["South", "South West", "West", "North West", "North", "North East", "East", "South East"];
+    let i = ((yaw.rem_euclid(360.0) + 22.5) / 45.0) as usize % 8;
+    names[i].to_owned()
+}
+
 /// How light the world is at day time `ticks`: 1 by day, 0.45 at night.
 pub fn daylight(ticks: i64) -> f32 {
     let t = (ticks.rem_euclid(24_000) - 6000) as f32 / 24_000.0;
@@ -2443,7 +2470,7 @@ fn compass_rose(out: &mut Out<'_>, at: [f32; 2], r: f32) {
     for (letter, [dx, dy]) in [("N", [0.0, -1.0]), ("E", [1.0, 0.0]), ("S", [0.0, 1.0]), ("W", [-1.0, 0.0])] {
         let w = out.width(letter);
         let p = [(at[0] + dx * r - w / 2.0 + 0.5).round(), (at[1] + dy * r - 3.5).round()];
-        outlined(&mut out.draws, letter, p, INK);
+        outlined(&mut out.draws, letter, p, INK, 1.0);
     }
 }
 
@@ -3578,6 +3605,33 @@ impl State {
         {
             lines.push(time_text(t));
         }
+        if st.facing {
+            lines.push(facing_text(here.yaw));
+        }
+        if st.dimension_line {
+            lines.push(dimension_label(&here.dimension));
+        }
+        if st.chunk_line {
+            let (cx, cz) = ((here.pos[0].floor() as i64) >> 4, (here.pos[2].floor() as i64) >> 4);
+            lines.push(format!("Chunk {cx}, {cz}"));
+        }
+        if st.light_line
+            && let Some((block, sky)) = info.light
+        {
+            lines.push(format!("Light {block} ({sky} sky)"));
+        }
+        if st.weather_line
+            && let Some((rain, thunder)) = info.weather
+        {
+            let w = if thunder > 0.5 {
+                "Thunder"
+            } else if rain > 0.2 {
+                "Rain"
+            } else {
+                "Clear"
+            };
+            lines.push(w.to_owned());
+        }
         if self.cut != Cut::Surface {
             lines.push(self.cut.label());
         }
@@ -3649,8 +3703,9 @@ impl State {
     pub fn minimap_box(&self, gui: [f32; 2], here: &Here, info: &MiniInfo, measure: &dyn Fn(&str) -> f32) -> [f32; 2] {
         let side = self.mini_side(gui) + self.frame_width() * 2.0;
         let lines = self.info_lines(here, info);
-        let widest = lines.iter().map(|l| measure(l) * INFO_SCALE + 2.0).fold(side, f32::max);
-        let below = if lines.is_empty() { 0.0 } else { lines.len() as f32 * LINE * INFO_SCALE + 3.0 };
+        let scale = self.settings().info_scale;
+        let widest = lines.iter().map(|l| measure(l) * scale + 4.0).fold(side, f32::max);
+        let below = if lines.is_empty() { 0.0 } else { lines.len() as f32 * LINE * scale + 4.0 };
         [widest, side + below]
     }
 
@@ -3828,18 +3883,31 @@ impl State {
                 let edge = half + fw / 2.0;
                 let t = if st.round { edge } else { edge / ux.abs().max(uy.abs()) };
                 let at = [mid[0] + ux * t, mid[1] + uy * t];
-                let lw = measure(letter);
-                outlined(&mut draws, letter, [(at[0] - lw / 2.0 + 0.5).round(), (at[1] - 3.5).round()], INK);
+                let k = st.compass_scale;
+                let lw = measure(letter) * k;
+                let ink = if letter == "N" { NORTH_RGB[st.north_color.min(3)] } else { INK };
+                outlined(&mut draws, letter, [at[0] - lw / 2.0 + 0.5 * k, at[1] - 3.5 * k], ink, k);
             }
         }
 
         // The lines under it.
         let lines = self.info_lines(here, info);
         let top = y + side + fw + 2.0;
+        let scale = st.info_scale;
+        let row = LINE * scale;
         for (i, line) in lines.iter().enumerate() {
-            let lw = measure(line) * INFO_SCALE;
-            let tx = x + half - lw / 2.0;
-            draws.push(Draw::Label(line.clone(), [tx, top + i as f32 * LINE * INFO_SCALE], 0xFFFF_FFFF, INFO_SCALE, true));
+            let lw = measure(line) * scale;
+            let tx = match st.info_align {
+                1 => x - fw,
+                2 => x + side + fw - lw,
+                _ => x + half - lw / 2.0,
+            };
+            let ty = top + i as f32 * row;
+            if st.info_bg > 0 {
+                let alpha = st.info_bg.clamp(0, 100) as u32 * 255 / 100;
+                draws.push(Draw::Fill([tx - 1.0, ty - 1.0, lw + 2.0, row], alpha << 24));
+            }
+            draws.push(Draw::Label(line.clone(), [tx, ty], 0xFFFF_FFFF, scale, true));
         }
         draws
     }
@@ -4685,6 +4753,7 @@ mod tests {
         let info = MiniInfo {
             biome: Some("minecraft:dark_forest".into()),
             day_time: Some(6000),
+            ..MiniInfo::default()
         };
         // Nothing before the image was uploaded.
         let gui = [480.0, 270.0];
@@ -4705,6 +4774,8 @@ mod tests {
             })
             .collect();
         // Each compass letter is drawn five times: four for its outline.
+        assert_eq!(facing_text(0.0), "South");
+        assert_eq!(facing_text(-90.0), "East");
         texts.dedup();
         assert_eq!(texts, ["F", "N", "E", "S", "W", "0, 64, 0", "Dark Forest", "Day 1, 12:00"]);
         assert!(matches!(draws.iter().find(|d| matches!(d, Draw::Image(..))), Some(Draw::Image(3, ..))));

@@ -827,6 +827,8 @@ pub(super) fn hud(
     let info = m::MiniInfo {
         biome: game.biome_name_at(p),
         day_time: game.native_clock().map(|c| c.day_time),
+        light: Some(game.native_light(here.pos.map(|v| v.floor() as i32))),
+        weather: Some(game.native_weather()),
     };
     let reach = f64::from(m::MINI as u32) * f64::from(m::with(|s| s.mini_zoom()));
     let dots = if settings.dots {

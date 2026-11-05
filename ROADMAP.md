@@ -1,5 +1,7 @@
 # Roadmap: Xaero's Minimap features, one commit each
 
+Items 1 to 9 are done, apart from what is listed under Not done.
+
 From the user's Xaero reference screenshots (2026-11-05). Each item is its own commit.
 
 1. **Settings screen**: Atlas's own screen in Xaero's layout (title with page n/m, search,
@@ -25,3 +27,11 @@ From the user's Xaero reference screenshots (2026-11-05). Each item is its own c
 7. **Overlays**: chunk grid (line width), light overlay, slime chunks.
 8. **Information display manager**: which lines, background opacity, alignment.
 9. **Compass**: on map / over everything, scale, shadow and north colours.
+
+## Not done
+
+- Settings with nothing to act on here: profiles, Minimap Item, update notifications, safe mode,
+  chunk claims, Waystones, boss health and potion push boxes (the corner layout handles effects).
+- Sub-worlds (only the world and dimension are selectable), custom teleport commands, tracked
+  players, up-close waypoint scale.
+- Faces for mobs not in `FACES` (`bridge.rs`): they stay dots.
