@@ -570,19 +570,39 @@ impl Tile {
     }
 }
 
+/// How columns are shaded (Block Map Settings).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shading {
+    /// 0 flat, 1 normal, 2 strong.
+    pub slopes: usize,
+    /// Higher land is lighter, lower land darker.
+    pub terrain_depth: bool,
+    /// Deep water is darker.
+    pub transparency: bool,
+}
+
+impl Default for Shading {
+    fn default() -> Self {
+        Self { slopes: 1, terrain_depth: true, transparency: true }
+    }
+}
+
 /// A column as the maps show it: land lit by its slope (lighter where it
-/// rises from the north and the west, darker where it falls), water darker
-/// the deeper it is, cut walls dark.
-pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, depth: u8) -> [u8; 4] {
+/// rises from the north and the west, darker where it falls) and its height,
+/// water darker the deeper it is, cut walls dark.
+pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, depth: u8, how: Shading) -> [u8; 4] {
     let rgb = color & RGB;
     let f = if color & WALL != 0 {
         0.38
     } else if color & KIND == WATER {
-        1.0 - f32::from(depth.min(14)) * 0.032
+        if how.transparency { 1.0 - f32::from(depth.min(14)) * 0.032 } else { 1.0 }
     } else {
         let dn = f32::from(height - north.unwrap_or(height));
         let dw = f32::from(height - west.unwrap_or(height));
-        1.0 + (dn * 0.11 + dw * 0.05).clamp(-0.32, 0.24)
+        let k = [0.0, 1.0, 1.8][how.slopes.min(2)];
+        let slope = 1.0 + ((dn * 0.11 + dw * 0.05) * k).clamp(-0.32 * k, 0.24 * k);
+        let up = if how.terrain_depth { (f32::from(height) - 64.0) / 512.0 } else { 0.0 };
+        slope * (1.0 + up.clamp(-0.15, 0.15))
     };
     let ch = |s: u32| (((rgb >> s) & 255) as f32 * f).round().clamp(0.0, 255.0) as u8;
     [ch(16), ch(8), ch(0), 255]
@@ -590,7 +610,13 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
 
 /// The colour of column `(x, z)` from `column`, shaded against the columns
 /// `step` blocks north and west of it, or None where nothing was seen.
-fn shaded(column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>, x: i32, z: i32, step: i32) -> Option<[u8; 4]> {
+fn shaded(
+    column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>,
+    x: i32,
+    z: i32,
+    step: i32,
+    how: Shading,
+) -> Option<[u8; 4]> {
     let (color, height, depth) = column(x, z)?;
     if color & KIND == 0 {
         return Some(UNKNOWN);
@@ -598,7 +624,7 @@ fn shaded(column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>, x: i32, z:
     let land = |c: &(u32, i16, u8)| c.0 & KIND == LAND && c.0 & WALL == 0;
     let north = column(x, z - step).filter(land).map(|c| c.1);
     let west = column(x - step, z).filter(land).map(|c| c.1);
-    Some(shade(color, height, north, west, depth))
+    Some(shade(color, height, north, west, depth, how))
 }
 
 /// Chunk offsets at Chebyshev distance `ring`.
@@ -1157,6 +1183,9 @@ const ARROW_COLORS: &[(&str, &str)] = &[
     ("blue", "Blue"),
 ];
 const ARROW_RGB: [u32; 5] = [0xE03030, 0xF0F0F0, 0xFFD030, 0x40D050, 0x4080F0];
+const COLOR_MODES: &[(&str, &str)] = &[("accurate", "Accurate"), ("vanilla", "Vanilla")];
+const AUTO_CAVE: &[(&str, &str)] = &[("ceiling3", "3x3 Ceiling"), ("ceiling1", "1x1 Ceiling"), ("off", "OFF")];
+const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Normal"), ("strong", "Strong")];
 const DISTANCE_MODES: &[(&str, &str)] = &[("off", "OFF"), ("looking", "Looking At"), ("always", "Always")];
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
@@ -1195,6 +1224,18 @@ settings! {
     mode: MapMode = MapMode::Auto, "mode", "Cave Mode", BlockMap, Kind::Choice(MODES);
     layer_y: i32 = 64, "layer", "Layer Mode Height", BlockMap,
         Kind::Slider { min: -64, max: 320, div: 1, unit: "", zero: None };
+    color_mode: usize = 0, "color_mode", "Block Color Mode", BlockMap, Kind::Choice(COLOR_MODES);
+    auto_cave: usize = 0, "auto_cave", "Auto Cave Mode", BlockMap, Kind::Choice(AUTO_CAVE);
+    cave_nether: bool = true, "cave_nether", "Cave Mode in the Nether", BlockMap, Kind::Toggle;
+    cave_depth: i32 = 16, "cave_depth", "Cave Mode Depth", BlockMap,
+        Kind::Slider { min: 8, max: 64, div: 1, unit: "", zero: None };
+    cave_timer: i32 = 1000, "cave_timer", "Cave Mode Toggle Timer", BlockMap,
+        Kind::Slider { min: 0, max: 5000, div: 1, unit: " ms", zero: None };
+    slopes: usize = 1, "slopes", "Terrain Slopes", BlockMap, Kind::Choice(SLOPES);
+    terrain_depth: bool = true, "terrain_depth", "Terrain Depth", BlockMap, Kind::Toggle;
+    transparency: bool = true, "transparency", "Block Transparency", BlockMap, Kind::Toggle;
+    flowers: bool = true, "flowers", "Show Flowers", BlockMap, Kind::Toggle;
+    stained_glass: bool = true, "stained_glass", "Display Stained Glass", BlockMap, Kind::Toggle;
 
     dots: bool = true, "dots", "Display Radar", Radar, Kind::Toggle;
     show_players: bool = true, "show_players", "Players", Radar, Kind::Toggle;
@@ -1465,6 +1506,15 @@ impl Settings {
         }
     }
 
+    /// How the maps shade columns.
+    pub fn shading(&self) -> Shading {
+        Shading {
+            slopes: self.slopes,
+            terrain_depth: self.terrain_depth,
+            transparency: self.transparency,
+        }
+    }
+
     /// The player's arrow, ARGB.
     pub fn arrow_argb(&self) -> u32 {
         let alpha = self.arrow_opacity.clamp(0, 100) as u32 * 255 / 100;
@@ -1542,6 +1592,7 @@ pub fn compose_minimap(
     grid: &MiniGrid,
     round: bool,
     undiscovered: i32,
+    how: Shading,
     column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>,
     out: &mut Vec<u8>,
 ) {
@@ -1564,7 +1615,7 @@ pub fn compose_minimap(
                 }
             }
             let (x, z) = grid.block(i, j);
-            let rgba = shaded(column, x, z, 1).unwrap_or(unseen);
+            let rgba = shaded(column, x, z, 1, how).unwrap_or(unseen);
             out[o..o + 4].copy_from_slice(&rgba);
         }
     }
@@ -1673,7 +1724,7 @@ pub fn map_level(bpp: f64) -> u8 {
 
 /// The world map image `key` from `store` into `out` (RGBA, transparent where
 /// nothing was seen). Each texel shows the block at its centre.
-pub fn compose_map_tile(store: &mut Store, key: TileKey, out: &mut Vec<u8>) {
+pub fn compose_map_tile(store: &mut Store, key: TileKey, how: Shading, out: &mut Vec<u8>) {
     let n = 1i32 << key.level;
     let [x0, z0, ..] = key.blocks();
     out.clear();
@@ -1682,7 +1733,7 @@ pub fn compose_map_tile(store: &mut Store, key: TileKey, out: &mut Vec<u8>) {
     for j in 0..MAP_TEXELS {
         for i in 0..MAP_TEXELS {
             let (x, z) = (x0 + i * n + n / 2, z0 + j * n + n / 2);
-            if let Some(rgba) = shaded(&mut column, x, z, n) {
+            if let Some(rgba) = shaded(&mut column, x, z, n, how) {
                 let o = ((j * MAP_TEXELS + i) * 4) as usize;
                 out[o..o + 4].copy_from_slice(&rgba);
             }
@@ -1926,6 +1977,8 @@ pub struct State {
     pub map_dimension: Option<String>,
     /// What both maps show now.
     pub cut: Cut,
+    /// A change of cut waiting for the toggle timer.
+    pub pending_cut: Option<(Cut, Instant)>,
     pub mini_key: Option<MiniKey>,
     pub mini_grid: Option<MiniGrid>,
     pub mini_image: Vec<u8>,
@@ -1977,6 +2030,7 @@ impl Default for State {
             scans: HashMap::new(),
             map_dimension: None,
             cut: Cut::Surface,
+            pending_cut: None,
             mini_key: None,
             mini_grid: None,
             mini_image: Vec::new(),
@@ -2510,9 +2564,17 @@ impl State {
 
     /// New settings, to be written by the next hook that can.
     pub fn change_settings(&mut self, st: Settings) {
+        let old = self.settings();
+        // What the scan reads: the loaded chunks are scanned again.
+        let scan = |s: &Settings| (s.color_mode, s.flowers, s.stained_glass, s.cave_depth);
+        if scan(&old) != scan(&st) {
+            self.scans.clear();
+        }
         self.settings = Some(st);
         self.settings_changed = true;
         self.mini_key = None;
+        // The world map's images are composed again.
+        self.images.stamps.clear();
     }
 
     /// The settings to write, once, when they changed.
@@ -2525,6 +2587,27 @@ impl State {
         if self.cut != cut {
             self.cut = cut;
             self.mini_key = None;
+        }
+    }
+
+    /// The cut the player's surroundings ask for: Auto changes only once
+    /// that has held for the toggle timer, so a tree overhead doesn't flip
+    /// the map back and forth.
+    pub fn want_cut(&mut self, cut: Cut) {
+        let st = self.settings();
+        if cut == self.cut || st.mode != MapMode::Auto || st.cave_timer == 0 {
+            self.pending_cut = None;
+            self.set_cut(cut);
+            return;
+        }
+        match self.pending_cut {
+            Some((c, since)) if c == cut => {
+                if since.elapsed().as_millis() >= st.cave_timer as u128 {
+                    self.pending_cut = None;
+                    self.set_cut(cut);
+                }
+            }
+            _ => self.pending_cut = Some((cut, Instant::now())),
         }
     }
 
@@ -2596,7 +2679,7 @@ impl State {
         }
         let store = self.maps.store(cut);
         let mut column = |x: i32, z: i32| store.column(x, z);
-        compose_minimap(&grid, st.round, st.undiscovered, &mut column, &mut self.mini_image);
+        compose_minimap(&grid, st.round, st.undiscovered, st.shading(), &mut column, &mut self.mini_image);
         if let Some(seed) = slime {
             tint_slime(&grid, st.round, seed, &mut self.mini_image);
         }
@@ -3256,7 +3339,7 @@ impl State {
                 match cut {
                     Cut::Below(top) => {
                         let top = f64::from(top);
-                        y <= top + 2.0 && y >= top - f64::from(CUT_DEPTH) - 8.0
+                        y <= top + 2.0 && y >= top - f64::from(st.cave_depth) - 8.0
                     }
                     Cut::Surface => match store.column(d.pos[0].floor() as i32, d.pos[2].floor() as i32) {
                         Some((c, h, _)) if c & KIND != 0 => y >= f64::from(h) - 3.0,
@@ -3285,7 +3368,8 @@ impl State {
     /// World map image `key`, 128 x 128 RGBA.
     pub fn compose_tile(&mut self, key: TileKey) -> Vec<u8> {
         let mut out = Vec::new();
-        compose_map_tile(self.maps.store(key.cut), key, &mut out);
+        let how = self.settings().shading();
+        compose_map_tile(self.maps.store(key.cut), key, how, &mut out);
         out
     }
 
@@ -4503,7 +4587,7 @@ mod tests {
         let grid = mini_grid(8.0, 8.0, 0.0, false, 1.0);
         let mut img = Vec::new();
         let mut column = |x, z| live.column(x, z);
-        compose_minimap(&grid, true, 78, &mut column, &mut img);
+        compose_minimap(&grid, true, 78, Shading::default(), &mut column, &mut img);
         assert_eq!(img.len(), MINI * MINI * 4);
         // The corner is outside the circle; the middle is the grass.
         assert_eq!(&img[0..4], &[0, 0, 0, 0]);
@@ -4513,7 +4597,7 @@ mod tests {
         // Far off nothing was seen.
         let mut column = |x, z| live.column(x, z);
         let far = mini_grid(5000.0, 5000.0, 0.0, false, 1.0);
-        compose_minimap(&far, false, 78, &mut column, &mut img);
+        compose_minimap(&far, false, 78, Shading::default(), &mut column, &mut img);
         assert_eq!(&img[mid..mid + 3], &UNKNOWN[..3]);
         assert_eq!(img[mid + 3], 198);
     }
@@ -4650,6 +4734,29 @@ mod tests {
         assert_eq!(count(&s), (0, 0, 0));
         s.tab_held = true;
         assert_eq!(count(&s), (1, 1, 1));
+    }
+
+    #[test]
+    fn block_map_settings_shade_the_map() {
+        let (flat, strong) = (
+            Shading { slopes: 0, terrain_depth: false, transparency: true },
+            Shading { slopes: 2, terrain_depth: false, transparency: true },
+        );
+        let at = |how| shade(LAND | 0x808080, 70, Some(68), Some(70), 0, how)[0];
+        assert_eq!(at(flat), 0x80);
+        assert!(at(Shading { slopes: 1, ..flat }) > 0x80);
+        assert!(at(strong) > at(Shading { slopes: 1, ..flat }));
+        // Deep water is darker unless transparency is off.
+        let water = |how| shade(WATER | 0x808080, 60, None, None, 10, how)[0];
+        assert!(water(flat) < 0x80);
+        assert_eq!(water(Shading { transparency: false, ..flat }), 0x80);
+        // Auto waits for the timer; other modes don't.
+        let mut s = State::default();
+        s.want_cut(Cut::Below(31));
+        assert_eq!(s.cut, Cut::Surface);
+        s.change_settings(Settings { cave_timer: 0, ..s.settings() });
+        s.want_cut(Cut::Below(31));
+        assert_eq!(s.cut, Cut::Below(31));
     }
 
     #[test]
@@ -4905,7 +5012,7 @@ mod tests {
         let mut store = Store::default();
         store.put(0, 0, grass(64));
         let mut img = Vec::new();
-        compose_map_tile(&mut store, TileKey { cut: Cut::Surface, level: 0, x: 0, z: 0 }, &mut img);
+        compose_map_tile(&mut store, TileKey { cut: Cut::Surface, level: 0, x: 0, z: 0 }, Shading::default(), &mut img);
         assert_eq!(img[3], 255);
         let o = (20 * 128 + 20) * 4;
         assert_eq!(img[o + 3], 0);

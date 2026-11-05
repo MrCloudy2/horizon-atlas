@@ -29,6 +29,8 @@ enum Tint {
 #[derive(Clone, Copy)]
 struct Look {
     rgb: u32,
+    /// The map item's colour.
+    map_rgb: u32,
     tint: Tint,
     flags: u8,
 }
@@ -37,6 +39,9 @@ const AIR: u8 = 4;
 const STURDY_TOP: u8 = 8;
 /// It has a map colour: the map item would stop at it.
 const MAPPED: u8 = 16;
+/// Blocks the settings can see through.
+const FLOWER: u8 = 32;
+const GLASS: u8 = 64;
 
 /// The block states' looks, worked out the first time each is met, and
 /// every texture's average colour.
@@ -112,7 +117,7 @@ impl Palette {
             return *look;
         }
         let Some(f) = facts.states.get(i) else {
-            return Look { rgb: 0, tint: Tint::None, flags: AIR };
+            return Look { rgb: 0, map_rgb: 0, tint: Tint::None, flags: AIR };
         };
         let mut flags = match f.fluid {
             Fluid::None => 0,
@@ -131,6 +136,17 @@ impl Palette {
             flags |= MAPPED;
         }
         let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
+        const FLOWERS: [&str; 15] = [
+            "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "tulip", "oxeye_daisy",
+            "cornflower", "lily_of_the_valley", "wither_rose", "sunflower", "lilac", "rose_bush",
+            "peony", "torchflower",
+        ];
+        if FLOWERS.iter().any(|n| name.ends_with(n)) {
+            flags |= FLOWER;
+        }
+        if name.contains("stained_glass") {
+            flags |= GLASS;
+        }
         let leaves = name.ends_with("_leaves");
         let tinted = match name {
             "spruce_leaves" => Tint::Constant(0x61_9961),
@@ -173,7 +189,8 @@ impl Palette {
             // No texture: the map item's colour.
             rgb = MAP_COLORS.get(usize::from(f.map_color)).copied().unwrap_or(0) & 0xFF_FFFF;
         }
-        let look = Look { rgb, tint, flags };
+        let map_rgb = MAP_COLORS.get(usize::from(f.map_color)).copied().unwrap_or(0) & 0xFF_FFFF;
+        let look = Look { rgb, map_rgb, tint, flags };
         if let Some(slot) = self.looks.get_mut(i) {
             *slot = Some(look);
         }
@@ -192,6 +209,11 @@ struct Scan<'a> {
     facts: &'a BlockFacts,
     render: &'a horizon_client::assets::RenderAssets,
     biomes: &'a horizon_client::biome::Biomes,
+    /// The map item's colours, not the textures'.
+    vanilla: bool,
+    /// Blocks seen through (`FLOWER`, `GLASS`).
+    hide: u8,
+    cave_depth: i32,
 }
 
 impl Scan<'_> {
@@ -202,6 +224,9 @@ impl Scan<'_> {
 
     /// `look`'s colour at block `(x, y, z)` of the chunk, tinted by its biome.
     fn color(&self, look: Look, x: i32, y: i32, z: i32) -> u32 {
+        if self.vanilla {
+            return look.map_rgb;
+        }
         let tint = match look.tint {
             Tint::None => return look.rgb,
             Tint::Constant(c) => c,
@@ -230,7 +255,7 @@ impl Scan<'_> {
         let bottom = self.chunk.min_y();
         while y > bottom {
             let look = self.look(x, y, z);
-            if look.flags & MAPPED == 0 {
+            if look.flags & MAPPED == 0 || look.flags & self.hide != 0 {
                 y -= 1;
                 continue;
             }
@@ -247,7 +272,7 @@ impl Scan<'_> {
             if fluid == 2 {
                 return (m::LAND | self.palette.lava, y as i16, 0);
             }
-            let water = Look { rgb: self.palette.water, tint: Tint::Water, flags: look.flags };
+            let water = Look { rgb: self.palette.water, map_rgb: look.map_rgb, tint: Tint::Water, flags: look.flags };
             return (m::WATER | self.color(water, x, y, z), y as i16, depth);
         }
         (0, bottom as i16, 0)
@@ -263,7 +288,7 @@ impl Scan<'_> {
             return self.column_from(x, z, top);
         }
         // Down through what is solid at the cut; solid all the way is a wall.
-        let floor = (cut_y - m::CUT_DEPTH).max(self.chunk.min_y());
+        let floor = (cut_y - self.cave_depth).max(self.chunk.min_y());
         let mut y = cut_y;
         let mut wall = None;
         while y > floor {
@@ -319,8 +344,15 @@ fn current_cut(game: &Game<'_>, settings: &m::Settings) -> Option<m::Cut> {
     let dimension = game.native_player()?.dimension;
     let head = (p.position.y + f64::from(p.dimensions.eye_height)).floor() as i32;
     let (bx, bz) = (p.position.x.floor() as i32, p.position.z.floor() as i32);
-    let covered = game.world.light(bx, head, bz) >> 4 == 0;
-    Some(m::cut_for(settings.mode, settings.layer_y, head, covered, dimension == m::NETHER))
+    let sky = |dx: i32, dz: i32| game.world.light(bx + dx, head, bz + dz) >> 4;
+    let covered = match settings.auto_cave {
+        // All nine columns around the player: one gap doesn't flip the map.
+        0 => (-1..=1).all(|dx| (-1..=1).all(|dz| sky(dx, dz) == 0)),
+        1 => sky(0, 0) == 0,
+        _ => false,
+    };
+    let ceiling = settings.cave_nether && dimension == m::NETHER;
+    Some(m::cut_for(settings.mode, settings.layer_y, head, covered, ceiling))
 }
 
 /// The world or server being played, naming its waypoints and maps.
@@ -399,8 +431,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
         m::with(|s| s.save_now_and_then(10.0));
         return;
     };
-    m::with(|s| s.set_cut(cut));
-    scan(game, cut);
+    m::with(|s| s.want_cut(cut));
+    let cut = m::with(|s| s.cut);
+    scan(game, cut, &settings);
     m::with(|s| s.save_now_and_then(10.0));
     if settings.minimap {
         upload_minimap(game);
@@ -415,7 +448,7 @@ pub(super) fn frame(game: &mut Game<'_>) {
 
 /// Scans the loaded chunks around the player, nearest first, for `cut` (and
 /// the surface too, so the surface map grows underground), within a budget.
-fn scan(game: &Game<'_>, cut: m::Cut) {
+fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
     let Some(p) = game.player.as_ref() else {
         return;
     };
@@ -458,6 +491,9 @@ fn scan(game: &Game<'_>, cut: m::Cut) {
                         facts,
                         render,
                         biomes: &context.biomes,
+                        vanilla: settings.color_mode == 1,
+                        hide: u8::from(!settings.flowers) * FLOWER | u8::from(!settings.stained_glass) * GLASS,
+                        cave_depth: settings.cave_depth,
                     };
                     let tile = scan_tile(&mut scan, air, c);
                     m::with(|s| s.put_scan(c, key, revision, tile));
