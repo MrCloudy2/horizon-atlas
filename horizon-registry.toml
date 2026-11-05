@@ -1,0 +1,17 @@
+name = "Atlas"
+summary = "A sharp minimap, a world map of everywhere you've been and waypoints, with cave and layer modes, in the style of Xaero's mods."
+description = """
+A minimap, a world map and waypoints that share one map of the world, kept on disk per world, server and dimension.
+
+- **Minimap**: drawn at your screen's resolution, turns with you, with entity dots that fade with height. Hold Tab for mob faces, player faces and item icons.
+- **World map (M)**: drag and zoom. B makes a waypoint under the pointer.
+- **Map modes**: Auto (the surface in the open, the cave around you under a roof), Cave and Layer.
+- **Waypoints (U, B, H)**: sets, filter, Share, Teleport for operators, deathpoints, temporary waypoints, and labels in the world.
+- **Overlays**: chunk grid, light overlay, slime chunks (with `/atlas seed`).
+- **Settings (Y)**: pages of options with search; `/atlas` sets exact values.
+
+The look follows Xaero's Minimap and World Map, but no code or art comes from them. Built on Waypoints by Nirokx (MIT); the map columns follow Horizon's minimap (MIT).
+
+Pinned to Horizon `f319701`: it reads the game's world directly, so a newer Nightly may need a new release. Turn off Horizon's own Minimap to avoid two maps."""
+authors = ["MrCloudy2", "Nirokx"]
+license = "MIT"
