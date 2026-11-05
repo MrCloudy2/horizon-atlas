@@ -301,11 +301,17 @@ impl Scan<'_> {
                     3 => 0.85,
                     _ => 0.9,
                 };
+                // Past the shallows the tint itself gets darker.
+                let deep = match depth {
+                    0..=2 => 1.0,
+                    3 => 0.94,
+                    _ => 0.87,
+                };
                 // The map grades water apart from land: the bottom is graded
                 // as land here, undoing the water's grade to come.
                 let ch = |s: u32, tint: f32, land: f32| {
                     let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
-                    ((w * tint * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
+                    ((w * tint * deep * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
                 };
                 rgb = ch(16, 0.83, 0.94) | ch(8, 0.99, 1.15) | ch(0, 1.15, 1.36);
             }
