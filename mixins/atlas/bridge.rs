@@ -32,16 +32,18 @@ struct Look {
     /// The map item's colour.
     map_rgb: u32,
     tint: Tint,
-    flags: u8,
+    flags: u16,
 }
-const FLUID: u8 = 3;
-const AIR: u8 = 4;
-const STURDY_TOP: u8 = 8;
+const FLUID: u16 = 3;
+const AIR: u16 = 4;
+const STURDY_TOP: u16 = 8;
 /// It has a map colour: the map item would stop at it.
-const MAPPED: u8 = 16;
+const MAPPED: u16 = 16;
 /// Blocks the settings can see through.
-const FLOWER: u8 = 32;
-const GLASS: u8 = 64;
+const FLOWER: u16 = 32;
+const GLASS: u16 = 64;
+const PLANT: u16 = 128;
+const LEAVES: u16 = 256;
 
 /// The block states' looks, worked out the first time each is met, and
 /// every texture's average colour.
@@ -147,6 +149,17 @@ impl Palette {
         if name.contains("stained_glass") {
             flags |= GLASS;
         }
+        const PLANTS: [&str; 16] = [
+            "short_grass", "tall_grass", "fern", "large_fern", "short_dry_grass", "tall_dry_grass",
+            "bush", "firefly_bush", "dead_bush", "leaf_litter", "wildflowers", "pink_petals",
+            "vine", "glow_lichen", "moss_carpet", "pale_moss_carpet",
+        ];
+        if PLANTS.contains(&name) {
+            flags |= PLANT;
+        }
+        if name.ends_with("_leaves") {
+            flags |= LEAVES;
+        }
         let leaves = name.ends_with("_leaves");
         let tinted = match name {
             "spruce_leaves" => Tint::Constant(0x61_9961),
@@ -212,8 +225,10 @@ struct Scan<'a> {
     /// The map item's colours, not the textures'.
     vanilla: bool,
     /// Blocks seen through (`FLOWER`, `GLASS`).
-    hide: u8,
+    hide: u16,
     cave_depth: i32,
+    /// The bottom shows through water.
+    transparency: bool,
 }
 
 impl Scan<'_> {
@@ -273,7 +288,19 @@ impl Scan<'_> {
                 return (m::LAND | self.palette.lava, y as i16, 0);
             }
             let water = Look { rgb: self.palette.water, map_rgb: look.map_rgb, tint: Tint::Water, flags: look.flags };
-            return (m::WATER | self.color(water, x, y, z), y as i16, depth);
+            let mut rgb = self.color(water, x, y, z);
+            if self.transparency {
+                // See-through: the bottom shows under shallow water.
+                let under = self.look(x, below, z);
+                let bottom = self.color(under, x, below, z);
+                let a = (0.5 + f32::from(depth) * 0.05).min(0.92);
+                let ch = |s: u32| {
+                    let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
+                    ((w * a + g * (1.0 - a)).round() as u32) << s
+                };
+                rgb = ch(16) | ch(8) | ch(0);
+            }
+            return (m::WATER | rgb, y as i16, depth);
         }
         (0, bottom as i16, 0)
     }
@@ -492,8 +519,12 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
                         render,
                         biomes: &context.biomes,
                         vanilla: settings.color_mode == 1,
-                        hide: u8::from(!settings.flowers) * FLOWER | u8::from(!settings.stained_glass) * GLASS,
+                        hide: u16::from(!settings.flowers) * FLOWER
+                            | u16::from(!settings.stained_glass) * GLASS
+                            | u16::from(!settings.plants) * PLANT
+                            | u16::from(!settings.leaves) * LEAVES,
                         cave_depth: settings.cave_depth,
+                        transparency: settings.transparency,
                     };
                     let tile = scan_tile(&mut scan, air, c);
                     m::with(|s| s.put_scan(c, key, revision, tile));

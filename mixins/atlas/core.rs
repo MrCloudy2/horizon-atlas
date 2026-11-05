@@ -161,10 +161,10 @@ impl DotKind {
     /// White players, yellow mobs, red items, purple the rest.
     pub fn color(self) -> u32 {
         match self {
-            DotKind::Player => 0xFFFF_FFFF,
-            DotKind::Mob => 0xFFFF_DD33,
-            DotKind::Item => 0xFFFF_4444,
-            DotKind::Other => 0xFFB0_55FF,
+            DotKind::Player => 0xFFF6_F6F6,
+            DotKind::Mob => 0xFFF2_CE52,
+            DotKind::Item => 0xFFE8_6A58,
+            DotKind::Other => 0xFFB8_84EE,
         }
     }
     fn layer(self) -> u8 {
@@ -618,17 +618,23 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
     let f = if color & WALL != 0 {
         0.38
     } else if color & KIND == WATER {
-        if how.transparency { 1.0 - f32::from(depth.min(14)) * 0.032 } else { 1.0 }
+        if how.transparency { 1.0 - f32::from(depth.min(14)) * 0.012 } else { 1.0 }
     } else {
+        // A soft curve: a one block step is a gentle change, a cliff no
+        // harsher than a few blocks, so rough ground doesn't turn to noise.
         let dn = f32::from(height - north.unwrap_or(height));
         let dw = f32::from(height - west.unwrap_or(height));
-        let k = [0.0, 1.0, 1.8][how.slopes.min(2)];
-        let slope = 1.0 + ((dn * 0.11 + dw * 0.05) * k).clamp(-0.32 * k, 0.24 * k);
+        let k = [0.0, 1.0, 1.7][how.slopes.min(2)];
+        let lit = ((dn + dw * 0.6) / 3.0).tanh();
+        let slope = 1.0 + k * if lit < 0.0 { lit * 0.2 } else { lit * 0.15 };
         let up = if how.terrain_depth { (f32::from(height) - 64.0) / 512.0 } else { 0.0 };
         slope * (1.0 + up.clamp(-0.15, 0.15))
     };
-    let ch = |s: u32| (((rgb >> s) & 255) as f32 * f).round().clamp(0.0, 255.0) as u8;
-    [ch(16), ch(8), ch(0), 255]
+    // A touch less saturated than the textures: a softer, cleaner map.
+    let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
+    let grey = r * 0.3 + g * 0.59 + b * 0.11;
+    let ch = |c: f32| ((c * 0.9 + grey * 0.1) * f).round().clamp(0.0, 255.0) as u8;
+    [ch(r), ch(g), ch(b), 255]
 }
 
 /// The colour of column `(x, z)` from `column`, shaded against the columns
@@ -1265,6 +1271,8 @@ settings! {
     terrain_depth: bool = true, "terrain_depth", "Terrain Depth", BlockMap, Kind::Toggle;
     transparency: bool = true, "transparency", "Block Transparency", BlockMap, Kind::Toggle;
     flowers: bool = true, "flowers", "Show Flowers", BlockMap, Kind::Toggle;
+    plants: bool = false, "plants", "Show Grass and Plants", BlockMap, Kind::Toggle;
+    leaves: bool = true, "leaves", "Show Tree Leaves", BlockMap, Kind::Toggle;
     stained_glass: bool = true, "stained_glass", "Display Stained Glass", BlockMap, Kind::Toggle;
 
     dots: bool = true, "dots", "Display Radar", Radar, Kind::Toggle;
@@ -2668,7 +2676,9 @@ impl State {
     pub fn change_settings(&mut self, st: Settings) {
         let old = self.settings();
         // What the scan reads: the loaded chunks are scanned again.
-        let scan = |s: &Settings| (s.color_mode, s.flowers, s.stained_glass, s.cave_depth);
+        let scan = |s: &Settings| {
+            (s.color_mode, s.flowers, s.plants, s.leaves, s.stained_glass, s.cave_depth, s.transparency)
+        };
         if scan(&old) != scan(&st) {
             self.scans.clear();
         }
@@ -3893,7 +3903,7 @@ impl State {
         // Dots a little under 1/40 of the map across, as Xaero's, or icons.
         let dot = (side / 85.0).clamp(0.8, 2.2) * st.dot_size as f32 / 2.0;
         let icons = st.icons == 2 || (st.icons == 1 && self.tab_held);
-        let icon = (side / 11.0).clamp(7.0, 14.0) * st.icon_size;
+        let icon = (side / 15.0).clamp(4.5, 10.0) * st.icon_size;
         if st.dots {
             let mut sorted: Vec<&Dot> = dots.iter().collect();
             sorted.sort_by_key(|d| d.kind.layer());
@@ -3921,8 +3931,12 @@ impl State {
                     }
                     _ => {
                         let r = if d.kind == DotKind::Player { dot * 1.3 } else { dot };
-                        disc(&mut draws, p, r + 0.6, fade(0xE020_2020, 1.0, near));
-                        disc(&mut draws, p, r, fade(d.kind.color(), 0.35 + 0.65 * near, near));
+                        // A soft shadow, a shaded body and a lit top.
+                        let light = 0.35 + 0.65 * near;
+                        disc(&mut draws, p, r + 0.7, fade(0x7010_1018, 1.0, near));
+                        disc(&mut draws, p, r, fade(d.kind.color(), light * 0.7, near));
+                        let lit = [p[0] - r * 0.18, p[1] - r * 0.18];
+                        disc(&mut draws, lit, r * 0.62, fade(d.kind.color(), light, near));
                     }
                 }
                 let wanted = st.names == 2 || (st.names == 1 && d.kind == DotKind::Player);
@@ -5074,6 +5088,29 @@ mod tests {
         assert!(back.iter().any(|w| w.kind == WpKind::Death));
         s.act(Action::Share(0), None);
         assert!(s.take_say().is_some_and(|l| l.contains("Death")));
+        // Settings that act when something happens.
+        s.can_teleport = true;
+        s.waypoints[0].dimension = NETHER.into();
+        s.change_settings(Settings { cross_dim_tp: false, ..s.settings() });
+        s.act(Action::Teleport(0), Some(&h));
+        assert!(s.teleport.is_none(), "not across dimensions");
+        s.change_settings(Settings { cross_dim_tp: true, new_to_bottom: true, ..s.settings() });
+        s.act(Action::Teleport(0), Some(&h));
+        assert!(s.teleport.is_some());
+        s.add_temporary(&h);
+        assert_eq!(s.waypoints.last().unwrap().kind, WpKind::Temporary);
+        s.change_settings(Settings { deathpoints: false, ..s.settings() });
+        let before = s.waypoints.len();
+        s.track_death(false, &far);
+        s.track_death(true, &far);
+        assert_eq!(s.waypoints.len(), before, "no deathpoint when off");
+        s.track_death(false, &far);
+        s.change_settings(Settings { deathpoints: true, keep_deathpoints: false, ..s.settings() });
+        s.track_death(true, &far);
+        s.track_death(false, &h);
+        s.track_death(true, &h);
+        let deaths = s.waypoints.iter().filter(|w| w.kind == WpKind::Death).count();
+        assert_eq!(deaths, 1, "old ones go");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5128,6 +5165,14 @@ mod tests {
         s.enlarge_key(false);
         assert_eq!(s.mini_side(gui), small);
         assert!(s.turning());
+        // Toggled, it stays on after the key comes up.
+        s.change_settings(Settings { toggle_enlarged: true, ..s.settings() });
+        s.enlarge_key(true);
+        s.enlarge_key(false);
+        assert!(s.enlarged);
+        s.enlarge_key(true);
+        assert!(!s.enlarged);
+        s.change_settings(Settings { toggle_enlarged: false, ..s.settings() });
         s.zoom_key(true);
         assert_eq!(s.settings().zoom, 0.5);
         s.zoom_key(false);
@@ -5146,6 +5191,159 @@ mod tests {
             assert_eq!(o.parse(&o.stored(v)), Ok(v), "{}", o.key);
             assert_ne!(o.next(v), v, "{}", o.key);
         }
+    }
+
+    /// Everything the logic draws and decides, for settings `st`.
+    fn everything(st: Settings) -> String {
+        let h = Here { pos: [8.5, 64.0, 8.5], dimension: OVERWORLD.into(), yaw: 30.0 };
+        let info = MiniInfo {
+            biome: Some("minecraft:plains".into()),
+            day_time: Some(18000),
+            light: Some((3, 9)),
+            weather: Some((0.0, 0.0)),
+        };
+        let dots = [
+            Dot { pos: [12.0, 64.0, 8.0], kind: DotKind::Mob, icon: Icon::Mob("minecraft:zombie".into()), name: Some("Zombie".into()) },
+            Dot { pos: [4.0, 90.0, 8.0], kind: DotKind::Player, icon: Icon::Skin("s".into()), name: Some("P".into()) },
+            Dot { pos: [8.0, 200.0, 12.0], kind: DotKind::Item, icon: Icon::Item("minecraft:apple".into()), name: Some("Apple".into()) },
+            Dot { pos: [8.0, 66.0, 4.0], kind: DotKind::Other, icon: Icon::None, name: Some("Boat".into()) },
+        ];
+        let camera = Camera { pos: [8.5, 65.6, 8.5], yaw: 0.0, pitch: 5.0, fov: 70.0 };
+        let gui = [480.0, 270.0];
+        let mut out = String::new();
+        for (enlarged, cut, tab, picked) in [
+            (false, Cut::Surface, false, None),
+            (true, Cut::Surface, true, Some(0)),
+            (false, Cut::Below(31), true, Some(0)),
+        ] {
+            let mut s = State::default();
+            s.settings = Some(st);
+            s.seed = Some(12345);
+            s.enlarged = enlarged;
+            s.tab_held = tab;
+            s.set_cut(cut);
+            s.can_teleport = true;
+            s.selected = picked;
+            s.faces.insert("minecraft:zombie".into(), [0.0, 0.0, 8.0, 8.0]);
+            s.face_slot = Some(1);
+            let mut t = grass(64);
+            t.height[5] = 70;
+            t.color[9] = WATER | 0x3F_76E4;
+            t.depth[9] = 9;
+            s.maps.store(cut).put(0, 0, t);
+            for (i, set) in ["a", "b"].into_iter().enumerate() {
+                s.waypoints.push(Waypoint {
+                    name: "Wp".into(),
+                    // 120 blocks off and 11 degrees to the side.
+                    pos: [32 + i as i32, 66, 128 + i as i32 * 900],
+                    set: if i == 0 { DEFAULT_SET.into() } else { set.into() },
+                    ..Waypoint::default()
+                });
+            }
+            s.update_minimap_lit(8.5, 8.5, 30.0, &|_, _, _| 4);
+            s.mini_ready = true;
+            let image: u64 = s.mini_image.iter().fold(7, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
+            let shown = s.visible_dots(dots.to_vec(), 64.0);
+            let hud = s.minimap_hud(gui, [0.0, 0.0], &h, &info, &shown, &measure);
+            let labels = s.labels(camera, h.pos, OVERWORLD, gui, &measure);
+            s.open_list(None);
+            let list = s.screen(gui, [0.0, 0.0], Some(&h), &measure).0;
+            s.open_map(Some(&h), None);
+            let map = s.screen(gui, [0.0, 0.0], Some(&h), &measure).0;
+            let tile = s.compose_tile(TileKey { cut, level: 0, x: 0, z: 0 });
+            let tile: u64 = tile.iter().fold(7, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
+            out.push_str(&format!("{image} {tile} {hud:?} {labels:?} {list:?} {map:?} {} {}", s.mini_n, s.mini_reach()));
+        }
+        out
+    }
+
+    #[test]
+    fn every_setting_does_something() {
+        // Those the game side reads: it must read them.
+        let bridge = std::fs::read_to_string("mixins/atlas/bridge.rs").unwrap();
+        const GAME_SIDE: [(&str, &str); 13] = [
+            ("minimap", "settings.minimap"),
+            ("corner", "settings.corner"),
+            ("hide_under_screen", "settings.hide_under_screen"),
+            ("hide_under_f3", "settings.hide_under_f3"),
+            ("center_enlarged", "settings.center_enlarged"),
+            ("color_mode", "settings.color_mode"),
+            ("auto_cave", "settings.auto_cave"),
+            ("cave_nether", "settings.cave_nether"),
+            ("cave_depth", "settings.cave_depth"),
+            ("flowers", "settings.flowers"),
+            ("plants", "settings.plants"),
+            ("leaves", "settings.leaves"),
+            ("stained_glass", "settings.stained_glass"),
+        ];
+        let more = ["hide_invisible", "entity_limit"];
+        let mut dead = Vec::new();
+        for (key, use_of) in GAME_SIDE {
+            assert!(Opt::index(key).is_some(), "{key}");
+            if !bridge.contains(use_of) {
+                dead.push(key);
+            }
+        }
+        for key in more {
+            if !bridge.contains(&format!("settings.{key}")) {
+                dead.push(key);
+            }
+        }
+        // Behaviour over time, covered by their own tests.
+        let timed = [
+            "toggle_enlarged",
+            "cave_timer",
+            "deathpoints",
+            "keep_deathpoints",
+            "delete_reached",
+            "new_to_bottom",
+            "cross_dim_tp",
+        ];
+        // All the rest must change what is drawn.
+        let base = Settings {
+            chunk_grid: 1,
+            light_overlay: true,
+            light_level: 8,
+            slime: true,
+            names: 2,
+            entity_height: true,
+            facing: true,
+            dimension_line: true,
+            chunk_line: true,
+            light_line: true,
+            weather_line: true,
+            mode: MapMode::Layer,
+            ..Settings::default()
+        };
+        for (i, o) in OPTS.iter().enumerate() {
+            // Settings about the distance need it shown, or looked for.
+            let base = match o.key {
+                "distance_scale" | "name_above" => Settings { distance_mode: 2, ..base },
+                "angle_v" => Settings { angle_h: 180, ..base },
+                _ => base,
+            };
+            let plain = everything(base);
+            let skip = GAME_SIDE.iter().any(|g| g.0 == o.key) || more.contains(&o.key) || timed.contains(&o.key);
+            if skip {
+                continue;
+            }
+            let mut tries = vec![o.next(base.raw(i))];
+            if let Kind::Slider { min, max, .. } = o.kind {
+                tries.extend([min, max, (min + max) / 2, min + 1]);
+            }
+            if let Kind::Choice(names) = o.kind {
+                tries.extend(0..names.len() as i32);
+            }
+            let works = tries.into_iter().filter(|v| *v != base.raw(i)).any(|v| {
+                let mut st = base;
+                st.put(i, v);
+                everything(st) != plain
+            });
+            if !works {
+                dead.push(o.key);
+            }
+        }
+        assert!(dead.is_empty(), "settings that do nothing: {dead:?}");
     }
 
     #[test]
