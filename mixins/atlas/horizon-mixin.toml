@@ -1,19 +1,26 @@
 [mod]
-id = "waypoints"
-version = "1.0.0"
+id = "atlas"
+version = "0.1.0"
 priority = 100
 
-# Pinned: besides the native hook points it reads the window's world folder
-# and the connected server's address (they name the waypoint file) and the
-# camera the last frame drew from, which are not part of the stable hook points.
+# Pinned: besides the native hook points it reads the window's world (chunks,
+# block facts, light, entities, biomes), the game's map texture slots, the
+# world folder and the connected server's address, none of which the stable
+# hook points offer.
 [compatibility]
-horizon_revision = "c9d474dd9116e84c243f8992d75c11314df56f06"
+horizon_revision = "f319701e8c9ab657ff562250b3ba07b2d654e3bc"
 
 [[module]]
-id = "runtime"
+id = "core"
 file = "crates/horizon-client/src/game.rs"
-name = "waypoints_mod"
-source = "runtime.rs"
+name = "atlas_mod"
+source = "core.rs"
+
+[[module]]
+id = "bridge"
+file = "crates/horizon-client/src/game.rs"
+name = "atlas_bridge"
+source = "bridge.rs"
 
 [[injection]]
 id = "list"
@@ -74,6 +81,7 @@ helper = "hud.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+  { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "&mut *corners" },
 ]
 
 [[injection]]
@@ -100,12 +108,36 @@ bindings = [
 ]
 
 [[injection]]
+id = "release"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_button_released_pre"
+helper = "release.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "button", ty = "i32", value = "button" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "drag"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_dragged_pre"
+helper = "drag.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "button", ty = "i32", value = "button" },
+  { name = "delta", ty = "[f32; 2]", value = "delta" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
 id = "scroll"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_scrolled_pre"
 helper = "scroll.rs"
 bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
   { name = "scroll", ty = "[f64; 2]", value = "scroll" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
 ]
@@ -131,4 +163,33 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "c", ty = "char", value = "c" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "commands"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
+helper = "commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<&'static str>", value = "&mut *commands" },
+]
+
+[[injection]]
+id = "command"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_command"
+helper = "command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+[[injection]]
+id = "camera"
+kind = "RETURN"
+target = "horizon_client::game::native_hooks::Game<'_>::native_camera_pose_now"
+helper = "camera.rs"
+bindings = [
+  { name = "value", ty = "(glam::DVec3, f32, f32)", value = "$value" },
 ]

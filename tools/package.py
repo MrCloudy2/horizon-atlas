@@ -19,7 +19,7 @@ INSTALLED = Path.home() / '.local/share/horizon/horizon-native-mods'
 
 def package():
     compat = json.loads((ROOT / 'compatibility.json').read_text())
-    bundle = ROOT / 'mixins' / 'waypoints'
+    bundle = ROOT / 'mixins' / 'atlas'
     mixin = tomllib.loads((bundle / 'horizon-mixin.toml').read_text())
     mod = mixin['mod']
     if mixin.get('compatibility', {}).get('horizon_revision') != compat['horizon_revision']:

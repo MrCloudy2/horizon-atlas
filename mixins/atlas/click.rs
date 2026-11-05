@@ -1,14 +1,17 @@
-// A click on the settings page: turn the labels in the world on or off.
-fn waypoints_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
-    use crate::game::waypoints_mod as m;
-    if mod_id != m::ID || button != 0 {
+// A click on the settings page steps that setting, which is kept at once.
+fn atlas_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
+    use crate::game::atlas_mod as m;
+    if mod_id != m::ID {
         return;
     }
-    let stored = game.native_setting(m::ID, "labels");
-    let on = m::with(|s| {
-        let on = !s.labels.unwrap_or_else(|| m::read_labels(stored));
-        s.labels = Some(on);
-        on
+    let g = &*game;
+    let mut st = m::with(|s| s.settings_with(|k| g.native_setting(m::ID, k)));
+    st.click(button);
+    m::with(|s| {
+        s.change_settings(st);
+        s.take_changed_settings();
     });
-    game.native_set_setting(m::ID, "labels", if on { "true" } else { "false" });
+    for (key, value) in st.stored() {
+        game.native_set_setting(m::ID, key, &value);
+    }
 }
