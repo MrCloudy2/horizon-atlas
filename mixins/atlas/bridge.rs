@@ -404,6 +404,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
     m::with(|s| s.save_now_and_then(10.0));
     if settings.minimap {
         upload_minimap(game);
+        if settings.icons != 0 {
+            upload_faces(game);
+        }
     }
     if m::with(|s| s.map_visible()) {
         upload_map_tiles(game);
@@ -549,24 +552,123 @@ fn upload_map_tiles(game: &mut Game<'_>) {
     }
 }
 
-/// The entities the minimap's dots stand for, within `reach` blocks.
-fn dots(game: &Game<'_>, here: &m::Here, reach: f64) -> Vec<m::Dot> {
+/// Each mob's texture and where its face is on it (`[x, y, w, h]`).
+const FACES: &[(&str, &str, [u32; 4])] = &[
+    ("zombie", "zombie/zombie", [8, 8, 8, 8]),
+    ("husk", "zombie/husk", [8, 8, 8, 8]),
+    ("drowned", "zombie/drowned", [8, 8, 8, 8]),
+    ("skeleton", "skeleton/skeleton", [8, 8, 8, 8]),
+    ("stray", "skeleton/stray", [8, 8, 8, 8]),
+    ("wither_skeleton", "skeleton/wither_skeleton", [8, 8, 8, 8]),
+    ("creeper", "creeper/creeper", [8, 8, 8, 8]),
+    ("enderman", "enderman/enderman", [8, 8, 8, 8]),
+    ("spider", "spider/spider", [40, 12, 8, 8]),
+    ("cave_spider", "spider/cave_spider", [40, 12, 8, 8]),
+    ("pig", "pig/pig_temperate", [8, 8, 8, 8]),
+    ("sheep", "sheep/sheep", [8, 8, 6, 6]),
+    ("cow", "cow/cow_temperate", [6, 6, 8, 8]),
+    ("chicken", "chicken/chicken_temperate", [3, 3, 4, 6]),
+    ("villager", "villager/villager", [8, 8, 8, 10]),
+    ("witch", "witch", [8, 8, 8, 10]),
+    ("wolf", "wolf/wolf", [4, 4, 6, 6]),
+    ("iron_golem", "iron_golem/iron_golem", [8, 8, 8, 10]),
+];
+
+/// A PNG as (width, RGBA).
+fn read_png(path: &std::path::Path) -> Option<(usize, Vec<u8>)> {
+    let bytes = horizon_core::prepared_files::read(path).ok()?;
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let channels = info.color_type.samples();
+    let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+    for px in buf[..info.buffer_size()].chunks_exact(channels) {
+        match channels {
+            4 => rgba.extend_from_slice(px),
+            3 => rgba.extend_from_slice(&[px[0], px[1], px[2], 255]),
+            2 => rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]),
+            _ => rgba.extend_from_slice(&[px[0], px[0], px[0], 255]),
+        }
+    }
+    Some((info.width as usize, rgba))
+}
+
+/// Keeps the mob face sheet in a map texture slot: 16 x 16 texel cells.
+fn upload_faces(game: &mut Game<'_>) {
+    let (slot, fresh) = slot_for(game, m::FACES_SLOT_KEY);
+    if !fresh && m::with(|s| s.face_slot == Some(slot)) {
+        return;
+    }
+    let root = game.options.resources.join("assets/minecraft/textures/entity");
+    let mut sheet = vec![0u8; m::MINI * m::MINI * 4];
+    let mut faces = std::collections::HashMap::new();
+    for (i, (mob, file, [fx, fy, fw, fh])) in FACES.iter().enumerate() {
+        let Some((width, rgba)) = read_png(&root.join(format!("{file}.png"))) else {
+            continue;
+        };
+        let (cx, cy) = (i % 8 * 16, i / 8 * 16);
+        for y in 0..*fh as usize {
+            for x in 0..*fw as usize {
+                let from = ((*fy as usize + y) * width + *fx as usize + x) * 4;
+                let to = ((cy + y) * m::MINI + cx + x) * 4;
+                if let (Some(px), Some(out)) = (rgba.get(from..from + 4), sheet.get_mut(to..to + 4)) {
+                    out.copy_from_slice(px);
+                }
+            }
+        }
+        faces.insert(format!("minecraft:{mob}"), [cx as f32, cy as f32, *fw as f32, *fh as f32]);
+    }
+    if upload(game, slot, sheet) {
+        m::with(|s| {
+            s.faces = faces;
+            s.face_slot = Some(slot);
+        });
+    }
+}
+
+/// The entities the minimap's dots stand for, within `reach` blocks, the
+/// nearest `limit`. `skins` are the players' skin sprites by UUID.
+fn dots(
+    game: &Game<'_>,
+    here: &m::Here,
+    reach: f64,
+    settings: &m::Settings,
+    skins: &std::collections::HashMap<u128, String>,
+) -> Vec<m::Dot> {
     let near = |x: f64, z: f64| (x - here.pos[0]).abs() <= reach && (z - here.pos[2]).abs() <= reach;
     let mut out = Vec::new();
     for mob in game.mobs.iter() {
         if mob.removed || !near(mob.position.x, mob.position.z) {
             continue;
         }
-        let kind = if mob.kind.id == "minecraft:player" || game.remote_player_uuid(mob.id).is_some() {
+        if settings.hide_invisible && (mob.invisible || mob.has_effect("minecraft:invisibility")) {
+            continue;
+        }
+        let uuid = game.remote_player_uuid(mob.id);
+        let player = mob.kind.id == "minecraft:player" || uuid.is_some();
+        let kind = if player {
             m::DotKind::Player
         } else if mob.kind.category == "misc" {
             m::DotKind::Other
         } else {
             m::DotKind::Mob
         };
+        let icon = match uuid.and_then(|u| skins.get(&u)) {
+            Some(skin) => m::Icon::Skin(skin.clone()),
+            None if player => m::Icon::None,
+            None => m::Icon::Mob(mob.kind.id.clone()),
+        };
+        let name = game
+            .remote_player_name(mob.id)
+            .map(str::to_owned)
+            .or_else(|| Some(m::biome_label(&mob.kind.id)));
         out.push(m::Dot {
             pos: [mob.position.x, mob.position.y, mob.position.z],
             kind,
+            icon,
+            name,
         });
     }
     for item in game.dropped.iter() {
@@ -574,6 +676,8 @@ fn dots(game: &Game<'_>, here: &m::Here, reach: f64) -> Vec<m::Dot> {
             out.push(m::Dot {
                 pos: [item.position.x, item.position.y, item.position.z],
                 kind: m::DotKind::Item,
+                icon: m::Icon::Item(item.stack.item.to_string()),
+                name: Some(m::biome_label(&item.stack.item)),
             });
         }
     }
@@ -582,9 +686,14 @@ fn dots(game: &Game<'_>, here: &m::Here, reach: f64) -> Vec<m::Dot> {
             out.push(m::Dot {
                 pos: [other.position.x, other.position.y, other.position.z],
                 kind: m::DotKind::Other,
+                icon: m::Icon::None,
+                name: Some(m::biome_label(&other.kind)),
             });
         }
     }
+    let away = |d: &m::Dot| (d.pos[0] - here.pos[0]).powi(2) + (d.pos[2] - here.pos[2]).powi(2);
+    out.sort_by(|a, b| away(a).total_cmp(&away(b)));
+    out.truncate(settings.entity_limit.max(0) as usize);
     out
 }
 
@@ -595,6 +704,14 @@ pub(super) fn paint(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
             m::Draw::Fill(rect, argb) => game.native_fill(batch, rect, argb),
             m::Draw::Text(text, at, rgb, shadow) => game.native_text(batch, &text, at, rgb, shadow),
             m::Draw::Quad(points, argb) => game.native_quad(batch, points, argb),
+            m::Draw::Item(item, at, size) => {
+                game.native_item(batch, &item, at, size);
+            }
+            m::Draw::Skin(skin, dst) => {
+                // The face and the hat over it, on a 64 x 64 skin.
+                game.native_sprite(batch, &skin, [8.0, 8.0, 8.0, 8.0], dst);
+                game.native_sprite(batch, &skin, [40.0, 8.0, 8.0, 8.0], dst);
+            }
             m::Draw::Nine(sprite, rect, argb) => game.native_gui_nine_slice(batch, sprite, rect, argb),
             m::Draw::Label(text, at, argb, scale, shadow) => {
                 let start = batch.vertices.len();
@@ -627,6 +744,7 @@ pub(super) fn hud(
     game: &Game<'_>,
     batch: &mut horizon_client::hud::HudBatch,
     corners: &mut horizon_client::extras_hud::Corners,
+    skins: &std::collections::HashMap<u128, String>,
 ) {
     if !game.native_on(m::ID) {
         return;
@@ -674,7 +792,7 @@ pub(super) fn hud(
     };
     let reach = f64::from(m::MINI as u32) * f64::from(m::with(|s| s.mini_zoom()));
     let dots = if settings.dots {
-        let all = dots(game, &here, reach);
+        let all = dots(game, &here, reach, &settings, skins);
         m::with(|s| s.visible_dots(all, here.pos[1]))
     } else {
         Vec::new()

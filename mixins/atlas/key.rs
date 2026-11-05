@@ -6,6 +6,10 @@ fn atlas_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if !game.native_on(m::ID) {
         return;
     }
+    if key == "key.keyboard.tab" {
+        m::with(|s| s.tab_held = pressed);
+        return;
+    }
     // The enlarge key is heard going up too, wherever that happens.
     if key == game.native_mod_key(m::ID, m::KEY_ENLARGE, m::DEFAULT_ENLARGE) {
         if !pressed || game.native_playing() {

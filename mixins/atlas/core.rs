@@ -145,9 +145,10 @@ pub struct MiniInfo {
 }
 
 /// What a dot on the minimap stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DotKind {
     Player,
+    #[default]
     Mob,
     Item,
     Other,
@@ -173,11 +174,26 @@ impl DotKind {
     }
 }
 
+/// What an entity shows as when icons are on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Icon {
+    #[default]
+    None,
+    /// An item's icon (`minecraft:apple`).
+    Item(String),
+    /// A player's face: their skin sprite.
+    Skin(String),
+    /// A mob's face in the face sheet (`minecraft:zombie`).
+    Mob(String),
+}
+
 /// An entity near the player, as a dot.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Dot {
     pub pos: [f64; 3],
     pub kind: DotKind,
+    pub icon: Icon,
+    pub name: Option<String>,
 }
 
 /// What a hook draws, in GUI pixels: a filled `[x, y, w, h]` in ARGB, a
@@ -190,6 +206,10 @@ pub enum Draw {
     Text(String, [f32; 2], u32, bool),
     Image(usize, [f32; 4], [f32; 4], u32),
     Quad([[f32; 2]; 4], u32),
+    /// An item's icon with its top left at the point, the size square.
+    Item(String, [f32; 2], f32),
+    /// A player's face from their skin sprite, into `[x, y, w, h]`.
+    Skin(String, [f32; 4]),
     /// A vanilla GUI sprite (`gui/sprites/widget/button`) nine-sliced into a
     /// rectangle, tinted ARGB.
     Nine(&'static str, [f32; 4], u32),
@@ -212,13 +232,10 @@ pub fn arrow(draws: &mut Vec<Draw>, at: [f32; 2], degrees: f32, len: f32, argb: 
 }
 
 /// How near in height an entity `dy` blocks above (or below) the player
-/// is: 1 up to `FADE_FROM` blocks away, falling to 0 at `FADE_TO`.
-pub fn height_fade(dy: f64) -> f32 {
-    let d = dy.abs() as f32;
-    (1.0 - (d - FADE_FROM) / (FADE_TO - FADE_FROM)).clamp(0.0, 1.0)
+/// is: 1 up to `from` blocks away, falling to 0 over 32 blocks more.
+pub fn height_fade(dy: f64, from: f32) -> f32 {
+    (1.0 - (dy.abs() as f32 - from) / 32.0).clamp(0.0, 1.0)
 }
-const FADE_FROM: f32 = 8.0;
-const FADE_TO: f32 = 40.0;
 
 /// `argb` with its colour times `light` and its alpha faded to 30% at
 /// `near` 0.
@@ -1129,6 +1146,17 @@ fn frame_bands(i: usize) -> (u32, u32, u32) {
     (0xFF00_0000 | c, mix(0xFFFFFF, 0.55), mix(0x000000, 0.45))
 }
 
+const ICON_MODES: &[(&str, &str)] = &[("off", "OFF"), ("tab", "Player List"), ("always", "Always")];
+const NAME_MODES: &[(&str, &str)] = &[("none", "No Names"), ("players", "Players"), ("all", "All")];
+const MAIN_ENTITY: &[(&str, &str)] = &[("arrow", "Arrow"), ("crosshair", "Crosshair"), ("dot", "Dot")];
+const ARROW_COLORS: &[(&str, &str)] = &[
+    ("red", "Red"),
+    ("white", "White"),
+    ("yellow", "Yellow"),
+    ("green", "Green"),
+    ("blue", "Blue"),
+];
+const ARROW_RGB: [u32; 5] = [0xE03030, 0xF0F0F0, 0xFFD030, 0x40D050, 0x4080F0];
 const DISTANCE_MODES: &[(&str, &str)] = &[("off", "OFF"), ("looking", "Looking At"), ("always", "Always")];
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
@@ -1169,6 +1197,31 @@ settings! {
         Kind::Slider { min: -64, max: 320, div: 1, unit: "", zero: None };
 
     dots: bool = true, "dots", "Display Radar", Radar, Kind::Toggle;
+    show_players: bool = true, "show_players", "Players", Radar, Kind::Toggle;
+    show_mobs: bool = true, "show_mobs", "Mobs", Radar, Kind::Toggle;
+    show_items: bool = true, "show_items", "Dropped Items", Radar, Kind::Toggle;
+    show_others: bool = true, "show_others", "Other Entities", Radar, Kind::Toggle;
+    dot_size: i32 = 2, "dot_size", "Entity Dot Size", Radar,
+        Kind::Slider { min: 1, max: 6, div: 1, unit: "", zero: None };
+    icons: usize = 1, "icons", "Display Icons", Radar, Kind::Choice(ICON_MODES);
+    icon_size: f32 = 1.0, "icon_size", "Entity Icon Scale", Radar,
+        Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
+    names: usize = 0, "names", "Display Names", Radar, Kind::Choice(NAME_MODES);
+    entity_limit: i32 = 1000, "entity_limit", "Entity Number", Radar,
+        Kind::Slider { min: 10, max: 1000, div: 1, unit: "", zero: None };
+    height_limit: i32 = 0, "height_limit", "Entity Height Limit", Radar,
+        Kind::Slider { min: 0, max: 256, div: 1, unit: "", zero: Some((0, "OFF")) };
+    depth_fade: bool = true, "depth_fade", "Show Entity Depth", Radar, Kind::Toggle;
+    fade_from: i32 = 8, "fade_from", "Min Y Distance For Depth Fade", Radar,
+        Kind::Slider { min: 0, max: 64, div: 1, unit: "", zero: None };
+    entity_height: bool = false, "entity_height", "Display Entity Height", Radar, Kind::Toggle;
+    main_entity: usize = 0, "main_entity", "Main Entity As", Radar, Kind::Choice(MAIN_ENTITY);
+    arrow_scale: f32 = 1.0, "arrow_scale", "Arrow Scale", Radar,
+        Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
+    arrow_color: usize = 0, "arrow_color", "Arrow Color", Radar, Kind::Choice(ARROW_COLORS);
+    arrow_opacity: i32 = 100, "arrow_opacity", "Arrow Opacity", Radar,
+        Kind::Slider { min: 10, max: 100, div: 1, unit: "", zero: None };
+    hide_invisible: bool = true, "hide_invisible", "Hide Invisible Entities", Radar, Kind::Toggle;
 
     slime: bool = false, "slime", "Slime Chunks", Overlay, Kind::Toggle;
 
@@ -1410,6 +1463,12 @@ impl Settings {
             },
             _ => ("Atlas: /atlas help lists the settings".into(), false),
         }
+    }
+
+    /// The player's arrow, ARGB.
+    pub fn arrow_argb(&self) -> u32 {
+        let alpha = self.arrow_opacity.clamp(0, 100) as u32 * 255 / 100;
+        alpha << 24 | ARROW_RGB[self.arrow_color.min(ARROW_RGB.len() - 1)]
     }
 
     /// The minimap turns with the player.
@@ -1720,6 +1779,8 @@ pub struct MapImages {
 
 /// The minimap's own slot key: far below the world map's.
 pub const MINIMAP_SLOT_KEY: i32 = i32::MIN + 7;
+/// The mob face sheet's slot key.
+pub const FACES_SLOT_KEY: i32 = i32::MIN + 8;
 
 impl MapImages {
     pub fn clear(&mut self) {
@@ -1872,6 +1933,11 @@ pub struct State {
     pub mini_slot: Option<usize>,
     /// The enlarge key is held, or toggled on.
     pub enlarged: bool,
+    /// The player list key is held: icons show.
+    pub tab_held: bool,
+    /// Where each mob's face is in the face sheet, and its texture slot.
+    pub faces: HashMap<String, [f32; 4]>,
+    pub face_slot: Option<usize>,
     pub map: MapView,
     pub images: MapImages,
     /// The size the mod's screen was last drawn at, and the pointer then.
@@ -1916,6 +1982,9 @@ impl Default for State {
             mini_image: Vec::new(),
             mini_slot: None,
             enlarged: false,
+            tab_held: false,
+            faces: HashMap::new(),
+            face_slot: None,
             map: MapView::default(),
             images: MapImages::default(),
             screen_size: [480.0, 270.0],
@@ -3171,9 +3240,17 @@ impl State {
     /// more than a few blocks under the ground the map shows where they
     /// are; in a cut, those inside its band.
     pub fn visible_dots(&mut self, dots: Vec<Dot>, player_y: f64) -> Vec<Dot> {
+        let st = self.settings();
         let cut = self.cut;
         let store = self.maps.store(cut);
         dots.into_iter()
+            .filter(|d| match d.kind {
+                DotKind::Player => st.show_players,
+                DotKind::Mob => st.show_mobs,
+                DotKind::Item => st.show_items,
+                DotKind::Other => st.show_others,
+            })
+            .filter(|d| st.height_limit == 0 || (d.pos[1] - player_y).abs() <= f64::from(st.height_limit))
             .filter(|d| {
                 let y = d.pos[1];
                 match cut {
@@ -3524,8 +3601,10 @@ impl State {
             Some(([mid[0] + sx, mid[1] + sy], past))
         };
 
-        // Dots a little under 1/40 of the map across, as Xaero's.
-        let dot = (side / 85.0).clamp(0.8, 2.2);
+        // Dots a little under 1/40 of the map across, as Xaero's, or icons.
+        let dot = (side / 85.0).clamp(0.8, 2.2) * st.dot_size as f32 / 2.0;
+        let icons = st.icons == 2 || (st.icons == 1 && self.tab_held);
+        let icon = (side / 11.0).clamp(7.0, 14.0) * st.icon_size;
         if st.dots {
             let mut sorted: Vec<&Dot> = dots.iter().collect();
             sorted.sort_by_key(|d| d.kind.layer());
@@ -3533,11 +3612,39 @@ impl State {
                 let Some((p, _)) = place(d.pos[0] - here.pos[0], d.pos[2] - here.pos[2], false) else {
                     continue;
                 };
-                let r = if d.kind == DotKind::Player { dot * 1.3 } else { dot };
+                let dy = d.pos[1] - here.pos[1];
                 // Darker and fainter the further from the player's height.
-                let near = height_fade(d.pos[1] - here.pos[1]);
-                disc(&mut draws, p, r + 0.6, fade(0xE020_2020, 1.0, near));
-                disc(&mut draws, p, r, fade(d.kind.color(), 0.35 + 0.65 * near, near));
+                let near = if st.depth_fade { height_fade(dy, st.fade_from as f32) } else { 1.0 };
+                let box_at = [p[0] - icon / 2.0, p[1] - icon / 2.0, icon, icon];
+                let face = self.faces.get(match &d.icon {
+                    Icon::Mob(id) => id.as_str(),
+                    _ => "",
+                });
+                match (&d.icon, face, self.face_slot) {
+                    (Icon::Item(item), ..) if icons => draws.push(Draw::Item(item.clone(), [box_at[0], box_at[1]], icon)),
+                    (Icon::Skin(skin), ..) if icons => draws.push(Draw::Skin(skin.clone(), box_at)),
+                    (Icon::Mob(_), Some(src), Some(slot)) if icons => {
+                        let alpha = ((0.3 + 0.7 * near) * 255.0) as u32;
+                        // As wide as the face is, as tall as it is.
+                        let h = icon * src[3] / src[2];
+                        let dst = [box_at[0], p[1] - h / 2.0, icon, h];
+                        draws.push(Draw::Image(slot, *src, dst, alpha << 24 | 0xFF_FFFF));
+                    }
+                    _ => {
+                        let r = if d.kind == DotKind::Player { dot * 1.3 } else { dot };
+                        disc(&mut draws, p, r + 0.6, fade(0xE020_2020, 1.0, near));
+                        disc(&mut draws, p, r, fade(d.kind.color(), 0.35 + 0.65 * near, near));
+                    }
+                }
+                let wanted = st.names == 2 || (st.names == 1 && d.kind == DotKind::Player);
+                if let Some(name) = d.name.as_ref().filter(|_| wanted) {
+                    let tw = measure(name) * 0.5;
+                    draws.push(Draw::Label(name.clone(), [p[0] - tw / 2.0, p[1] + 3.0], 0xE0FF_FFFF, 0.5, true));
+                }
+                if st.entity_height {
+                    let text = format!("{:+}", dy.round() as i32);
+                    draws.push(Draw::Label(text, [p[0] + 3.0, p[1] - 2.0], 0xE0FF_FFFF, 0.5, true));
+                }
             }
         }
 
@@ -3551,9 +3658,22 @@ impl State {
             }
         }
 
-        // The player: a red arrow, as Xaero's.
+        // The player: a red arrow as Xaero's, a crosshair or a dot.
         let facing = if self.turning() { 0.0 } else { 180.0 + here.yaw };
-        arrow(&mut draws, mid, facing, (side / 14.0).clamp(5.0, 9.0), 0xFFE0_3030);
+        let color = st.arrow_argb();
+        let len = (side / 14.0).clamp(5.0, 9.0) * st.arrow_scale;
+        match st.main_entity {
+            0 => arrow(&mut draws, mid, facing, len, color),
+            1 => {
+                let l = len / 2.0;
+                draws.push(Draw::Fill([mid[0] - l, mid[1] - 0.5, l * 2.0, 1.0], color));
+                draws.push(Draw::Fill([mid[0] - 0.5, mid[1] - l, 1.0, l * 2.0], color));
+            }
+            _ => {
+                disc(&mut draws, mid, len / 3.0 + 0.6, 0xFF10_1010);
+                disc(&mut draws, mid, len / 3.0, color);
+            }
+        }
 
         // N E S W on the frame.
         if st.compass {
@@ -3669,7 +3789,8 @@ impl State {
 
         if let Some(h) = here {
             let at = self.map.screen(h.pos[0], h.pos[2], size);
-            arrow(&mut out.draws, at, 180.0 + h.yaw, 10.0, 0xFFE0_3030);
+            let st = self.settings();
+            arrow(&mut out.draws, at, 180.0 + h.yaw, 10.0 * st.arrow_scale, st.arrow_argb());
         }
 
         // Top left: the scale (pixels a block).
@@ -4428,8 +4549,8 @@ mod tests {
         assert!(!s.update_minimap(0.6, 0.5, 0.0));
         s.mini_slot = Some(3);
         let dots = [
-            Dot { pos: [5.0, 64.0, 0.0], kind: DotKind::Mob },
-            Dot { pos: [900.0, 64.0, 0.0], kind: DotKind::Item },
+            Dot { pos: [5.0, 64.0, 0.0], kind: DotKind::Mob, ..Dot::default() },
+            Dot { pos: [900.0, 64.0, 0.0], kind: DotKind::Item, ..Dot::default() },
         ];
         let draws = s.minimap_hud(gui, [0.0, 0.0], &h, &info, &dots, &measure);
         let mut texts: Vec<&str> = draws
@@ -4505,11 +4626,38 @@ mod tests {
     }
 
     #[test]
+    fn icons_show_while_tab_is_held() {
+        let mut s = State::default();
+        let h = Here { pos: [0.5, 64.0, 0.5], dimension: OVERWORLD.into(), yaw: 0.0 };
+        s.update_minimap(0.5, 0.5, 0.0);
+        s.mini_slot = Some(3);
+        s.face_slot = Some(4);
+        s.faces.insert("minecraft:zombie".into(), [0.0, 0.0, 8.0, 8.0]);
+        let dots = [
+            Dot { pos: [3.0, 64.0, 0.0], icon: Icon::Mob("minecraft:zombie".into()), ..Dot::default() },
+            Dot { pos: [0.0, 64.0, 3.0], kind: DotKind::Item, icon: Icon::Item("minecraft:apple".into()), ..Dot::default() },
+            Dot { pos: [3.0, 64.0, 3.0], kind: DotKind::Player, icon: Icon::Skin("skins/x".into()), ..Dot::default() },
+        ];
+        let info = MiniInfo::default();
+        let gui = [480.0, 270.0];
+        let count = |s: &State| {
+            let d = s.minimap_hud(gui, [0.0, 0.0], &h, &info, &dots, &measure);
+            let items = d.iter().filter(|x| matches!(x, Draw::Item(..))).count();
+            let skins = d.iter().filter(|x| matches!(x, Draw::Skin(..))).count();
+            let faces = d.iter().filter(|x| matches!(x, Draw::Image(4, ..))).count();
+            (items, skins, faces)
+        };
+        assert_eq!(count(&s), (0, 0, 0));
+        s.tab_held = true;
+        assert_eq!(count(&s), (1, 1, 1));
+    }
+
+    #[test]
     fn dots_fade_with_height() {
-        assert_eq!(height_fade(0.0), 1.0);
-        assert_eq!(height_fade(-8.0), 1.0, "near heights don't fade");
-        assert!(height_fade(24.0) > 0.4 && height_fade(24.0) < 0.6);
-        assert_eq!(height_fade(45.0), 0.0);
+        assert_eq!(height_fade(0.0, 8.0), 1.0);
+        assert_eq!(height_fade(-8.0, 8.0), 1.0, "near heights don't fade");
+        assert!(height_fade(24.0, 8.0) > 0.4 && height_fade(24.0, 8.0) < 0.6);
+        assert_eq!(height_fade(45.0, 8.0), 0.0);
         assert_eq!(fade(0xFFFF_DD33, 1.0, 1.0), 0xFFFF_DD33);
         let far = fade(0xFFFF_DD33, 0.35, 0.0);
         assert_eq!(far >> 24, 77);
@@ -4520,7 +4668,7 @@ mod tests {
     fn dots_show_on_the_level_the_map_shows() {
         let mut s = State::default();
         s.maps.store(Cut::Surface).put(0, 0, grass(64));
-        let at = |y: f64| Dot { pos: [5.0, y, 5.0], kind: DotKind::Mob };
+        let at = |y: f64| Dot { pos: [5.0, y, 5.0], kind: DotKind::Mob, ..Dot::default() };
         let kept = |s: &mut State, y: f64| !s.visible_dots(vec![at(y)], 65.0).is_empty();
         assert!(kept(&mut s, 65.0));
         assert!(!kept(&mut s, 20.0), "a cave mob under the grass");
