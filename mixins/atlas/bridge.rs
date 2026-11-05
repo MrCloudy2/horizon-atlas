@@ -162,7 +162,8 @@ impl Palette {
         }
         let leaves = name.ends_with("_leaves");
         let tinted = match name {
-            "spruce_leaves" => Tint::Constant(0x61_9961),
+            // Darker than the game's: measured from Xaero's map.
+            "spruce_leaves" => Tint::Constant(0x48_6C4C),
             "birch_leaves" => Tint::Constant(0x80_A755),
             "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves" => Tint::None,
             "leaf_litter" => Tint::Dry,
@@ -197,6 +198,16 @@ impl Palette {
         } else if name == "lava" {
             rgb = self.lava;
             tint = Tint::None;
+        }
+        // Measured from Xaero's map: these are darker than their textures.
+        let dim = match name {
+            "ice" | "packed_ice" | "blue_ice" | "frosted_ice" => 0.75,
+            "podzol" | "coarse_dirt" | "rooted_dirt" => 0.76,
+            _ => 1.0,
+        };
+        if dim < 1.0 {
+            let ch = |s: u32| (((rgb >> s & 255) as f32 * dim) as u32) << s;
+            rgb = ch(16) | ch(8) | ch(0);
         }
         if rgb == 0 {
             // No texture: the map item's colour.
@@ -276,7 +287,8 @@ impl Scan<'_> {
             }
             let fluid = look.flags & FLUID;
             if fluid == 0 || look.flags & STURDY_TOP != 0 {
-                return (m::LAND | self.color(look, x, y, z), y as i16, 0);
+                let kind = if look.flags & LEAVES != 0 { m::LEAF } else { m::LAND };
+                return (kind | self.color(look, x, y, z), y as i16, 0);
             }
             let mut depth = 1u8;
             let mut below = y - 1;

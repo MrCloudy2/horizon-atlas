@@ -477,6 +477,8 @@ pub struct Widget {
 /// by its biome) in the rest. A kind of 0 is a column with nothing in it.
 pub const LAND: u32 = 1 << 24;
 pub const WATER: u32 = 2 << 24;
+/// Tree tops: land, with their own edges.
+pub const LEAF: u32 = 3 << 24;
 /// Marks a column the map cuts through (solid at the cut's height).
 pub const WALL: u32 = 0x80 << 24;
 pub const KIND: u32 = 0x7F << 24;
@@ -591,11 +593,20 @@ pub struct Shading {
     pub terrain_depth: bool,
     /// Deep water is darker.
     pub transparency: bool,
+    /// Land's brightness.
+    pub gain: f32,
+    /// Water's brightness.
+    pub water_gain: f32,
+    /// How deep the shadow of a height step is: at the minimap's zoom a
+    /// softer line reads better.
+    pub edges: f32,
+    /// The same on tree tops.
+    pub leaf_edges: f32,
 }
 
 impl Default for Shading {
     fn default() -> Self {
-        Self { slopes: 1, terrain_depth: true, transparency: true }
+        Self { slopes: 1, terrain_depth: true, transparency: true, gain: 1.0, water_gain: 1.0, edges: 1.0, leaf_edges: 1.0 }
     }
 }
 
@@ -637,7 +648,8 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
         1.0
     };
     let k = [0.0, 1.0, 1.3][how.slopes.min(2)];
-    let slope = 1.0 + (shadow - 1.0) * k;
+    let edges = if color & KIND == LEAF { how.leaf_edges } else { how.edges };
+    let slope = 1.0 + (shadow - 1.0) * k * edges;
     let f = if color & WALL != 0 {
         0.38
     } else if color & KIND == WATER {
@@ -656,8 +668,12 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
     // The colour grade from the blocks' averages to Xaero's: measured on
     // grass, sand and gravel of the same world.
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
-    let grade = if color & KIND == WATER { [0.89, 0.745, 0.66] } else { [0.84, 0.86, 0.9] };
-    let ch = |c: f32, grade: f32| (c * grade * f).round().clamp(0.0, 255.0) as u8;
+    let (grade, gain) = if color & KIND == WATER {
+        ([0.89, 0.745, 0.66], how.water_gain)
+    } else {
+        ([0.84, 0.86, 0.9], how.gain)
+    };
+    let ch = |c: f32, grade: f32| (c * grade * gain * f).round().clamp(0.0, 255.0) as u8;
     [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
 }
 
@@ -676,7 +692,7 @@ fn shaded(
     }
     // Land against land; water against water, by the height of its bottom.
     let water = color & KIND == WATER;
-    let like = |c: &(u32, i16, u8)| c.0 & WALL == 0 && c.0 & KIND == if water { WATER } else { LAND };
+    let like = |c: &(u32, i16, u8)| c.0 & WALL == 0 && (c.0 & KIND == WATER) == water && c.0 & KIND != 0;
     let level = |c: (u32, i16, u8)| if water { c.1 - i16::from(c.2) } else { c.1 };
     let north = column(x, z - step).filter(like).map(level);
     let west = column(x - step, z).filter(like).map(level);
@@ -1008,7 +1024,10 @@ pub const MINI: usize = 128;
 /// The minimap's image at most: Horizon's mod image is 1024 square.
 pub const MINI_MAX: usize = 1024;
 /// A block on the minimap at zoom 1, in screen pixels, as Xaero draws it.
-pub const PIXELS_PER_BLOCK: f32 = 2.0;
+pub const PIXELS_PER_BLOCK: f32 = 1.0;
+/// How much brighter land is on the minimap than on the world map, as
+/// measured on Xaero's (daytime sand `d8d4b0` against `b2ac90`).
+const MINI_LAND_GAIN: f32 = 1.21;
 
 /// How the minimap's edge looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1233,6 +1252,7 @@ fn frame_bands(i: usize) -> (u32, u32, u32) {
 const ICON_MODES: &[(&str, &str)] = &[("off", "OFF"), ("tab", "Player List"), ("always", "Always")];
 const NAME_MODES: &[(&str, &str)] = &[("none", "No Names"), ("players", "Players"), ("all", "All")];
 const MAIN_ENTITY: &[(&str, &str)] = &[("arrow", "Arrow"), ("crosshair", "Crosshair"), ("dot", "Dot")];
+const MAIN_ARROW: usize = 0;
 const ARROW_COLORS: &[(&str, &str)] = &[
     ("red", "Red"),
     ("white", "White"),
@@ -1321,7 +1341,7 @@ settings! {
     fade_from: i32 = 8, "fade_from", "Min Y Distance For Depth Fade", Radar,
         Kind::Slider { min: 0, max: 64, div: 1, unit: "", zero: None };
     entity_height: bool = false, "entity_height", "Display Entity Height", Radar, Kind::Toggle;
-    main_entity: usize = 0, "main_entity", "Main Entity As", Radar, Kind::Choice(MAIN_ENTITY);
+    main_entity: usize = 1, "main_entity", "Main Entity As", Radar, Kind::Choice(MAIN_ENTITY);
     arrow_scale: f32 = 1.0, "arrow_scale", "Arrow Scale", Radar,
         Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
     arrow_color: usize = 0, "arrow_color", "Arrow Color", Radar, Kind::Choice(ARROW_COLORS);
@@ -1597,6 +1617,7 @@ impl Settings {
             slopes: self.slopes,
             terrain_depth: self.terrain_depth,
             transparency: self.transparency,
+            ..Shading::default()
         }
     }
 
@@ -2103,6 +2124,8 @@ pub struct State {
     pub mini_image: Vec<u8>,
     /// The image's side in texels: the minimap's in screen pixels, plus one.
     pub mini_n: usize,
+    /// Screen pixels a GUI pixel.
+    pub gui_scale: f32,
     /// The image has been uploaded.
     pub mini_ready: bool,
     pub mini_uploaded: Option<Instant>,
@@ -2160,6 +2183,7 @@ impl Default for State {
             mini_grid: None,
             mini_image: Vec::new(),
             mini_n: MINI,
+            gui_scale: 2.0,
             mini_ready: false,
             mini_uploaded: None,
             shade_cache: HashMap::new(),
@@ -2342,11 +2366,20 @@ pub fn facing_text(yaw: f32) -> String {
     names[i].to_owned()
 }
 
-/// How light the world is at day time `ticks`: 1 by day, 0.45 at night.
+/// How light the world is at day time `ticks`: full all day, 0.45 at night,
+/// easing over dusk and dawn.
 pub fn daylight(ticks: i64) -> f32 {
-    let t = (ticks.rem_euclid(24_000) - 6000) as f32 / 24_000.0;
-    let sun = (t * std::f32::consts::TAU).cos();
-    0.45 + 0.55 * (0.5 + sun * 2.0).clamp(0.0, 1.0)
+    let t = ticks.rem_euclid(24_000) as f32;
+    let night = if t < 12_000.0 {
+        0.0
+    } else if t < 13_700.0 {
+        (t - 12_000.0) / 1700.0
+    } else if t < 22_300.0 {
+        1.0
+    } else {
+        (24_000.0 - t) / 1700.0
+    };
+    1.0 - 0.55 * night
 }
 
 /// `minecraft:dark_forest` as `Dark Forest`.
@@ -2838,7 +2871,13 @@ impl State {
             self.shade_cache.clear();
             self.shade_cut = Some(cut);
         }
-        let how = st.shading();
+        let how = Shading {
+            gain: MINI_LAND_GAIN,
+            water_gain: 1.15,
+            edges: 0.6,
+            leaf_edges: 0.3,
+            ..st.shading()
+        };
         let store = self.maps.store(cut);
         let cache = &mut self.shade_cache;
         // Rows of texels stay in one chunk for a while: remember the last.
@@ -3757,6 +3796,7 @@ impl State {
     /// a texel a screen pixel, so nothing is stretched.
     pub fn size_image(&mut self, gui: [f32; 2], physical: [f32; 2]) {
         let scale = if gui[1] > 0.0 { physical[1] / gui[1] } else { 1.0 };
+        self.gui_scale = scale.max(1.0);
         let n = (self.mini_side(gui) * scale).round() as usize + 1;
         // Even, so the player sits on the grid.
         self.mini_n = (n + n % 2).clamp(32, MINI_MAX);
@@ -3769,6 +3809,12 @@ impl State {
             self.mini_uploaded = Some(Instant::now());
         }
         due
+    }
+
+    /// The lines' size in GUI units: the UI Scale is of a font pixel at GUI
+    /// scale 2, so they keep their size on screen at any GUI scale.
+    fn info_scale(&self) -> f32 {
+        (self.settings().info_scale * 2.0 / self.gui_scale).max(0.3)
     }
 
     /// How far the minimap reaches from the player, in blocks.
@@ -3820,7 +3866,7 @@ impl State {
     /// How far the frame reaches out of the map on each side.
     fn frame_width(&self) -> f32 {
         match self.settings().style {
-            Style::Frame => 4.0,
+            Style::Frame => 2.0,
             Style::Thin => 1.0,
             Style::Bare => 0.0,
         }
@@ -3831,7 +3877,7 @@ impl State {
     pub fn minimap_box(&self, gui: [f32; 2], here: &Here, info: &MiniInfo, measure: &dyn Fn(&str) -> f32) -> [f32; 2] {
         let side = self.mini_side(gui) + self.frame_width() * 2.0;
         let lines = self.info_lines(here, info);
-        let scale = self.settings().info_scale;
+        let scale = self.info_scale();
         let widest = lines.iter().map(|l| measure(l) * scale + 4.0).fold(side, f32::max);
         let below = if lines.is_empty() { 0.0 } else { lines.len() as f32 * LINE * scale + 4.0 };
         [widest, side + below]
@@ -3868,9 +3914,9 @@ impl State {
         if st.round {
             match st.style {
                 Style::Frame => {
-                    ring(&mut draws, mid, half + 2.0, 5.0, 0xFF10_1010);
-                    ring(&mut draws, mid, half + 2.0, 3.0, band);
-                    ring(&mut draws, mid, half + 1.5, 1.0, light);
+                    ring(&mut draws, mid, half + 1.0, 2.5, 0xFF10_1010);
+                    ring(&mut draws, mid, half + 1.0, 1.5, band);
+                    ring(&mut draws, mid, half + 0.8, 0.5, light);
                 }
                 Style::Thin => ring(&mut draws, mid, half + 0.5, 1.0, 0xFF10_1010),
                 Style::Bare => {}
@@ -3879,10 +3925,10 @@ impl State {
             let r = |d: f32| [x - d, y - d, side + d * 2.0, side + d * 2.0];
             match st.style {
                 Style::Frame => {
-                    draws.push(Draw::Fill(r(4.0), 0xFF10_1010));
-                    draws.push(Draw::Fill(r(3.0), band));
-                    draws.push(Draw::Fill(r(2.0), light));
-                    draws.push(Draw::Fill(r(1.0), dark));
+                    draws.push(Draw::Fill(r(2.0), 0xFF10_1010));
+                    draws.push(Draw::Fill(r(1.5), band));
+                    draws.push(Draw::Fill(r(1.0), light));
+                    draws.push(Draw::Fill(r(0.5), dark));
                 }
                 Style::Thin => draws.push(Draw::Fill(r(1.0), 0xFF10_1010)),
                 Style::Bare => {}
@@ -3928,7 +3974,7 @@ impl State {
         };
 
         // Dots a little under 1/40 of the map across, as Xaero's, or icons.
-        let dot = (side / 85.0).clamp(0.8, 2.2) * st.dot_size as f32 / 2.0;
+        let dot = (side / 100.0).clamp(0.5, 2.0) * st.dot_size as f32 / 2.0;
         let icons = st.icons == 2 || (st.icons == 1 && self.tab_held);
         let icon = (side / 15.0).clamp(4.5, 10.0) * st.icon_size;
         if st.dots {
@@ -3960,8 +4006,7 @@ impl State {
                         let r = if d.kind == DotKind::Player { dot * 1.3 } else { dot };
                         // A diamond with a black outline, as Xaero's.
                         let light = 0.35 + 0.65 * near;
-                        let r = r * 1.5;
-                        diamond(&mut draws, p, r + 0.8, fade(0xFF00_0000, 1.0, near));
+                        diamond(&mut draws, p, r + 0.4, fade(0xFF00_0000, 1.0, near));
                         diamond(&mut draws, p, r, fade(d.kind.color(), light, near));
                     }
                 }
@@ -3990,13 +4035,21 @@ impl State {
         // The player: a red arrow as Xaero's, a crosshair or a dot.
         let facing = if self.turning() { 0.0 } else { 180.0 + here.yaw };
         let color = st.arrow_argb();
-        let len = (side / 14.0).clamp(5.0, 9.0) * st.arrow_scale;
+        let len = (side / 18.0).clamp(4.0, 7.0) * st.arrow_scale;
         match st.main_entity {
-            0 => arrow(&mut draws, mid, facing, len, color),
+            MAIN_ARROW => arrow(&mut draws, mid, facing, len, color),
             1 => {
-                let l = len / 2.0;
-                draws.push(Draw::Fill([mid[0] - l, mid[1] - 0.5, l * 2.0, 1.0], color));
-                draws.push(Draw::Fill([mid[0] - 0.5, mid[1] - l, 1.0, l * 2.0], color));
+                // As Xaero's: 2.5% of the map across, arms 0.7% thick, white
+                // with a faint edge.
+                let l = (side * 0.0105).max(1.0) * st.arrow_scale;
+                let w = (side * 0.0036).max(0.35) * st.arrow_scale;
+                let alpha = color & 0xFF00_0000;
+                let edge = (alpha >> 25) << 24 | 0x30_3040;
+                draws.push(Draw::Fill([mid[0] - l - 0.3, mid[1] - w - 0.3, l * 2.0 + 0.6, w * 2.0 + 0.6], edge));
+                draws.push(Draw::Fill([mid[0] - w - 0.3, mid[1] - l - 0.3, w * 2.0 + 0.6, l * 2.0 + 0.6], edge));
+                let white = alpha | 0xFF_FFFF;
+                draws.push(Draw::Fill([mid[0] - l, mid[1] - w, l * 2.0, w * 2.0], white));
+                draws.push(Draw::Fill([mid[0] - w, mid[1] - l, w * 2.0, l * 2.0], white));
             }
             _ => {
                 disc(&mut draws, mid, len / 3.0 + 0.6, 0xFF10_1010);
@@ -4010,20 +4063,23 @@ impl State {
                 let [sx, sy] = grid.to_screen(dir[0], dir[1], 1.0);
                 let len = (sx * sx + sy * sy).sqrt().max(1e-6);
                 let (ux, uy) = (sx / len, sy / len);
-                let edge = half + fw / 2.0;
+                // A tiny blue tag just inside the edge, as Xaero's.
+                let k = (side / 280.0).max(0.2) * st.compass_scale;
+                let tag = 4.5 * k;
+                let edge = half - tag - 1.0;
                 let t = if st.round { edge } else { edge / ux.abs().max(uy.abs()) };
                 let at = [mid[0] + ux * t, mid[1] + uy * t];
-                let k = st.compass_scale;
+                draws.push(Draw::Fill([at[0] - tag, at[1] - tag, tag * 2.0, tag * 2.0], 0xB020_38A0));
                 let lw = measure(letter) * k;
                 let ink = if letter == "N" { NORTH_RGB[st.north_color.min(3)] } else { INK };
-                outlined(&mut draws, letter, [at[0] - lw / 2.0 + 0.5 * k, at[1] - 3.5 * k], ink, k);
+                draws.push(Draw::Label(letter.into(), [at[0] - lw / 2.0 + 0.3 * k, at[1] - 3.5 * k], 0xFF00_0000 | ink, k, false));
             }
         }
 
         // The lines under it.
         let lines = self.info_lines(here, info);
         let top = y + side + fw + 2.0;
-        let scale = st.info_scale;
+        let scale = self.info_scale();
         let row = LINE * scale;
         for (i, line) in lines.iter().enumerate() {
             let lw = measure(line) * scale;
@@ -5024,8 +5080,8 @@ mod tests {
     #[test]
     fn block_map_settings_shade_the_map() {
         let (flat, strong) = (
-            Shading { slopes: 0, terrain_depth: false, transparency: true },
-            Shading { slopes: 2, terrain_depth: false, transparency: true },
+            Shading { slopes: 0, terrain_depth: false, ..Shading::default() },
+            Shading { slopes: 2, terrain_depth: false, ..Shading::default() },
         );
         let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, 0, how)[0];
         let flat_at = at(flat, Some(68), Some(70));
@@ -5212,6 +5268,7 @@ mod tests {
         s.set_cut(Cut::Below(31));
         assert_eq!(s.mini_zoom(), 1.0, "closer in caves");
         assert_eq!(daylight(6000), 1.0);
+        assert_eq!(daylight(100), 1.0, "right after sunrise");
         assert!(daylight(18000) < 0.5);
     }
 
