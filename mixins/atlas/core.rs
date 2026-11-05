@@ -1089,6 +1089,7 @@ fn frame_bands(i: usize) -> (u32, u32, u32) {
     (0xFF00_0000 | c, mix(0xFFFFFF, 0.55), mix(0x000000, 0.45))
 }
 
+const DISTANCE_MODES: &[(&str, &str)] = &[("off", "OFF"), ("looking", "Looking At"), ("always", "Always")];
 const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
 const CORNER_CHOICES: &[(&str, &str)] = &[
     ("top_left", "Top Left"),
@@ -1135,7 +1136,35 @@ settings! {
     biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
     time: bool = true, "time", "Time of Day", Info, Kind::Toggle;
 
+    on_map: bool = true, "on_map", "On-Map Waypoints", Waypoints, Kind::Toggle;
     labels: bool = true, "labels", "In-World Waypoints", Waypoints, Kind::Toggle;
+    icon_scale: f32 = 1.0, "icon_scale", "In-World Waypoint Icon Scale", Waypoints,
+        Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
+    name_scale: f32 = 0.7, "name_scale", "Waypoint Name Text Scale", Waypoints,
+        Kind::Slider { min: 30, max: 200, div: 100, unit: "x", zero: None };
+    distance_scale: f32 = 0.7, "distance_scale", "Waypoint Distance Text Scale", Waypoints,
+        Kind::Slider { min: 30, max: 200, div: 100, unit: "x", zero: None };
+    distance_mode: usize = 1, "distance_mode", "Distance to WP", Waypoints, Kind::Choice(DISTANCE_MODES);
+    list_distance: bool = true, "list_distance", "Waypoint Distance In Menu", Waypoints, Kind::Toggle;
+    name_above: bool = true, "name_above", "WP Name Above Distance", Waypoints, Kind::Toggle;
+    angle_v: i32 = 180, "angle_v", "WP Dist. Vertic. Angle", Waypoints,
+        Kind::Slider { min: 1, max: 180, div: 1, unit: "", zero: None };
+    angle_h: i32 = 10, "angle_h", "WP Dist. Horis. Angle", Waypoints,
+        Kind::Slider { min: 1, max: 180, div: 1, unit: "", zero: None };
+    max_render: i32 = 0, "max_render", "Max WP Render Dist.", Waypoints,
+        Kind::Slider { min: 0, max: 10000, div: 1, unit: "m", zero: Some((0, "Unlimited")) };
+    min_render: i32 = 0, "min_render", "Min WP Render Dist.", Waypoints,
+        Kind::Slider { min: 0, max: 500, div: 1, unit: "m", zero: Some((0, "OFF")) };
+    km_at: i32 = 10000, "km_at", "Convert Distance to KM at", Waypoints,
+        Kind::Slider { min: 100, max: 100000, div: 1, unit: "m", zero: None };
+    precision: i32 = 1, "precision", "Waypoint Distance Precision", Waypoints,
+        Kind::Slider { min: 0, max: 3, div: 1, unit: "", zero: None };
+    world_opacity: i32 = 80, "world_opacity", "Waypoint Opacity in World", Waypoints,
+        Kind::Slider { min: 10, max: 100, div: 1, unit: "", zero: None };
+    map_opacity: i32 = 90, "map_opacity", "Waypoint Opacity on Map", Waypoints,
+        Kind::Slider { min: 10, max: 100, div: 1, unit: "", zero: None };
+    map_scale: f32 = 1.0, "map_scale", "On-Map Waypoint Scale", Waypoints,
+        Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
     compass: bool = true, "compass", "Compass", Waypoints, Kind::Toggle;
 }
 
@@ -2015,12 +2044,13 @@ pub fn time_text(ticks: i64) -> String {
     format!("Day {day}, {hours:02}:{minutes:02}")
 }
 
-/// `12 m`, then `1.2 km` from a kilometre on.
-pub fn distance_text(d: f64) -> String {
-    if d < 999.5 {
-        format!("{} m", d.round() as i64)
+/// `52.3m`, in kilometres from `km_at` metres on, to `precision` decimals.
+pub fn distance_text(d: f64, km_at: i32, precision: i32) -> String {
+    let p = precision.clamp(0, 3) as usize;
+    if d >= f64::from(km_at) {
+        format!("{:.p$}km", d / 1000.0)
     } else {
-        format!("{:.1} km", d / 1000.0)
+        format!("{d:.p$}m")
     }
 }
 
@@ -2222,17 +2252,18 @@ fn ink_on(rgb: u32) -> u32 {
 }
 
 /// A waypoint on a map: its initial on a square of its colour, ringed in
-/// black (white when `hot`), `half` pixels from the middle to the side.
-fn letter_marker(draws: &mut Vec<Draw>, at: [f32; 2], w: &Waypoint, half: f32, hot: bool) {
+/// black (white when `hot`), `half` pixels from the middle to the side, its
+/// opacity `alpha` of 255.
+fn letter_marker(draws: &mut Vec<Draw>, at: [f32; 2], w: &Waypoint, half: f32, hot: bool, alpha: u32) {
     let [x, y] = [at[0].round(), at[1].round()];
-    let ring = if hot { 0xFFFF_FFFF } else { 0xFF00_0000 };
-    let color = if w.hidden { 0x77_7777 } else { w.color & 0xFF_FFFF };
-    draws.push(Draw::Fill([x - half - 1.0, y - half - 1.0, half * 2.0 + 2.0, half * 2.0 + 2.0], ring));
-    draws.push(Draw::Fill([x - half, y - half, half * 2.0, half * 2.0], 0xFF00_0000 | color));
-    if half >= 4.0 {
-        let letter = initial(&w.name);
-        // The font's capitals are 5 pixels wide and 7 high.
-        draws.push(Draw::Text(letter, [x - 2.0, y - 3.5], ink_on(color), false));
+    let ring = if hot { 0xFF_FFFF } else { 0 };
+    let color = if w.hidden { 0x77_7777 } else { w.color & RGB };
+    let a = alpha << 24;
+    draws.push(Draw::Fill([x - half - 1.0, y - half - 1.0, half * 2.0 + 2.0, half * 2.0 + 2.0], a | ring));
+    draws.push(Draw::Fill([x - half, y - half, half * 2.0, half * 2.0], a | color));
+    if half >= 3.5 {
+        let scale = half / 4.5;
+        draws.push(Draw::Label(initial(&w.name), [x - 2.2 * scale, y - 3.5 * scale], a | ink_on(color), scale, false));
     }
 }
 
@@ -3028,7 +3059,8 @@ impl State {
         size: [f32; 2],
         measure: &dyn Fn(&str) -> f32,
     ) -> Vec<Draw> {
-        if !self.settings().labels {
+        let st = self.settings();
+        if !st.labels {
             return Vec::new();
         }
         let view = basis(camera.yaw, camera.pitch);
@@ -3037,30 +3069,59 @@ impl State {
             .iter()
             .filter(|w| !w.hidden && w.dimension == dimension)
             .filter_map(|w| {
+                let d = distance(player, centre(w));
+                if d < f64::from(st.min_render) || (st.max_render > 0 && d > f64::from(st.max_render)) {
+                    return None;
+                }
                 let at = project(camera.pos, view, camera.fov, centre(w), size)?;
                 let on_screen = at[0] >= 0.0 && at[0] <= size[0] && at[1] >= 0.0 && at[1] <= size[1];
-                on_screen.then(|| (distance(player, centre(w)), at, w))
+                on_screen.then_some((d, at, w))
             })
             .collect();
         shown.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut draws = Vec::new();
         for (d, [x, y], w) in shown {
             // As Xaero's: a see-through square of its colour with its
-            // letter, and its name and distance small under it, placed to
-            // the sub-pixel so they glide as the view turns.
-            let half = 4.5;
+            // letter, its name small under it, and its distance while it is
+            // looked at, placed to the sub-pixel so they glide as the view
+            // turns.
+            let alpha = st.world_opacity.clamp(0, 100) as u32 * 255 / 100;
+            let a = |v: u32| (v * alpha / 255) << 24;
+            let half = 4.5 * st.icon_scale;
             let color = w.color & RGB;
-            draws.push(Draw::Fill([x - half - 0.5, y - half - 0.5, half * 2.0 + 1.0, half * 2.0 + 1.0], 0x7000_0000));
-            draws.push(Draw::Fill([x - half, y - half, half * 2.0, half * 2.0], 0xA000_0000 | color));
+            draws.push(Draw::Fill([x - half - 0.5, y - half - 0.5, half * 2.0 + 1.0, half * 2.0 + 1.0], a(0x70)));
+            draws.push(Draw::Fill([x - half, y - half, half * 2.0, half * 2.0], a(0xD0) | color));
             let letter = initial(&w.name);
-            let lw = measure(&letter) * 0.9;
-            draws.push(Draw::Label(letter, [x - lw / 2.0 + 0.4, y - 3.4], 0xE000_0000 | ink_on(color), 0.9, false));
-            let line = format!("{}  {}", w.name, distance_text(d));
-            let scale = 0.7;
-            let tw = measure(&line) * scale;
-            let top = y + half + 2.0;
-            draws.push(Draw::Fill([x - tw / 2.0 - 2.0, top - 1.0, tw + 4.0, 8.0 * scale + 2.0], 0x5000_0000));
-            draws.push(Draw::Label(line, [x - tw / 2.0, top], 0xE0FF_FFFF, scale, false));
+            let ls = st.icon_scale * 0.9;
+            let lw = measure(&letter) * ls;
+            draws.push(Draw::Label(letter, [x - lw / 2.0 + 0.4, y - 3.6 * ls], a(0xFF) | ink_on(color), ls, false));
+
+            let looking = {
+                let c = centre(w);
+                let to = sub(c, camera.pos);
+                let flat = (to[0] * to[0] + to[2] * to[2]).sqrt().max(1e-6);
+                let yaw_to = (-to[0]).atan2(to[2]).to_degrees();
+                let pitch_to = (-to[1]).atan2(flat).to_degrees();
+                let dy = (yaw_to - f64::from(camera.yaw) + 540.0).rem_euclid(360.0) - 180.0;
+                let dp = pitch_to - f64::from(camera.pitch);
+                dy.abs() <= f64::from(st.angle_h) && dp.abs() <= f64::from(st.angle_v)
+            };
+            let show_distance = st.distance_mode == 2 || (st.distance_mode == 1 && looking);
+            let mut lines = vec![(w.name.clone(), st.name_scale)];
+            if show_distance {
+                lines.push((distance_text(d, st.km_at, st.precision), st.distance_scale));
+                if !st.name_above {
+                    lines.reverse();
+                }
+            }
+            let mut top = y + half + 2.0;
+            for (line, scale) in lines {
+                let tw = measure(&line) * scale;
+                let h = 8.0 * scale + 2.0;
+                draws.push(Draw::Fill([x - tw / 2.0 - 2.0, top - 1.0, tw + 4.0, h], a(0x50)));
+                draws.push(Draw::Label(line, [x - tw / 2.0, top], a(0xF0) | 0xFF_FFFF, scale, false));
+                top += h + 0.5;
+            }
         }
         draws
     }
@@ -3268,10 +3329,12 @@ impl State {
         }
 
         // Waypoints: their letter on their colour, on the edge when far.
-        for w in self.waypoints.iter().filter(|w| !w.hidden && w.dimension == here.dimension) {
+        let marks = self.waypoints.iter().filter(|w| st.on_map && !w.hidden && w.dimension == here.dimension);
+        let map_alpha = st.map_opacity.clamp(0, 100) as u32 * 255 / 100;
+        for w in marks {
             let c = centre(w);
             if let Some((p, _)) = place(c[0] - here.pos[0], c[2] - here.pos[2], true) {
-                letter_marker(&mut draws, p, w, 4.0, false);
+                letter_marker(&mut draws, p, w, 4.0 * st.map_scale, false, map_alpha);
             }
         }
 
@@ -3378,7 +3441,7 @@ impl State {
             if over {
                 hot = Some(i);
             }
-            letter_marker(&mut out.draws, at, w, 5.0, over);
+            letter_marker(&mut out.draws, at, w, 5.0, over, 255);
             let name_w = out.width(&w.name);
             let top = at[1] - 16.0;
             out.fill([at[0] - name_w / 2.0 - 2.0, top - 1.0, name_w + 4.0, 10.0], LABEL_BG);
@@ -3527,6 +3590,7 @@ impl State {
     /// The waypoint list: every waypoint (or a dimension's), one a row;
     /// a click picks one, and the buttons under the list act on it.
     fn draw_list(&mut self, out: &mut Out<'_>, size: [f32; 2], here: Option<&Here>) {
+        let st = self.settings();
         let pw = (size[0] - 16.0).min(360.0);
         let ph = (size[1] - 16.0).max(140.0);
         let (px, py) = (((size[0] - pw) / 2.0).round(), 8.0);
@@ -3587,11 +3651,14 @@ impl State {
 
             // Letter on its colour, name and coordinates.
             let mut marks = Vec::new();
-            letter_marker(&mut marks, [px + 14.0, ry + 11.0], w, 5.0, false);
+            letter_marker(&mut marks, [px + 14.0, ry + 11.0], w, 5.0, false, 255);
             out.draws.extend(marks);
             let dim = dimension_label(&w.dimension);
             let dist = match here {
-                Some(h) if h.dimension == w.dimension => distance_text(distance(h.pos, centre(w))),
+                _ if !st.list_distance => String::new(),
+                Some(h) if h.dimension == w.dimension => {
+                    distance_text(distance(h.pos, centre(w)), st.km_at, st.precision)
+                }
                 _ => "other dimension".into(),
             };
             let (dim_w, dist_w) = (out.width(&dim), out.width(&dist));
@@ -3838,8 +3905,9 @@ mod tests {
     fn words() {
         assert_eq!(dimension_label(NETHER), "Nether");
         assert_eq!(dimension_label("mymod:deep_dark"), "deep dark");
-        assert_eq!(distance_text(4.4), "4 m");
-        assert_eq!(distance_text(1530.0), "1.5 km");
+        assert_eq!(distance_text(4.44, 10000, 1), "4.4m");
+        assert_eq!(distance_text(15300.0, 10000, 1), "15.3km");
+        assert_eq!(distance_text(99.0, 10000, 0), "99m");
         assert_eq!(key_char("key.keyboard.n"), Some('n'));
         assert_eq!(key_char("key.keyboard.f1"), None);
         assert_eq!(trim_float(1.0), "1");
@@ -3987,7 +4055,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts, ["A", "A  20 m"]);
+        assert_eq!(texts[..2], ["A", "A"]);
+        assert!(texts[2].ends_with('m'), "the distance while looked at: {texts:?}");
         s.settings = Some(Settings {
             labels: false,
             ..Settings::default()
@@ -4142,7 +4211,7 @@ mod tests {
         let at = draws
             .iter()
             .find_map(|d| match d {
-                Draw::Text(t, at, ..) if t == "F" => Some(*at),
+                Draw::Label(t, at, ..) if t == "F" => Some(*at),
                 _ => None,
             })
             .unwrap();
