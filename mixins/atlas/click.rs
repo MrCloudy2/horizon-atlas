@@ -11,7 +11,5 @@ fn atlas_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
         s.change_settings(st);
         s.take_changed_settings();
     });
-    for (key, value) in st.stored() {
-        game.native_set_setting(m::ID, key, &value);
-    }
+    game.native_set_setting(m::ID, m::SETTINGS_FILE, &st.to_text());
 }

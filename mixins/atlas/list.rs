@@ -9,6 +9,7 @@ fn atlas_listed(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
             [m::KEY_MAP.into(), "World map".into(), m::DEFAULT_MAP.into()],
             [m::KEY_CREATE.into(), "New waypoint".into(), m::DEFAULT_CREATE.into()],
             [m::KEY_LIST.into(), "Waypoint list".into(), m::DEFAULT_LIST.into()],
+            [m::KEY_SETTINGS.into(), "Settings".into(), m::DEFAULT_SETTINGS.into()],
         ],
     });
 }

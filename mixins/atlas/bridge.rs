@@ -353,9 +353,7 @@ pub(super) fn frame(game: &mut Game<'_>) {
         m::with(|s| s.settings_with(|k| g.native_setting(m::ID, k)))
     };
     if let Some(changed) = m::with(|s| s.take_changed_settings()) {
-        for (key, value) in changed.stored() {
-            game.native_set_setting(m::ID, key, &value);
-        }
+        game.native_set_setting(m::ID, m::SETTINGS_FILE, &changed.to_text());
     }
     let key = world_key(game);
     let dimension = game.native_player().map(|p| p.dimension.to_owned());
@@ -587,6 +585,7 @@ pub(super) fn paint(game: &Game<'_>, batch: &mut horizon_client::hud::HudBatch, 
             m::Draw::Fill(rect, argb) => game.native_fill(batch, rect, argb),
             m::Draw::Text(text, at, rgb, shadow) => game.native_text(batch, &text, at, rgb, shadow),
             m::Draw::Quad(points, argb) => game.native_quad(batch, points, argb),
+            m::Draw::Nine(sprite, rect, argb) => game.native_gui_nine_slice(batch, sprite, rect, argb),
             m::Draw::Label(text, at, argb, scale, shadow) => {
                 let start = batch.vertices.len();
                 let [a, r, g, b] = argb.to_be_bytes();

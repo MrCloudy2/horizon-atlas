@@ -30,25 +30,23 @@ their shading follow Horizon's own minimap (MIT).
 
 ## Settings
 
-**Options > Mods > Atlas** has a button for each setting. `/atlas` in chat sets exact values:
+**Y** opens the settings screen, laid out as Xaero's: pages of buttons and sliders, and a search
+across them all. Options > Mods > Atlas has the main switches and the keys.
+
+`/atlas <setting> <value>` in chat sets any setting exactly (`/atlas help` lists them):
 
 ```
-/atlas size 120          minimap side in GUI pixels (48-256)
-/atlas zoom 2            blocks per minimap pixel (0.25-16)
+/atlas size 30           minimap side, percent of the window's height
+/atlas zoom 2            blocks per minimap pixel
 /atlas mode layer 40     auto | cave | layer [height]
-/atlas corner top_left   top_left | top_right | bottom_left | bottom_right
-/atlas shape round       round | square
-/atlas style frame       thin | frame | none
 /atlas seed <seed>       this world's seed, for slime chunks (a server never sends it)
-/atlas slime on          also: rotate, dots, coords, biome, time, compass, labels, minimap
-/atlas help
 ```
 
 ## Where it keeps things
 
 Everything goes in `horizon-mods/.horizon-mod-data/atlas/` inside the game folder:
 
-- the settings, one small file each
+- the settings, in `settings.txt`
 - waypoints and seeds, one file per single player world folder and per server address
 - the maps, in `maps/<world>/<dimension>/<mode layer>/`
 

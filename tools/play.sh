@@ -7,6 +7,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GAME=$ROOT/target/game
 export HORIZON_HOME=$ROOT/target/home HORIZON_CONTROL=$ROOT/target/ctl.sock
 mkdir -p "$HORIZON_HOME"
+# A game left running would otherwise be attached to, old build and all.
+if "$GAME/horizon-ctl" quit >/dev/null 2>&1; then
+    sleep 3
+fi
 # Muted: master volume 0.
 if ! grep -q '^soundCategory_master:' "$HORIZON_HOME/options.txt" 2>/dev/null; then
     echo 'soundCategory_master:0.0' >> "$HORIZON_HOME/options.txt"

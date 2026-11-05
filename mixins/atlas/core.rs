@@ -25,7 +25,11 @@ pub const ID: &str = "atlas";
 pub const NAME: &str = "Horizon Atlas";
 pub const VERSION: &str = "0.1.0";
 pub const DESCRIPTION: &str = "A smooth minimap, a world map of everywhere you have been and waypoints on both. M opens the map, B makes a waypoint, U lists them.";
+/// The file the settings are kept in, in the mod's folder.
+pub const SETTINGS_FILE: &str = "settings.txt";
 /// The keys' names and defaults (`key.atlas.map` in `horizon-mods.txt`).
+pub const KEY_SETTINGS: &str = "settings";
+pub const DEFAULT_SETTINGS: &str = "key.keyboard.y";
 pub const KEY_MAP: &str = "map";
 pub const KEY_CREATE: &str = "create";
 pub const KEY_LIST: &str = "list";
@@ -56,9 +60,6 @@ const ERROR: u32 = 0xFF5555;
 const SHADE: u32 = 0xA000_0000;
 const PANEL: u32 = 0xE010_1018;
 const PANEL_EDGE: u32 = 0xFF50_5064;
-const BUTTON: u32 = 0xFF34_3442;
-const BUTTON_HOVER: u32 = 0xFF4E_4E66;
-const BUTTON_ON: u32 = 0xFF3C_6E46;
 const FIELD: u32 = 0xFF00_0000;
 const FIELD_EDGE: u32 = 0xFF70_7070;
 const FIELD_FOCUS: u32 = 0xFFFF_FFFF;
@@ -151,6 +152,9 @@ pub enum Draw {
     Text(String, [f32; 2], u32, bool),
     Image(usize, [f32; 4], [f32; 4]),
     Quad([[f32; 2]; 4], u32),
+    /// A vanilla GUI sprite (`gui/sprites/widget/button`) nine-sliced into a
+    /// rectangle, tinted ARGB.
+    Nine(&'static str, [f32; 4], u32),
     /// Text at its top left, ARGB (it can be see-through), scaled by the
     /// factor (1 is the GUI's font size), with or without a shadow.
     Label(String, [f32; 2], u32, f32, bool),
@@ -289,12 +293,56 @@ impl Editor {
     }
 }
 
+/// Where the settings screen is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsView {
+    pub page: Page,
+    /// Which of the page's screens of buttons shows.
+    pub sub: usize,
+    pub search: String,
+    pub searching: bool,
+}
+
+/// A button of the settings screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Item {
+    Opt(usize),
+    Link(Page),
+    List,
+}
+
+/// The settings on `view`'s screen: what the search finds, else its page.
+fn settings_items(view: &SettingsView) -> Vec<Item> {
+    let wanted = view.search.trim().to_lowercase();
+    if !wanted.is_empty() {
+        return (0..OPTS.len())
+            .filter(|&i| OPTS[i].label.to_lowercase().contains(&wanted))
+            .map(Item::Opt)
+            .collect();
+    }
+    let mut items: Vec<Item> = (0..OPTS.len())
+        .filter(|&i| OPTS[i].page == view.page)
+        .map(Item::Opt)
+        .collect();
+    if view.page == Page::Main {
+        items.extend(
+            [Page::View, Page::BlockMap, Page::Radar, Page::Overlay, Page::Info, Page::Waypoints]
+                .into_iter()
+                .map(Item::Link),
+        );
+        items.push(Item::Link(Page::Misc));
+        items.push(Item::List);
+    }
+    items
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     Closed,
     List,
     Edit(Editor),
     Map,
+    Settings(SettingsView),
 }
 
 /// What a click on the screen does.
@@ -321,6 +369,15 @@ pub enum Action {
     Centre,
     /// A waypoint's marker on the world map: edit it.
     MapWaypoint(usize),
+    /// A settings button: the next value of option `i`.
+    Opt(usize),
+    /// A settings slider and its rectangle: its value at the pointer.
+    Slide(usize, [f32; 4]),
+    GoPage(Page),
+    /// Next (1) or previous (-1) screen of the page.
+    SubPage(i32),
+    SettingsBack,
+    FocusSearch,
     /// A row of the list: pick that waypoint.
     Select(usize),
     /// Teleport to a waypoint (operators).
@@ -399,22 +456,12 @@ pub enum MapMode {
 
 impl MapMode {
     pub const ALL: [MapMode; 3] = [MapMode::Auto, MapMode::Cave, MapMode::Layer];
-    pub fn name(self) -> &'static str {
-        match self {
-            MapMode::Auto => "auto",
-            MapMode::Cave => "cave",
-            MapMode::Layer => "layer",
-        }
-    }
     pub fn label(self) -> &'static str {
         match self {
             MapMode::Auto => "Auto",
             MapMode::Cave => "Cave",
             MapMode::Layer => "Layer",
         }
-    }
-    pub fn parse(s: &str) -> Option<MapMode> {
-        MapMode::ALL.into_iter().find(|m| m.name() == s.trim().to_ascii_lowercase())
     }
 }
 
@@ -816,24 +863,6 @@ pub const MINI: usize = 128;
 /// fraction of a texel can be scrolled into view.
 pub const MINI_SHOWN: f32 = 127.0;
 
-pub const CORNERS: [(&str, &str); 4] = [
-    ("top_left", "Top left"),
-    ("top_right", "Top right"),
-    ("bottom_left", "Bottom left"),
-    ("bottom_right", "Bottom right"),
-];
-/// The minimap's side as a share of the window's height, in percent: what
-/// the settings page steps through, and the most and least `/atlas size`
-/// takes. A share, so the minimap keeps its place in the window whatever its
-/// size and GUI scale.
-pub const SIZE_STEPS: [u16; 6] = [15, 20, 25, 30, 35, 40];
-pub const SIZE_MIN: u16 = 10;
-pub const SIZE_MAX: u16 = 60;
-/// Blocks per minimap pixel: the settings page's steps and the limits.
-pub const ZOOM_STEPS: [f32; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
-pub const ZOOM_MIN: f32 = 0.25;
-pub const ZOOM_MAX: f32 = 16.0;
-
 /// How the minimap's edge looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
@@ -845,121 +874,219 @@ pub enum Style {
     Bare,
 }
 
-impl Style {
-    pub const ALL: [Style; 3] = [Style::Thin, Style::Frame, Style::Bare];
-    pub fn name(self) -> &'static str {
-        match self {
-            Style::Thin => "thin",
-            Style::Frame => "frame",
-            Style::Bare => "none",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Style::Thin => "Thin rim",
-            Style::Frame => "Frame",
-            Style::Bare => "No rim",
-        }
-    }
-}
-
-/// Everything Options > Mods > Atlas and `/atlas` set, kept as one small
-/// file per key in the mod's folder.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Settings {
-    /// Waypoint names and distances in the world.
-    pub labels: bool,
-    pub minimap: bool,
-    /// Index in `CORNERS`.
-    pub corner: usize,
-    /// Side in percent of the window's height.
-    pub size: u16,
-    pub round: bool,
-    pub style: Style,
-    /// Blocks per minimap pixel.
-    pub zoom: f32,
-    pub rotate: bool,
-    pub mode: MapMode,
-    /// The height `MapMode::Layer` cuts at.
-    pub layer_y: i32,
-    /// Dots for players, mobs, items and other entities.
-    pub dots: bool,
-    pub coords: bool,
-    pub biome: bool,
-    pub time: bool,
-    /// N, E, S and W on the minimap's edge.
-    pub compass: bool,
-    pub slime: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            labels: true,
-            minimap: true,
-            corner: 0,
-            size: 25,
-            round: false,
-            style: Style::Frame,
-            zoom: 1.0,
-            rotate: true,
-            mode: MapMode::Auto,
-            layer_y: 64,
-            dots: true,
-            coords: true,
-            biome: true,
-            time: true,
-            compass: true,
-            slime: false,
-        }
-    }
-}
-
-/// The settings page's buttons, in order: section titles and settings.
+/// The pages of the settings screen, as Xaero's Minimap groups them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Knob {
-    Section(&'static str),
-    Labels,
-    Minimap,
-    Corner,
-    Size,
-    Shape,
-    Style,
-    Zoom,
-    Rotate,
-    Mode,
-    LayerY,
-    Dots,
-    Coords,
-    Biome,
-    Time,
-    Compass,
-    Slime,
+pub enum Page {
+    Main,
+    View,
+    BlockMap,
+    Radar,
+    Overlay,
+    Info,
+    Waypoints,
+    Misc,
 }
 
-const KNOBS: [Knob; 21] = [
-    Knob::Section("Minimap"),
-    Knob::Minimap,
-    Knob::Corner,
-    Knob::Size,
-    Knob::Zoom,
-    Knob::Rotate,
-    Knob::Section("Minimap look"),
-    Knob::Shape,
-    Knob::Style,
-    Knob::Compass,
-    Knob::Dots,
-    Knob::Slime,
-    Knob::Section("Under the minimap"),
-    Knob::Coords,
-    Knob::Biome,
-    Knob::Time,
-    Knob::Section("Map mode (both maps)"),
-    Knob::Mode,
-    Knob::LayerY,
-    Knob::Section("Waypoints"),
-    Knob::Labels,
+impl Page {
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Main => "Minimap Settings",
+            Page::View => "View Settings",
+            Page::BlockMap => "Block Map Settings",
+            Page::Radar => "Entity Radar Settings",
+            Page::Overlay => "Overlay Settings",
+            Page::Info => "Information Settings",
+            Page::Waypoints => "Waypoint Settings",
+            Page::Misc => "Miscellaneous Settings",
+        }
+    }
+}
+
+/// What a setting's button is, and how its value reads. Values are whole
+/// numbers: an index for `Choice`, `value / div` units for the others.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Toggle,
+    /// (stored name, label) per value.
+    Choice(&'static [(&'static str, &'static str)]),
+    /// `zero` names one value (`Auto`, `OFF`).
+    Slider {
+        min: i32,
+        max: i32,
+        div: i32,
+        unit: &'static str,
+        zero: Option<(i32, &'static str)>,
+    },
+    /// A button stepping through `steps`; `/atlas` takes any value from the
+    /// first to the last.
+    Steps {
+        steps: &'static [i32],
+        div: i32,
+        unit: &'static str,
+    },
+}
+
+/// One setting of the table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Opt {
+    /// Its name in the settings file and after `/atlas`.
+    pub key: &'static str,
+    pub label: &'static str,
+    pub page: Page,
+    pub kind: Kind,
+}
+
+/// A setting's field as the table's whole number.
+trait Val: Copy {
+    fn raw(self) -> i32;
+    fn cook(v: i32) -> Self;
+}
+impl Val for bool {
+    fn raw(self) -> i32 {
+        i32::from(self)
+    }
+    fn cook(v: i32) -> Self {
+        v != 0
+    }
+}
+impl Val for i32 {
+    fn raw(self) -> i32 {
+        self
+    }
+    fn cook(v: i32) -> Self {
+        v
+    }
+}
+impl Val for usize {
+    fn raw(self) -> i32 {
+        self as i32
+    }
+    fn cook(v: i32) -> Self {
+        v.max(0) as usize
+    }
+}
+/// Hundredths.
+impl Val for f32 {
+    fn raw(self) -> i32 {
+        (self * 100.0).round() as i32
+    }
+    fn cook(v: i32) -> Self {
+        v as f32 / 100.0
+    }
+}
+impl Val for Style {
+    fn raw(self) -> i32 {
+        match self {
+            Style::Frame => 0,
+            Style::Thin => 1,
+            Style::Bare => 2,
+        }
+    }
+    fn cook(v: i32) -> Self {
+        match v {
+            1 => Style::Thin,
+            2 => Style::Bare,
+            _ => Style::Frame,
+        }
+    }
+}
+impl Val for MapMode {
+    fn raw(self) -> i32 {
+        MapMode::ALL.iter().position(|m| *m == self).unwrap_or(0) as i32
+    }
+    fn cook(v: i32) -> Self {
+        MapMode::ALL[(v.max(0) as usize).min(MapMode::ALL.len() - 1)]
+    }
+}
+
+/// Declares the settings: the struct, its defaults and the table, from one
+/// line each.
+macro_rules! settings {
+    ($($field:ident: $ty:ty = $default:expr, $key:literal, $label:literal, $page:ident, $kind:expr;)*) => {
+        /// Everything the settings screen and `/atlas` set, kept in one file
+        /// in the mod's folder.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        pub struct Settings {
+            $(pub $field: $ty,)*
+        }
+        impl Default for Settings {
+            fn default() -> Self {
+                Self { $($field: $default,)* }
+            }
+        }
+        pub const OPTS: &[Opt] = &[
+            $(Opt { key: $key, label: $label, page: Page::$page, kind: $kind },)*
+        ];
+        impl Settings {
+            /// Option `i`'s value.
+            pub fn raw(&self, i: usize) -> i32 {
+                let mut n = 0;
+                $(
+                    if n == i {
+                        return Val::raw(self.$field);
+                    }
+                    n += 1;
+                )*
+                let _ = n;
+                0
+            }
+            /// Sets option `i`.
+            pub fn put(&mut self, i: usize, v: i32) {
+                let mut n = 0;
+                $(
+                    if n == i {
+                        self.$field = Val::cook(v);
+                        return;
+                    }
+                    n += 1;
+                )*
+                let _ = n;
+            }
+        }
+    };
+}
+
+const SHAPES: &[(&str, &str)] = &[("square", "Square"), ("round", "Round")];
+const STYLES: &[(&str, &str)] = &[("frame", "Default"), ("thin", "Thin"), ("none", "None")];
+const MODES: &[(&str, &str)] = &[("auto", "Auto"), ("cave", "Cave"), ("layer", "Layer")];
+const CORNER_CHOICES: &[(&str, &str)] = &[
+    ("top_left", "Top Left"),
+    ("top_right", "Top Right"),
+    ("bottom_left", "Bottom Left"),
+    ("bottom_right", "Bottom Right"),
 ];
+
+settings! {
+    minimap: bool = true, "minimap", "Minimap", Main, Kind::Toggle;
+    corner: usize = 0, "corner", "Position", Main, Kind::Choice(CORNER_CHOICES);
+
+    size: i32 = 25, "size", "Size", View,
+        Kind::Slider { min: 10, max: 60, div: 1, unit: "%", zero: None };
+    round: bool = false, "shape", "Shape", View, Kind::Choice(SHAPES);
+    lock_north: bool = false, "lock_north", "Lock Minimap North", View, Kind::Toggle;
+    zoom: f32 = 1.0, "zoom", "Blocks per Pixel", View,
+        Kind::Steps { steps: &[25, 50, 100, 200, 400, 800, 1600], div: 100, unit: "" };
+    style: Style = Style::Frame, "style", "Frame Style", View, Kind::Choice(STYLES);
+
+    mode: MapMode = MapMode::Auto, "mode", "Cave Mode", BlockMap, Kind::Choice(MODES);
+    layer_y: i32 = 64, "layer", "Layer Mode Height", BlockMap,
+        Kind::Slider { min: -64, max: 320, div: 1, unit: "", zero: None };
+
+    dots: bool = true, "dots", "Display Radar", Radar, Kind::Toggle;
+
+    slime: bool = false, "slime", "Slime Chunks", Overlay, Kind::Toggle;
+
+    coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
+    biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
+    time: bool = true, "time", "Time of Day", Info, Kind::Toggle;
+
+    labels: bool = true, "labels", "In-World Waypoints", Waypoints, Kind::Toggle;
+    compass: bool = true, "compass", "Compass", Waypoints, Kind::Toggle;
+}
+
+/// What Options > Mods > Atlas shows: the main switches. The rest are on the
+/// settings screen.
+const QUICK: [&str; 5] = ["minimap", "mode", "dots", "labels", "lock_north"];
 
 fn on_off(b: bool) -> &'static str {
     if b { "ON" } else { "OFF" }
@@ -973,191 +1100,165 @@ fn parse_flag(v: &str) -> Option<bool> {
     }
 }
 
-/// `1 block`, `½ block`, `2 blocks`.
-fn blocks_text(n: f32) -> String {
-    if n == 0.5 {
-        "½ block".into()
-    } else if n == 1.0 {
-        "1 block".into()
-    } else {
-        format!("{n} blocks")
+/// `v / div` without needless decimals.
+fn number_text(v: i32, div: i32) -> String {
+    if div <= 1 {
+        return v.to_string();
+    }
+    let n = f64::from(v) / f64::from(div);
+    let text = format!("{n:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+impl Opt {
+    /// The table's index of setting `key`.
+    pub fn index(key: &str) -> Option<usize> {
+        OPTS.iter().position(|o| o.key == key)
+    }
+
+    /// Value `v` as the button shows it.
+    pub fn shown(&self, v: i32) -> String {
+        match self.kind {
+            Kind::Toggle => on_off(v != 0).to_owned(),
+            Kind::Choice(names) => names.get(v.max(0) as usize).map_or("?", |n| n.1).to_owned(),
+            Kind::Slider { zero: Some((at, name)), .. } if at == v => name.to_owned(),
+            Kind::Slider { div, unit, .. } | Kind::Steps { div, unit, .. } => {
+                format!("{}{unit}", number_text(v, div))
+            }
+        }
+    }
+
+    /// The button's whole label.
+    pub fn text(&self, v: i32) -> String {
+        format!("{}: {}", self.label, self.shown(v))
+    }
+
+    /// Value `v` as the settings file and `/atlas` write it.
+    pub fn stored(&self, v: i32) -> String {
+        match self.kind {
+            Kind::Toggle => on_off(v != 0).to_ascii_lowercase(),
+            Kind::Choice(names) => names.get(v.max(0) as usize).map_or("", |n| n.0).to_owned(),
+            Kind::Slider { div, .. } | Kind::Steps { div, .. } => number_text(v, div),
+        }
+    }
+
+    /// What `text` stands for, or what this setting takes.
+    pub fn parse(&self, text: &str) -> Result<i32, String> {
+        let text = text.trim().trim_end_matches('%');
+        let number = |min: i32, max: i32, div: i32| {
+            let takes = format!(
+                "{} takes {} to {}",
+                self.key,
+                number_text(min, div),
+                number_text(max, div)
+            );
+            let v: f64 = text.parse().map_err(|_| takes.clone())?;
+            let v = (v * f64::from(div)).round();
+            if v < f64::from(min) || v > f64::from(max) {
+                return Err(takes);
+            }
+            Ok(v as i32)
+        };
+        match self.kind {
+            Kind::Toggle => parse_flag(text)
+                .map(i32::from)
+                .ok_or_else(|| format!("{} takes on or off", self.key)),
+            Kind::Choice(names) => names
+                .iter()
+                .position(|n| n.0 == text.to_ascii_lowercase())
+                .map(|i| i as i32)
+                .ok_or_else(|| {
+                    let all: Vec<&str> = names.iter().map(|n| n.0).collect();
+                    format!("{} takes {}", self.key, all.join(", "))
+                }),
+            Kind::Slider { min, max, div, zero, .. } => {
+                if let Some((at, name)) = zero
+                    && name.eq_ignore_ascii_case(text)
+                {
+                    return Ok(at);
+                }
+                number(min, max, div)
+            }
+            Kind::Steps { steps, div, .. } => {
+                number(steps[0], steps[steps.len() - 1], div)
+            }
+        }
+    }
+
+    /// The next value a click gives.
+    pub fn next(&self, v: i32) -> i32 {
+        match self.kind {
+            Kind::Toggle => i32::from(v == 0),
+            Kind::Choice(names) => (v + 1) % names.len() as i32,
+            Kind::Slider { min, max, .. } => {
+                if v >= max {
+                    min
+                } else {
+                    v + 1
+                }
+            }
+            Kind::Steps { steps, .. } => steps.iter().copied().find(|&s| s > v).unwrap_or(steps[0]),
+        }
     }
 }
 
-/// The next of `steps` after `now` (round to the first).
-fn next_step<T: PartialOrd + Copy>(steps: &[T], now: T) -> T {
-    steps.iter().copied().find(|&s| s > now).unwrap_or(steps[0])
-}
-
 impl Settings {
-    /// From the stored values; the defaults for the ones missing or broken.
+    /// From the settings file `get` reads; the defaults for what is missing
+    /// or broken.
     pub fn read(get: impl Fn(&str) -> Option<String>) -> Self {
         let mut s = Settings::default();
-        for (key, _) in s.stored() {
-            if let Some(v) = get(key) {
-                let _ = s.set(key, v.trim());
+        for line in get(SETTINGS_FILE).unwrap_or_default().lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                let _ = s.set(key.trim(), value.trim());
             }
         }
         s
     }
 
-    /// Sets `key` from text, as stored or typed after `/atlas`; the error
-    /// says what it takes.
-    pub fn set(&mut self, key: &str, v: &str) -> Result<(), String> {
-        let flag = || parse_flag(v).ok_or_else(|| format!("{key} takes on or off"));
-        match key {
-            "labels" => self.labels = flag()?,
-            "minimap" => self.minimap = flag()?,
-            "corner" => {
-                self.corner = CORNERS
-                    .iter()
-                    .position(|c| c.0 == v)
-                    .ok_or("corner takes top_left, top_right, bottom_left or bottom_right")?;
-            }
-            "size" => {
-                let n: u16 = v
-                    .trim_end_matches('%')
-                    .parse()
-                    .map_err(|_| "size takes a percent of the window's height, such as 25")?;
-                if !(SIZE_MIN..=SIZE_MAX).contains(&n) {
-                    return Err(format!("size takes {SIZE_MIN} to {SIZE_MAX} (percent of the window's height)"));
-                }
-                self.size = n;
-            }
-            "shape" => {
-                self.round = match v {
-                    "round" => true,
-                    "square" => false,
-                    _ => return Err("shape takes round or square".into()),
-                }
-            }
-            "style" => {
-                self.style = Style::ALL
-                    .into_iter()
-                    .find(|s| s.name() == v)
-                    .ok_or("style takes thin, frame or none")?;
-            }
-            "zoom" => {
-                let n: f32 = v.parse().map_err(|_| "zoom takes blocks per pixel, such as 2 or 0.5")?;
-                if !(ZOOM_MIN..=ZOOM_MAX).contains(&n) {
-                    return Err(format!("zoom takes {ZOOM_MIN} to {ZOOM_MAX}"));
-                }
-                self.zoom = n;
-            }
-            "rotate" => self.rotate = flag()?,
-            "mode" => self.mode = MapMode::parse(v).ok_or("mode takes auto, cave or layer")?,
-            "layer" => {
-                self.layer_y = v.parse().map_err(|_| "layer takes a height, such as 40")?;
-                if !(-2048..=2048).contains(&self.layer_y) {
-                    return Err("layer takes -2048 to 2048".into());
-                }
-            }
-            "dots" => self.dots = flag()?,
-            "coords" => self.coords = flag()?,
-            "biome" => self.biome = flag()?,
-            "time" => self.time = flag()?,
-            "compass" => self.compass = flag()?,
-            "slime" => self.slime = flag()?,
-            _ => return Err(format!("no setting {key}")),
+    /// The settings file's text: `key=value` lines.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for (i, o) in OPTS.iter().enumerate() {
+            out.push_str(&format!("{}={}\n", o.key, o.stored(self.raw(i))));
         }
+        out
+    }
+
+    /// Sets `key` from text; the error says what it takes.
+    pub fn set(&mut self, key: &str, v: &str) -> Result<(), String> {
+        let i = Opt::index(key).ok_or_else(|| format!("no setting {key}"))?;
+        let v = OPTS[i].parse(v)?;
+        self.put(i, v);
         Ok(())
     }
 
-    /// Each key and its value as `set` reads it.
-    pub fn stored(&self) -> [(&'static str, String); 16] {
-        let flag = |b: bool| if b { "on" } else { "off" }.to_owned();
-        [
-            ("labels", flag(self.labels)),
-            ("minimap", flag(self.minimap)),
-            ("corner", CORNERS[self.corner].0.to_owned()),
-            ("size", self.size.to_string()),
-            ("shape", if self.round { "round" } else { "square" }.to_owned()),
-            ("style", self.style.name().to_owned()),
-            ("zoom", self.zoom.to_string()),
-            ("rotate", flag(self.rotate)),
-            ("mode", self.mode.name().to_owned()),
-            ("layer", self.layer_y.to_string()),
-            ("dots", flag(self.dots)),
-            ("coords", flag(self.coords)),
-            ("biome", flag(self.biome)),
-            ("time", flag(self.time)),
-            ("compass", flag(self.compass)),
-            ("slime", flag(self.slime)),
-        ]
-    }
-
-    /// The settings page's buttons.
+    /// The buttons of Options > Mods > Atlas.
     pub fn labels(&self) -> Vec<String> {
-        KNOBS
-            .iter()
-            .map(|k| match k {
-                Knob::Section(title) => format!("------  {title}  ------"),
-                Knob::Labels => format!("Waypoint labels in the world: {}", on_off(self.labels)),
-                Knob::Minimap => format!("Minimap: {}", on_off(self.minimap)),
-                Knob::Corner => format!("Corner: {}", CORNERS[self.corner].1),
-                Knob::Size => format!("Size: {}% of the screen height (/atlas size)", self.size),
-                Knob::Shape => format!("Shape: {}", if self.round { "Round" } else { "Square" }),
-                Knob::Style => format!("Style: {}", self.style.label()),
-                Knob::Zoom => format!("Zoom: {} per pixel", blocks_text(self.zoom)),
-                Knob::Rotate => format!("Turn with the player: {}", on_off(self.rotate)),
-                Knob::Mode => format!("Map mode: {}", self.mode.label()),
-                Knob::LayerY => format!("Layer mode height: Y {} (/atlas layer)", self.layer_y),
-                Knob::Dots => format!("Entity dots: {}", on_off(self.dots)),
-                Knob::Coords => format!("Coordinates: {}", on_off(self.coords)),
-                Knob::Biome => format!("Biome: {}", on_off(self.biome)),
-                Knob::Time => format!("Time of day: {}", on_off(self.time)),
-                Knob::Compass => format!("N E S W letters: {}", on_off(self.compass)),
-                Knob::Slime => format!("Slime chunks: {} (needs /atlas seed)", on_off(self.slime)),
-            })
-            .collect()
+        let mut out = vec!["All settings: press Y in the game".to_owned()];
+        for key in QUICK {
+            if let Some(i) = Opt::index(key) {
+                out.push(OPTS[i].text(self.raw(i)));
+            }
+        }
+        out
     }
 
     /// Button `i` of `labels` clicked.
     pub fn click(&mut self, i: usize) {
-        let Some(k) = KNOBS.get(i) else {
+        let Some(at) = i.checked_sub(1).and_then(|k| QUICK.get(k)).and_then(|k| Opt::index(k)) else {
             return;
         };
-        match k {
-            Knob::Section(_) => {}
-            Knob::Labels => self.labels = !self.labels,
-            Knob::Minimap => self.minimap = !self.minimap,
-            Knob::Corner => self.corner = (self.corner + 1) % CORNERS.len(),
-            Knob::Size => self.size = next_step(&SIZE_STEPS, self.size),
-            Knob::Shape => self.round = !self.round,
-            Knob::Style => {
-                let at = Style::ALL.iter().position(|s| *s == self.style).unwrap_or(0);
-                self.style = Style::ALL[(at + 1) % Style::ALL.len()];
-            }
-            Knob::Zoom => self.zoom = next_step(&ZOOM_STEPS, self.zoom),
-            Knob::Rotate => self.rotate = !self.rotate,
-            Knob::Mode => {
-                let at = MapMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
-                self.mode = MapMode::ALL[(at + 1) % MapMode::ALL.len()];
-            }
-            Knob::LayerY => {
-                self.layer_y = if self.layer_y >= 304 { -64 } else { self.layer_y.div_euclid(16) * 16 + 16 };
-            }
-            Knob::Dots => self.dots = !self.dots,
-            Knob::Coords => self.coords = !self.coords,
-            Knob::Biome => self.biome = !self.biome,
-            Knob::Time => self.time = !self.time,
-            Knob::Compass => self.compass = !self.compass,
-            Knob::Slime => self.slime = !self.slime,
-        }
+        self.put(at, OPTS[at].next(self.raw(at)));
     }
 
     /// `/atlas <words>`: what to say back, and whether a setting changed.
     pub fn command(&mut self, args: &str) -> (String, bool) {
         let words: Vec<&str> = args.split_whitespace().collect();
         match words.as_slice() {
-            [] | ["help"] => (
-                "/atlas size <10-60 %> | zoom <0.25-16> | mode auto|cave|layer [y] | layer <y> | \
-                 corner top_left|top_right|bottom_left|bottom_right | shape round|square | \
-                 style thin|frame|none | rotate|dots|coords|biome|time|compass|slime|labels|minimap on|off | \
-                 seed <world seed>|off"
-                    .into(),
-                false,
-            ),
+            [] | ["help"] => {
+                let keys: Vec<&str> = OPTS.iter().map(|o| o.key).collect();
+                (format!("/atlas <setting> <value>, or seed <seed>. Settings: {}", keys.join(" ")), false)
+            }
             ["mode", m, y] => {
                 let before = *self;
                 match self.set("mode", m).and_then(|()| self.set("layer", y)) {
@@ -1172,17 +1273,22 @@ impl Settings {
                 Ok(()) => (format!("Atlas: {key} {value}"), true),
                 Err(e) => (format!("Atlas: {e}"), false),
             },
-            [key] => match self.stored().iter().find(|s| s.0 == *key) {
-                Some((_, v)) => (format!("Atlas: {key} is {v}"), false),
+            [key] => match Opt::index(key) {
+                Some(i) => (format!("Atlas: {key} is {}", OPTS[i].stored(self.raw(i))), false),
                 None => (format!("Atlas: no setting {key} (/atlas help)"), false),
             },
             _ => ("Atlas: /atlas help lists the settings".into(), false),
         }
     }
 
-    /// (side in GUI pixels, blocks per texel)
+    /// The minimap turns with the player.
+    pub fn rotate(&self) -> bool {
+        !self.lock_north
+    }
+
+    /// (side in percent, blocks per texel)
     pub fn view(&self) -> (f32, f32) {
-        (f32::from(self.size), self.zoom)
+        (self.size as f32, self.zoom)
     }
 }
 
@@ -1605,6 +1711,8 @@ pub struct State {
     pub settings: Option<Settings>,
     /// Changed on the mod's own screen, not written yet.
     pub settings_changed: bool,
+    /// The slider being dragged: its option and rectangle.
+    pub slider: Option<(usize, [f32; 4])>,
     /// Whether the player may teleport (an operator), as the game last said.
     pub can_teleport: bool,
     /// A teleport asked for: the dimension and block, sent by the next frame.
@@ -1649,6 +1757,7 @@ impl Default for State {
             close_requested: false,
             settings: None,
             settings_changed: false,
+            slider: None,
             can_teleport: false,
             teleport: None,
             maps: Maps::default(),
@@ -1972,16 +2081,11 @@ impl Out<'_> {
 
     fn button(&mut self, rect: [f32; 4], label: &str, action: Action, on: bool) {
         let hover = inside(rect, self.mouse);
-        let fill = if on {
-            BUTTON_ON
-        } else if hover {
-            BUTTON_HOVER
-        } else {
-            BUTTON
-        };
-        self.boxed(rect, if hover { FIELD_FOCUS } else { PANEL_EDGE }, fill);
+        let sprite = if hover { "gui/sprites/widget/button_highlighted" } else { "gui/sprites/widget/button" };
+        let tint = if on { 0xFFA0_FFA0 } else { 0xFFFF_FFFF };
+        self.draws.push(Draw::Nine(sprite, rect, tint));
         let w = self.width(label);
-        let at = [rect[0] + (rect[2] - w) / 2.0, rect[1] + (rect[3] - 8.0) / 2.0];
+        let at = [(rect[0] + (rect[2] - w) / 2.0).round(), (rect[1] + (rect[3] - 8.0) / 2.0).round()];
         self.text(label, at, INK);
         self.widgets.push(Widget { rect, action });
     }
@@ -2234,7 +2338,7 @@ impl State {
         let seed = self.seed;
         let st = self.settings();
         let (_, bpp) = st.view();
-        let grid = mini_grid(x, z, yaw, st.rotate, bpp);
+        let grid = mini_grid(x, z, yaw, st.rotate(), bpp);
         self.mini_grid = Some(grid);
         let slime = seed.filter(|_| st.slime);
         // The blocks the image can reach.
@@ -2244,10 +2348,10 @@ impl State {
         let stamp = self.maps.store(cut).stamp(bx - reach, bz - reach, bx + reach, bz + reach);
         let key = MiniKey {
             origin: grid.origin,
-            yaw_bits: if st.rotate { yaw.to_bits() } else { 0 },
+            yaw_bits: if st.rotate() { yaw.to_bits() } else { 0 },
             bpp_bits: bpp.to_bits(),
             round: st.round,
-            rotate: st.rotate,
+            rotate: st.rotate(),
             cut,
             stamp,
             slime,
@@ -2309,6 +2413,50 @@ impl State {
         self.mode = Mode::List;
         self.confirm_delete = None;
         self.skip_char = skip;
+    }
+
+    /// The settings screen, at `page`.
+    pub fn open_settings(&mut self, page: Page) {
+        self.slider = None;
+        self.mode = Mode::Settings(SettingsView {
+            page,
+            sub: 0,
+            search: String::new(),
+            searching: false,
+        });
+    }
+
+    /// Back a page: the main page from the others, the game from it.
+    fn settings_back(&mut self) {
+        let Mode::Settings(v) = &mut self.mode else {
+            return;
+        };
+        if !v.search.is_empty() {
+            v.search.clear();
+            v.searching = false;
+            v.sub = 0;
+        } else if v.page == Page::Main {
+            self.close();
+        } else {
+            self.open_settings(Page::Main);
+        }
+    }
+
+    /// The dragged slider's value at the pointer.
+    fn slide(&mut self) {
+        let Some((i, rect)) = self.slider else {
+            return;
+        };
+        let Kind::Slider { min, max, .. } = OPTS[i].kind else {
+            return;
+        };
+        let t = ((self.mouse[0] - rect[0] - 4.0) / (rect[2] - 8.0)).clamp(0.0, 1.0);
+        let v = min + ((max - min) as f32 * t).round() as i32;
+        let mut st = self.settings();
+        if st.raw(i) != v {
+            st.put(i, v);
+            self.change_settings(st);
+        }
     }
 
     /// The world map, on the player when it follows them.
@@ -2447,6 +2595,27 @@ impl State {
                 self.filter = filter;
                 self.scroll = 0;
             }
+            Action::Opt(i) => {
+                let mut st = self.settings();
+                st.put(i, OPTS[i].next(st.raw(i)));
+                self.change_settings(st);
+            }
+            Action::Slide(i, rect) => {
+                self.slider = Some((i, rect));
+                self.slide();
+            }
+            Action::GoPage(page) => self.open_settings(page),
+            Action::SubPage(n) => {
+                if let Mode::Settings(v) = &mut self.mode {
+                    v.sub = v.sub.saturating_add_signed(n as isize);
+                }
+            }
+            Action::SettingsBack => self.settings_back(),
+            Action::FocusSearch => {
+                if let Mode::Settings(v) = &mut self.mode {
+                    v.searching = true;
+                }
+            }
             Action::Select(i) => {
                 self.selected = (self.selected != Some(i)).then_some(i);
             }
@@ -2525,11 +2694,20 @@ impl State {
     }
 
     /// A key pressed over the mod's screen (all of them are the mod's).
-    /// `keys` are the player's map, create and list keys.
-    pub fn key(&mut self, key: &str, shift: bool, here: Option<&Here>, keys: [&str; 3]) {
-        let [map_key, create_key, list_key] = keys;
+    /// `keys` are the player's map, create, list and settings keys.
+    pub fn key(&mut self, key: &str, shift: bool, here: Option<&Here>, keys: [&str; 4]) {
+        let [map_key, create_key, list_key, settings_key] = keys;
         match &mut self.mode {
             Mode::Closed => {}
+            Mode::Settings(v) => match key {
+                "key.keyboard.escape" => self.settings_back(),
+                "key.keyboard.backspace" if v.searching => {
+                    v.search.pop();
+                    v.sub = 0;
+                }
+                k if k == settings_key && !v.searching => self.close(),
+                _ => {}
+            },
             Mode::List => match key {
                 "key.keyboard.escape" => self.close(),
                 "key.keyboard.up" => self.scroll = self.scroll.saturating_sub(1),
@@ -2605,6 +2783,13 @@ impl State {
         {
             return;
         }
+        if let Mode::Settings(v) = &mut self.mode {
+            if v.searching && !c.is_control() && v.search.chars().count() < NAME_MAX {
+                v.search.push(c);
+                v.sub = 0;
+            }
+            return;
+        }
         let Mode::Edit(editor) = &mut self.mode else {
             return;
         };
@@ -2633,6 +2818,10 @@ impl State {
             self.map.zoom(steps, mouse, size);
             return;
         }
+        if matches!(self.mode, Mode::Settings(_)) {
+            self.act(Action::SubPage(if steps > 0.0 { -1 } else { 1 }), None);
+            return;
+        }
         if steps > 0.0 {
             self.scroll = self.scroll.saturating_sub(1);
         } else if steps < 0.0 {
@@ -2643,6 +2832,7 @@ impl State {
     /// A mouse button went down on the mod's screen at `mouse`, over
     /// `widgets` (this frame's).
     pub fn press(&mut self, button: i32, mouse: [f32; 2], widgets: &[Widget], here: Option<&Here>) {
+        self.mouse = mouse;
         if let Some(action) = hit(widgets, mouse) {
             if button == 0 {
                 self.act(action, here);
@@ -2742,11 +2932,18 @@ impl State {
     pub fn release(&mut self, button: i32) {
         if button == 0 {
             self.map.dragging = false;
+            self.slider = None;
         }
     }
 
     /// The pointer moved `delta` with a button held.
     pub fn drag(&mut self, button: i32, delta: [f32; 2]) -> bool {
+        if button == 0 && self.slider.is_some() {
+            self.mouse[0] += delta[0];
+            self.mouse[1] += delta[1];
+            self.slide();
+            return true;
+        }
         if self.mode != Mode::Map || button != 0 || !self.map.dragging {
             return false;
         }
@@ -2830,7 +3027,7 @@ impl State {
     /// The minimap's side on a `gui` sized screen: the share of its height
     /// chosen (never wider than 45% of it, never under 24 pixels).
     pub fn mini_side(&self, gui: [f32; 2]) -> f32 {
-        let share = f32::from(self.settings().size) / 100.0;
+        let share = self.settings().size as f32 / 100.0;
         (gui[1] * share).min(gui[0] * 0.45).max(24.0).floor()
     }
 
@@ -2961,7 +3158,7 @@ impl State {
         }
 
         // The player: a red arrow, as Xaero's.
-        let facing = if st.rotate { 0.0 } else { 180.0 + here.yaw };
+        let facing = if st.rotate() { 0.0 } else { 180.0 + here.yaw };
         arrow(&mut draws, mid, facing, (side / 14.0).clamp(5.0, 9.0), 0xFFE0_3030);
 
         // N E S W on the frame.
@@ -3019,6 +3216,10 @@ impl State {
                 draw_editor(&mut out, size, &editor);
             }
             Mode::Map => self.draw_map(&mut out, size, here, true),
+            Mode::Settings(view) => {
+                out.fill([0.0, 0.0, size[0], size[1]], SHADE);
+                self.draw_settings(&mut out, size, &view);
+            }
         }
         (out.draws, out.widgets)
     }
@@ -3109,6 +3310,7 @@ impl State {
             buttons.push(("-".into(), Action::LayerStep(-1)));
         }
         buttons.push((format!("Mode: {}", st.mode.label()), Action::CycleMapMode));
+        buttons.push(("Settings".into(), Action::GoPage(Page::Main)));
         let mut x = size[0] - 4.0;
         let by = size[1] - 18.0;
         for (label, action) in buttons {
@@ -3126,6 +3328,82 @@ impl State {
         };
         let hint = out.fit(&hint, x - 8.0);
         out.text(&hint, [4.0, size[1] - 14.0], MUTED);
+    }
+
+    /// The settings screen, laid out as Xaero's: the title and page number,
+    /// the search box, two columns of buttons and sliders, Prev, Back, Next.
+    fn draw_settings(&mut self, out: &mut Out<'_>, size: [f32; 2], view: &SettingsView) {
+        let st = self.settings();
+        let items = settings_items(view);
+        let gap = 8.0;
+        let bw = ((size[0] - 24.0 - gap) / 2.0).min(200.0).floor();
+        let left = ((size[0] - bw * 2.0 - gap) / 2.0).floor();
+        let top = 46.0;
+        let bottom = size[1] - 30.0;
+        let rows = (((bottom - top) / 24.0).floor() as usize).clamp(1, 6);
+        let pages = items.len().div_ceil(rows * 2).max(1);
+        let sub = view.sub.min(pages - 1);
+        if let Mode::Settings(v) = &mut self.mode {
+            v.sub = sub;
+        }
+
+        let title = if view.search.trim().is_empty() {
+            format!("{} ({}/{pages})", view.page.title(), sub + 1)
+        } else {
+            format!("Search ({}/{pages})", sub + 1)
+        };
+        let tw = out.width(&title);
+        out.text(&title, [((size[0] - tw) / 2.0).round(), 8.0], INK);
+
+        // The search box, top right.
+        let rect = [left + bw + gap, 22.0, bw, 16.0];
+        out.draws.push(Draw::Fill(rect, if view.searching { 0xFFFF_FFFF } else { 0xFFA0_A0A0 }));
+        out.draws.push(Draw::Fill([rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, rect[3] - 2.0], 0xFF00_0000));
+        let shown = if view.searching { format!("{}_", view.search) } else { view.search.clone() };
+        if shown.is_empty() {
+            out.text("Search...", [rect[0] + 4.0, rect[1] + 4.0], 0x707070);
+        } else {
+            out.text(&shown, [rect[0] + 4.0, rect[1] + 4.0], INK);
+        }
+        out.widgets.push(Widget { rect, action: Action::FocusSearch });
+
+        for (n, item) in items.iter().skip(sub * rows * 2).take(rows * 2).enumerate() {
+            let x = left + (n % 2) as f32 * (bw + gap);
+            let y = top + (n / 2) as f32 * 24.0;
+            let rect = [x, y, bw, 20.0];
+            match *item {
+                Item::Opt(i) => {
+                    let o = &OPTS[i];
+                    let label = o.text(st.raw(i));
+                    if let Kind::Slider { min, max, .. } = o.kind {
+                        let t = (st.raw(i) - min) as f32 / (max - min).max(1) as f32;
+                        mc_slider(out, rect, &label, t.clamp(0.0, 1.0), Action::Slide(i, rect));
+                    } else {
+                        mc_button(out, rect, &label, Some(Action::Opt(i)));
+                    }
+                }
+                Item::Link(page) => {
+                    let label = page.title().replace("Minimap ", "");
+                    mc_button(out, rect, &label, Some(Action::GoPage(page)));
+                }
+                Item::List => mc_button(out, rect, "Waypoints", Some(Action::OpenList)),
+            }
+        }
+
+        // Prev, Back, Next.
+        let y = size[1] - 26.0;
+        let pw = 74.0;
+        let prev = (sub > 0).then_some(Action::SubPage(-1));
+        let next = (sub + 1 < pages).then_some(Action::SubPage(1));
+        mc_button(out, [left, y, pw, 20.0], "<< Prev", prev);
+        mc_button(out, [left + bw * 2.0 + gap - pw, y, pw, 20.0], "Next >>", next);
+        let back_w = 200.0_f32.min(bw * 2.0 + gap - pw * 2.0 - 8.0);
+        mc_button(
+            out,
+            [((size[0] - back_w) / 2.0).round(), y, back_w, 20.0],
+            "Back",
+            Some(Action::SettingsBack),
+        );
     }
 
     /// The waypoint list: every waypoint (or a dimension's), one a row;
@@ -3249,26 +3527,42 @@ impl State {
     }
 }
 
-/// A button as Minecraft draws its own: a grey bevelled face, white text,
-/// lighter under the pointer, darker and inert when `action` is None.
+/// A vanilla button: inert when `action` is None.
 fn mc_button(out: &mut Out<'_>, rect: [f32; 4], label: &str, action: Option<Action>) {
-    let [x, y, w, h] = rect;
     let active = action.is_some();
     let hover = active && inside(rect, out.mouse);
-    let (face, light, dark, ink) = match (active, hover) {
-        (false, _) => (0xFF2C_2C2C, 0xFF3A_3A3A, 0xFF1E_1E1E, 0xA0A0A0),
-        (true, false) => (0xFF6F_6F6F, 0xFFA8_A8A8, 0xFF4A_4A4A, INK),
-        (true, true) => (0xFF7E_88B8, 0xFFBE_C8F0, 0xFF56_5E8A, 0xFFFFA0),
+    let sprite = if !active {
+        "gui/sprites/widget/button_disabled"
+    } else if hover {
+        "gui/sprites/widget/button_highlighted"
+    } else {
+        "gui/sprites/widget/button"
     };
-    out.fill([x, y, w, h], 0xFF00_0000);
-    out.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], dark);
-    out.fill([x + 1.0, y + 1.0, w - 3.0, h - 3.0], light);
-    out.fill([x + 2.0, y + 2.0, w - 4.0, h - 5.0], face);
-    let tw = out.width(label);
-    out.text(label, [(x + (w - tw) / 2.0).round(), (y + (h - 8.0) / 2.0).round()], ink);
+    out.draws.push(Draw::Nine(sprite, rect, 0xFFFF_FFFF));
+    let label = out.fit(label, rect[2] - 6.0);
+    let tw = out.width(&label);
+    let ink = if active { INK } else { 0xA0A0A0 };
+    out.text(&label, [(rect[0] + (rect[2] - tw) / 2.0).round(), (rect[1] + (rect[3] - 8.0) / 2.0).round()], ink);
     if let Some(action) = action {
         out.widgets.push(Widget { rect, action });
     }
+}
+
+/// A vanilla slider, its handle `t` of the way along.
+fn mc_slider(out: &mut Out<'_>, rect: [f32; 4], label: &str, t: f32, action: Action) {
+    let hover = inside(rect, out.mouse);
+    let (track, handle) = if hover {
+        ("gui/sprites/widget/slider_highlighted", "gui/sprites/widget/slider_handle_highlighted")
+    } else {
+        ("gui/sprites/widget/slider", "gui/sprites/widget/slider_handle")
+    };
+    out.draws.push(Draw::Nine(track, rect, 0xFFFF_FFFF));
+    let x = rect[0] + (rect[2] - 8.0) * t;
+    out.draws.push(Draw::Nine(handle, [x, rect[1], 8.0, rect[3]], 0xFFFF_FFFF));
+    let label = out.fit(label, rect[2] - 6.0);
+    let tw = out.width(&label);
+    out.text(&label, [(rect[0] + (rect[2] - tw) / 2.0).round(), (rect[1] + (rect[3] - 8.0) / 2.0).round()], INK);
+    out.widgets.push(Widget { rect, action });
 }
 
 fn draw_editor(out: &mut Out<'_>, size: [f32; 2], e: &Editor) {
@@ -3371,7 +3665,7 @@ pub fn hit(widgets: &[Widget], at: [f32; 2]) -> Option<Action> {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 3] = [DEFAULT_MAP, DEFAULT_CREATE, DEFAULT_LIST];
+    const KEYS: [&str; 4] = [DEFAULT_MAP, DEFAULT_CREATE, DEFAULT_LIST, DEFAULT_SETTINGS];
 
     fn here(dim: &str) -> Here {
         Here {
@@ -3679,7 +3973,7 @@ mod tests {
     fn the_minimap_draws_its_image_dots_waypoints_compass_and_lines() {
         let mut s = State::default();
         s.settings = Some(Settings {
-            rotate: false,
+            lock_north: true,
             ..Settings::default()
         });
         s.waypoints.push(Waypoint {
@@ -3819,34 +4113,78 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_commands_set_them() {
-        let none = |_: &str| None;
-        let s = Settings::read(none);
+        let s = Settings::read(|_| None);
         assert_eq!(s, Settings::default());
         assert_eq!(s.view(), (25.0, 1.0));
         let mut s = s;
-        let labels = s.labels();
-        let find = |start: &str| labels.iter().position(|l| l.starts_with(start)).unwrap();
-        // Sections first, and clicking one changes nothing.
-        assert!(labels[0].contains("Minimap"));
-        let before = s;
-        s.click(0);
-        assert_eq!(s, before);
-        s.click(find("Minimap:"));
-        s.click(find("Shape:"));
-        s.click(find("Zoom:"));
         assert_eq!(s.command("size 30"), ("Atlas: size 30".to_string(), true));
         assert!(!s.command("size 120").1);
         assert!(s.command("mode layer -20").1);
         assert!(!s.command("mode layer high").1);
+        assert!(s.command("zoom 2").1);
+        assert!(s.command("shape round").1);
+        assert!(s.command("minimap off").1);
         assert_eq!(s.mode, MapMode::Layer);
         assert_eq!(s.layer_y, -20);
-        let stored = s.stored();
-        let back = Settings::read(|k: &str| stored.iter().find(|f| f.0 == k).map(|f| f.1.clone()));
+        let text = s.to_text();
+        let back = Settings::read(|k: &str| (k == SETTINGS_FILE).then(|| text.clone()));
         assert_eq!(back, s);
         assert!(!back.minimap && back.round && back.size == 30);
-        assert_eq!(back.labels()[find("Zoom:")], "Zoom: 2 blocks per pixel");
+        let i = Opt::index("zoom").unwrap();
+        assert_eq!(OPTS[i].text(back.raw(i)), "Blocks per Pixel: 2");
         let mut back = back;
         assert_eq!(back.command("zoom").0, "Atlas: zoom is 2");
+        // Options > Mods: a title that does nothing, then the main switches.
+        let mut s = Settings::default();
+        s.click(0);
+        assert_eq!(s, Settings::default());
+        s.click(1);
+        assert!(!s.minimap);
+    }
+
+    #[test]
+    fn every_setting_reads_back_what_it_stores() {
+        for (i, o) in OPTS.iter().enumerate() {
+            let v = Settings::default().raw(i);
+            assert_eq!(o.parse(&o.stored(v)), Ok(v), "{}", o.key);
+            assert_ne!(o.next(v), v, "{}", o.key);
+        }
+    }
+
+    #[test]
+    fn the_settings_screen_pages_and_searches() {
+        let mut s = State::default();
+        s.open_settings(Page::Main);
+        let size = [427.0, 240.0];
+        let find = |w: &[Widget], a: &Action| w.iter().find(|x| x.action == *a).map(|x| x.rect);
+        let (_, w) = s.screen(size, [0.0, 0.0], None, &measure);
+        let view = find(&w, &Action::GoPage(Page::View)).unwrap();
+        s.press(0, [view[0] + 1.0, view[1] + 1.0], &w, None);
+        assert!(matches!(&s.mode, Mode::Settings(v) if v.page == Page::View));
+        // A slider follows the pointer while dragged.
+        let size_opt = Opt::index("size").unwrap();
+        let (_, w) = s.screen(size, [0.0, 0.0], None, &measure);
+        let slider = w.iter().find(|x| matches!(x.action, Action::Slide(i, _) if i == size_opt)).unwrap().rect;
+        s.press(0, [slider[0] + slider[2] - 4.0, slider[1] + 5.0], &w, None);
+        assert_eq!(s.settings().size, 60);
+        assert!(s.drag(0, [-(slider[2] - 8.0), 0.0]));
+        assert_eq!(s.settings().size, 10);
+        s.release(0);
+        assert!(s.take_changed_settings().is_some());
+        // Search goes across the pages; Escape clears it, then goes back.
+        let (_, w) = s.screen(size, [0.0, 0.0], None, &measure);
+        let search = find(&w, &Action::FocusSearch).unwrap();
+        s.press(0, [search[0] + 1.0, search[1] + 1.0], &w, None);
+        for c in "slime".chars() {
+            s.char_typed(c);
+        }
+        let (_, w) = s.screen(size, [0.0, 0.0], None, &measure);
+        assert!(find(&w, &Action::Opt(Opt::index("slime").unwrap())).is_some());
+        s.key("key.keyboard.escape", false, None, KEYS);
+        s.key("key.keyboard.escape", false, None, KEYS);
+        assert!(matches!(&s.mode, Mode::Settings(v) if v.page == Page::Main));
+        s.key(DEFAULT_SETTINGS, false, None, KEYS);
+        assert!(s.take_close());
     }
 
     #[test]
