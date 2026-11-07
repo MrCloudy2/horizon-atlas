@@ -91,6 +91,7 @@ class World:
             self.dir = Path(folder) / 'region'
         self.chunks = {}
         self.biomes = {}
+        self.lights = {}
 
     def chunk(self, cx, cz):
         key = (cx, cz)
@@ -114,7 +115,11 @@ class World:
         d = root(raw)
         sections = {}
         biomes = {}
+        lights = {}
         for s in d.get('sections', []):
+            for k in ('BlockLight', 'SkyLight'):
+                if s.get(k) is not None:
+                    lights[(s['Y'], k)] = bytes(b & 255 for b in s[k])
             bi = s.get('biomes')
             if bi:
                 biomes[s['Y']] = ([name(p) for p in bi['palette']], bi.get('data'))
@@ -125,11 +130,22 @@ class World:
             sections[s['Y']] = (pal, bs.get('data'))
         self.chunks[key] = sections
         self.biomes[key] = biomes
+        self.lights[key] = lights
         return sections
 
     def raw_biomes(self, cx, cz):
         self.chunk(cx, cz)
         return self.biomes.get((cx, cz))
+
+    def light(self, x, y, z, kind='BlockLight'):
+        """The saved light level at (x, y, z), or None if not saved."""
+        if self.chunk(x >> 4, z >> 4) is None:
+            return None
+        arr = self.lights.get((x >> 4, z >> 4), {}).get((y >> 4, kind))
+        if arr is None:
+            return None
+        idx = ((y & 15) * 16 + (z & 15)) * 16 + (x & 15)
+        return arr[idx >> 1] >> (4 * (idx & 1)) & 15
 
     def block(self, x, y, z):
         """The block at (x, y, z) as `name[props]`, or None if not saved."""

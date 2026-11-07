@@ -23,6 +23,13 @@ print("parity-active %(tag)s " + (a ? a.caption : "none"));
 """
 
 
+def _ydotool(*args):
+    """ydotool, or stop: without its daemon it sends nothing, quietly."""
+    r = subprocess.run(['ydotool', *args], capture_output=True, text=True)
+    if r.returncode != 0 or 'failed to connect' in (r.stdout + r.stderr).lower():
+        raise SystemExit(f'ydotool failed (is ydotoold running?): {r.stdout}{r.stderr}')
+
+
 def _kwin(activate):
     tag = f'{time.time_ns()}'
     with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False) as f:
@@ -62,7 +69,7 @@ def key(name, hold=0.05):
         time.sleep(0.15)
         if focused():
             code = KEYS[name]
-            subprocess.run(['ydotool', 'key', f'{code}:1', f'{code}:0'], capture_output=True)
+            _ydotool('key', f'{code}:1', f'{code}:0')
             time.sleep(hold)
             return
     raise SystemExit(f'Minecraft would not take focus (active: {c}); no key sent')
@@ -93,8 +100,7 @@ def wheel(notches):
     for _ in range(abs(notches)):
         if not focused():
             key_focus_only()
-        subprocess.run(['ydotool', 'mousemove', '-w', '--', '0', '1' if notches > 0 else '-1'],
-                       capture_output=True)
+        _ydotool('mousemove', '-w', '--', '0', '1' if notches > 0 else '-1')
         time.sleep(0.15)
 
 
@@ -103,3 +109,18 @@ def key_focus_only():
     time.sleep(0.15)
     if not focused():
         raise SystemExit('Minecraft would not take focus; no wheel sent')
+
+
+def combo(*names):
+    """Press keys together (the first ones held), e.g. combo('shift', 'tab')."""
+    KEYS.setdefault('shift', 42)
+    codes = [KEYS[n] for n in names]
+    for _ in range(3):
+        _kwin(True)
+        time.sleep(0.15)
+        if focused():
+            seq = [f'{c}:1' for c in codes] + [f'{c}:0' for c in reversed(codes)]
+            _ydotool('key', *seq)
+            time.sleep(0.05)
+            return
+    raise SystemExit('Minecraft would not take focus; no key sent')

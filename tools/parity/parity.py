@@ -71,7 +71,7 @@ def cmd_java(a):
 
 def cmd_flat(a):
     import flat
-    out = flat.make(a.template, a.out, a.seed, a.centre[0], a.centre[1])
+    out = flat.make(a.template, a.out, a.seed, a.centre[0], a.centre[1], a.time)
     print(f'Made {out}')
 
 
@@ -99,7 +99,7 @@ def cmd_capture(a):
         marker.write_text(json.dumps(want))
     ctl('tp', cx + 0.5, scene.FLOOR + 1, cz + 0.5)
     ctl('look', 180, 90)
-    ctl('time', 6000)
+    ctl('time', a.time)
     for setting in a.atlas:
         ctl('chat', f'/atlas {setting}')
     ctl('wait-ready')
@@ -251,6 +251,7 @@ def main():
     c = sub.add_parser('capture')
     c.add_argument('--seed', type=int, required=True)
     c.add_argument('--centre', type=int, nargs=2, default=[0, 0])
+    c.add_argument('--time', type=int, default=6000, help='the time of day to shoot at')
     c.add_argument('--world', help='the test world (made with `flat` for a superflat one)')
     c.add_argument('--view', choices=['map', 'mini'], default='map')
     c.add_argument('--size', type=int, nargs=2, default=[1280, 720])
@@ -268,6 +269,7 @@ def main():
     f.add_argument('--out', required=True)
     f.add_argument('--seed', type=int, default=1651784574633817667)
     f.add_argument('--centre', type=int, nargs=2, default=[0, 0])
+    f.add_argument('--time', type=int, default=6000, help='the time of day the datapack holds')
     m = sub.add_parser('compare')
     m.add_argument('xaero')
     m.add_argument('atlas')

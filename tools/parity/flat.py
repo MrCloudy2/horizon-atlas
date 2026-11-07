@@ -111,10 +111,15 @@ def generator(seed):
     }
 
 
-def datapack(folder, cx, cz):
+# 26.3's names (the older camelCase ones no longer parse).
+RULES = ['spawn_mobs', 'spawn_monsters', 'advance_time', 'advance_weather', 'spawn_patrols',
+         'spawn_wandering_traders', 'spawn_phantoms']
+
+
+def datapack(folder, cx, cz, daytime=6000):
     """The scene as a datapack that builds itself: once a player is in the
     world it force-loads the area, waits for it, builds, and puts every
-    player in the middle looking down, at noon."""
+    player in the middle looking down, at `daytime` (noon unless told)."""
     root = Path(folder)
     fn = root / 'data' / 'parity' / 'function'
     tags = root / 'data' / 'minecraft' / 'tags' / 'function'
@@ -124,15 +129,23 @@ def datapack(folder, cx, cz):
         {'pack': {'description': 'Atlas parity scene', 'min_format': DATA_FORMAT,
                   'max_format': DATA_FORMAT}}, indent=2))
     (tags / 'tick.json').write_text(json.dumps({'values': ['parity:tick']}))
+    # No spawning, no daylight or weather cycle. A bad line stops a whole
+    # function from loading, so each rule is a function of its own that may
+    # fail alone in a version that names it otherwise.
+    rules = []
+    for i, rule in enumerate(RULES):
+        (fn / f'rule{i}.mcfunction').write_text(f'gamerule {rule} false\n')
+        rules.append({'id': f'parity:rule{i}', 'required': False})
+    (tags / 'load.json').write_text(json.dumps({'values': rules}))
     x0, z0 = cx - scene.HALF, cz - scene.HALF
     x1, z1 = cx + scene.HALF - 1, cz + scene.HALF - 1
     # Every tick: the player held in the middle looking north (nothing can
-    # move the view between shots), no mobs but the test's own, noon.
+    # move the view between shots), no mobs but the test's own, one time.
     (fn / 'tick.mcfunction').write_text(
         'execute as @a[tag=!parity] run function parity:start\n'
         f'tp @a[tag=parity] {cx + 0.5} {scene.FLOOR + 1} {cz + 0.5} 180 90\n'
         'kill @e[type=!player,tag=!parity_keep]\n'
-        'time set 6000\n')
+        f'time set {daytime}\n')
     (fn / 'start.mcfunction').write_text(
         'tag @s add parity\n'
         'gamemode creative @s\n'
@@ -147,7 +160,7 @@ def datapack(folder, cx, cz):
     return root
 
 
-def make(template, out, seed, cx, cz):
+def make(template, out, seed, cx, cz, daytime=6000):
     """World folder `out` from `template`'s level.dat, flat, with the scene."""
     out = Path(out)
     if out.exists():
@@ -156,5 +169,5 @@ def make(template, out, seed, cx, cz):
     shutil.copy(Path(template) / 'level.dat', out / 'level.dat')
     (out / 'data' / 'minecraft').mkdir(parents=True)
     write_nbt(out / 'data' / 'minecraft' / 'world_gen_settings.dat', generator(seed))
-    datapack(out / 'datapacks' / 'parity', cx, cz)
+    datapack(out / 'datapacks' / 'parity', cx, cz, daytime)
     return out
