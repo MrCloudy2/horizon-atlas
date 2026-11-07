@@ -162,8 +162,8 @@ impl Palette {
         }
         let leaves = name.ends_with("_leaves");
         let tinted = match name {
-            // Darker than the game's: measured from Xaero's map.
-            "spruce_leaves" => Tint::Constant(0x48_6C4C),
+            // The game's own: these don't follow the biome.
+            "spruce_leaves" => Tint::Constant(0x61_9961),
             "birch_leaves" => Tint::Constant(0x80_A755),
             "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves" => Tint::None,
             "leaf_litter" => Tint::Dry,
@@ -199,15 +199,11 @@ impl Palette {
             rgb = self.lava;
             tint = Tint::None;
         }
-        // Measured from Xaero's map: these are darker than their textures.
-        let dim = match name {
-            "ice" | "packed_ice" | "blue_ice" | "frosted_ice" => 0.75,
-            "podzol" | "coarse_dirt" | "rooted_dirt" => 0.76,
-            _ => 1.0,
-        };
-        if dim < 1.0 {
-            let ch = |s: u32| (((rgb >> s & 255) as f32 * dim) as u32) << s;
-            rgb = ch(16) | ch(8) | ch(0);
+        // Measured from Xaero's map: ice is darker than its texture, and
+        // bluer in the dark.
+        if matches!(name, "ice" | "frosted_ice") {
+            let ch = |s: u32, k: f32| (((rgb >> s & 255) as f32 * k) as u32) << s;
+            rgb = ch(16, 0.898) | ch(8, 0.838) | ch(0, 0.761);
         }
         if rgb == 0 {
             // No texture: the map item's colour.
@@ -302,30 +298,20 @@ impl Scan<'_> {
             let water = Look { rgb: self.palette.water, map_rgb: look.map_rgb, tint: Tint::Water, flags: look.flags };
             let mut rgb = self.color(water, x, y, z);
             if self.transparency {
-                // See-through at every depth: the bottom keeps showing under
-                // a blue tint, more of it in the shallows. Measured from
-                // Xaero's map, as is the tint under it.
+                // See-through at every depth: the bottom keeps showing
+                // under the water, less of it the deeper it is, and the
+                // water itself darkens. Fitted to Xaero's map at noon over
+                // sand and over dirt, 1 to 10 deep; past 15 it stays.
                 let under = self.look(x, below, z);
                 let bottom = self.color(under, x, below, z);
-                let a = match depth {
-                    0 | 1 => 0.72,
-                    2 => 0.8,
-                    3 => 0.85,
-                    _ => 0.9,
-                };
-                // Past the shallows the tint itself gets darker.
-                let deep = match depth {
-                    0..=2 => 1.0,
-                    3 => 0.94,
-                    _ => 0.87,
-                };
-                // The map grades water apart from land: the bottom is graded
-                // as land here, undoing the water's grade to come.
-                let ch = |s: u32, tint: f32, land: f32| {
+                let d = f32::from(depth.clamp(1, 15) - 1);
+                let a = 0.716 + 0.0145 * d;
+                let dark = 1.0 - 0.0185 * d;
+                let ch = |s: u32, k: f32| {
                     let (w, g) = ((rgb >> s & 255) as f32, (bottom >> s & 255) as f32);
-                    ((w * tint * deep * a + g * land * (1.0 - a)).round().min(255.0) as u32) << s
+                    ((w * k * dark * a + g * (1.0 - a)).round().min(255.0) as u32) << s
                 };
-                rgb = ch(16, 0.83, 0.94) | ch(8, 0.99, 1.15) | ch(0, 1.15, 1.36);
+                rgb = ch(16, 0.895) | ch(8, 0.874) | ch(0, 0.849);
             }
             return (m::WATER | rgb, y as i16, depth);
         }

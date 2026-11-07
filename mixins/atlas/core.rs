@@ -628,9 +628,9 @@ fn shade_chunk(store: &mut Store, chunk: (i32, i32), how: Shading) -> Rc<ShadedC
 }
 
 /// A column as the maps show it: land lit by its slope (lighter where it
-/// rises from the north and the west, darker where it falls) and its height,
-/// water darker the deeper it is, cut walls dark.
-pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, depth: u8, how: Shading) -> [u8; 4] {
+/// rises from the north and the west, darker where it falls) and darker
+/// below sea level; water as blended when read; cut walls dark.
+pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, how: Shading) -> [u8; 4] {
     let rgb = color & RGB;
     // As Xaero's, measured from its map: flat ground is one even colour and
     // each step in height a crisp line. The light comes from the north
@@ -654,25 +654,22 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, dep
         0.38
     } else if color & KIND == WATER {
         // `height` is the bottom's here: its relief shows through, faintly.
-        if how.transparency {
-            (1.0 + (slope - 1.0) * 0.25) * (1.0 - f32::from(depth.min(14)) * 0.006)
-        } else {
-            1.0
-        }
+        // How deep it is was blended in when the column was read.
+        if how.transparency { 1.0 + (slope - 1.0) * 0.25 } else { 1.0 }
     } else {
-        // Flats in even bands by height.
-        let band = (f32::from(height) - 62.0).div_euclid(16.0);
-        let up = if how.terrain_depth { (band * 0.06).clamp(-0.12, 0.12) } else { 0.0 };
-        slope * (1.0 + up)
+        // Measured from Xaero's map at noon: land is one colour from sea
+        // level up, and a little darker for each block below it.
+        let below = (63 - i32::from(height)).max(0) as f32;
+        let deep = if how.terrain_depth { (1.0 - below * 0.0145).max(0.7) } else { 1.0 };
+        slope * deep
     };
-    // The colour grade from the blocks' averages to Xaero's: measured on
-    // grass, sand and gravel of the same world.
+    // The colour grade from the blocks' texture averages to Xaero's,
+    // measured on eighteen blocks of a test scene at noon: each channel
+    // lands within 4 of Xaero's. Water is graded the same, its blend having
+    // been fitted to it.
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
-    let (grade, gain) = if color & KIND == WATER {
-        ([0.89, 0.745, 0.66], how.water_gain)
-    } else {
-        ([0.84, 0.86, 0.9], how.gain)
-    };
+    let grade = [1.072, 1.102, 1.163];
+    let gain = if color & KIND == WATER { how.water_gain } else { how.gain };
     let ch = |c: f32, grade: f32| (c * grade * gain * f).round().clamp(0.0, 255.0) as u8;
     [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
 }
@@ -696,7 +693,7 @@ fn shaded(
     let level = |c: (u32, i16, u8)| if water { c.1 - i16::from(c.2) } else { c.1 };
     let north = column(x, z - step).filter(like).map(level);
     let west = column(x - step, z).filter(like).map(level);
-    Some(shade(color, level((color, height, depth)), north, west, depth, how))
+    Some(shade(color, level((color, height, depth)), north, west, how))
 }
 
 /// Chunk offsets at Chebyshev distance `ring`.
@@ -1025,9 +1022,13 @@ pub const MINI: usize = 128;
 pub const MINI_MAX: usize = 1024;
 /// A block on the minimap at zoom 1, in screen pixels, as Xaero draws it.
 pub const PIXELS_PER_BLOCK: f32 = 1.0;
-/// How much brighter land is on the minimap than on the world map, as
-/// measured on Xaero's (daytime sand `d8d4b0` against `b2ac90`).
-const MINI_LAND_GAIN: f32 = 1.21;
+/// The minimap's land against the world map's. Xaero's minimap sand was
+/// `d8d4b0`; this keeps it there until the minimap is measured at noon in
+/// the test scene as the world map was.
+const MINI_LAND_GAIN: f32 = 0.945;
+/// The same for water: about what it was before the world map's water was
+/// fitted.
+const MINI_WATER_GAIN: f32 = 0.7;
 
 /// How the minimap's edge looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2873,7 +2874,7 @@ impl State {
         }
         let how = Shading {
             gain: MINI_LAND_GAIN,
-            water_gain: 1.15,
+            water_gain: MINI_WATER_GAIN,
             edges: 0.6,
             leaf_edges: 0.3,
             ..st.shading()
@@ -5083,20 +5084,25 @@ mod tests {
             Shading { slopes: 0, terrain_depth: false, ..Shading::default() },
             Shading { slopes: 2, terrain_depth: false, ..Shading::default() },
         );
-        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, 0, how)[0];
+        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, how)[0];
         let flat_at = at(flat, Some(68), Some(70));
-        assert_eq!(flat_at, 108, "the grade alone");
+        assert_eq!(flat_at, 137, "the grade alone");
         let normal = Shading { slopes: 1, ..flat };
         assert!(at(normal, Some(68), Some(70)) > flat_at, "lit");
         assert!(at(strong, Some(68), Some(70)) > at(normal, Some(68), Some(70)));
         // A higher north neighbour is hard shadow, a higher west one soft.
         let (hard, soft) = (at(normal, Some(71), Some(70)), at(normal, Some(70), Some(71)));
         assert!(hard < soft && soft < flat_at);
-        assert_eq!(hard, 61);
-        // Deep water is darker unless transparency is off.
-        let water = |how| shade(WATER | 0x808080, 60, None, None, 10, how)[0];
-        assert!(water(flat) < 114);
-        assert_eq!(water(Shading { transparency: false, ..flat }), 114);
+        assert_eq!(hard, 78);
+        // Land is even from sea level up, darker below it with Terrain Depth.
+        let depth = Shading { terrain_depth: true, ..flat };
+        let high = |how, y| shade(LAND | 0x808080, y, None, None, how)[0];
+        assert_eq!(high(depth, 63), high(depth, 200));
+        assert!(high(depth, 60) < high(depth, 63));
+        assert_eq!(high(flat, 60), high(flat, 63));
+        // Water's depth was blended in when read: graded as land here.
+        let water = |how| shade(WATER | 0x808080, 60, None, None, how)[0];
+        assert_eq!(water(flat), flat_at);
         // Auto waits for the timer; other modes don't.
         let mut s = State::default();
         s.want_cut(Cut::Below(31));
@@ -5316,6 +5322,8 @@ mod tests {
             s.face_slot = Some(1);
             let mut t = grass(100);
             t.height[5] = 106;
+            // Under sea level, for Terrain Depth.
+            t.height[40] = 50;
             t.color[9] = WATER | 0x3F_76E4;
             t.depth[9] = 9;
             s.maps.store(cut).put(0, 0, t);
@@ -5349,7 +5357,8 @@ mod tests {
     fn every_setting_does_something() {
         // Those the game side reads: it must read them.
         let bridge = std::fs::read_to_string("mixins/atlas/bridge.rs").unwrap();
-        const GAME_SIDE: [(&str, &str); 13] = [
+        const GAME_SIDE: [(&str, &str); 14] = [
+            ("transparency", "settings.transparency"),
             ("minimap", "settings.minimap"),
             ("corner", "settings.corner"),
             ("hide_under_screen", "settings.hide_under_screen"),
