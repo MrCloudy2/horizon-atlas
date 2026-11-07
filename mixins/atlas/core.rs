@@ -616,7 +616,7 @@ pub struct Shading {
 impl Default for Shading {
     fn default() -> Self {
         Self {
-            slopes: 1,
+            slopes: 2,
             terrain_depth: true,
             transparency: true,
             gain: 1.0,
@@ -646,42 +646,41 @@ fn shade_chunk(store: &mut Store, chunk: (i32, i32), how: Shading) -> Rc<ShadedC
     Rc::new(out)
 }
 
-/// A column as the maps show it: land lit by its slope (lighter where it
-/// rises from the north and the west, darker where it falls) and darker
-/// below sea level; water as blended when read; cut walls dark; all of it
-/// lit by the sky or the block light `light` over it, whichever is more.
-pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, light: u8, how: Shading) -> [u8; 4] {
+/// A column as the maps show it: land lit by its slope against the
+/// columns `step` blocks north and north west of it (lighter facing north,
+/// darker facing away) and darker below sea level; water as blended when
+/// read; cut walls dark; all of it lit by the sky or the block light `light`
+/// over it, whichever is more.
+#[allow(clippy::too_many_arguments)]
+pub fn shade(
+    color: u32,
+    height: i16,
+    north: Option<i16>,
+    north_west: Option<i16>,
+    step: i32,
+    light: u8,
+    how: Shading,
+) -> [u8; 4] {
     let rgb = color & RGB;
-    // As Xaero's, measured from its map: flat ground is one even colour and
-    // each step in height a crisp line. The light comes from the north
-    // west: a block under a higher north neighbour is in hard shadow, under
-    // a higher west neighbour in soft shadow.
-    let dn = height - north.unwrap_or(height);
-    let dw = height - west.unwrap_or(height);
-    let shadow = if dn < 0 {
-        0.57
-    } else if dw < 0 {
-        0.83
-    } else if dn > 0 || dw > 0 {
-        1.08
-    } else {
-        1.0
-    };
-    let k = [0.0, 1.0, 1.3][how.slopes.min(2)];
+    let shadow = slope_light(height, north, north_west, step);
+    let k = [0.0, 0.5, 1.0][how.slopes.min(2)];
     let edges = if color & KIND == LEAF { how.leaf_edges } else { how.edges };
     let slope = 1.0 + (shadow - 1.0) * k * edges;
     let f = if color & WALL != 0 {
-        0.38
+        [0.38; 3]
     } else if color & KIND == WATER {
-        // `height` is the bottom's here: its relief shows through, faintly.
-        // How deep it is was blended in when the column was read.
-        if how.transparency { 1.0 + (slope - 1.0) * 0.25 } else { 1.0 }
+        // `height` is the bottom's here: its relief shows through. Xaero's
+        // shades the bottom under the water's tint, so red the most, blue
+        // the least: measured at the edges of pools 1 to 10 deep (more over
+        // sand, less over dirt, less the deeper). How deep it is was blended
+        // in when the column was read.
+        if how.transparency { [0.58, 0.38, 0.19].map(|k| 1.0 + (slope - 1.0) * k) } else { [1.0; 3] }
     } else {
         // Measured from Xaero's map at noon: land is one colour from sea
         // level up, and a little darker for each block below it.
         let below = (63 - i32::from(height)).max(0) as f32;
         let deep = if how.terrain_depth { (1.0 - below * 0.0145).max(0.7) } else { 1.0 };
-        slope * deep
+        [slope * deep; 3]
     };
     // The colour grade from the blocks' texture averages to Xaero's,
     // measured on eighteen blocks of a test scene at noon: each channel
@@ -694,12 +693,29 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, lig
     // of light, sky or block, is a 24th, from 9 24ths in the dark, over the
     // colour as it is by day (white snow stays an even grey).
     let lit = if how.lighting { (9.0 + how.sky.max(f32::from(light.min(15)))) / 24.0 } else { 1.0 };
-    let ch = |c: f32, grade: f32| ((c * grade * gain * f).min(255.0) * lit).round().clamp(0.0, 255.0) as u8;
-    [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
+    let ch = |c: f32, i: usize| ((c * grade[i] * gain * f[i]).min(255.0) * lit).round().clamp(0.0, 255.0) as u8;
+    [ch(r, 0), ch(g, 1), ch(b, 2), 255]
+}
+
+/// How a column `height` high is lit by its slope, 1 on the flat: Xaero's
+/// "3D" terrain slopes, measured from its map. The surface's normal comes
+/// from the columns `step` blocks north and north west of it (the same
+/// height where unknown); the light comes from the north, 42.5 degrees up,
+/// over an ambient 0.58. Within 0.035 of Xaero's over steps and ramps of 1
+/// to 32 blocks.
+pub fn slope_light(height: i16, north: Option<i16>, north_west: Option<i16>, step: i32) -> f32 {
+    const AMBIENT: f32 = 0.58;
+    const UP: f32 = 42.5 * std::f32::consts::PI / 180.0;
+    let step = step.max(1) as f32;
+    let v = f32::from(height - north.unwrap_or(height)) / step;
+    let d = f32::from(height - north_west.unwrap_or(height)) / step;
+    // The normal (v - d, 1, -v) against the light (0, cos UP, -sin UP).
+    let along = (UP.cos() + v * UP.sin()) / ((v - d) * (v - d) + 1.0 + v * v).sqrt();
+    AMBIENT + (1.0 - AMBIENT) * along.max(0.0) / UP.cos()
 }
 
 /// The colour of column `(x, z)` from `column`, shaded against the columns
-/// `step` blocks north and west of it, or None where nothing was seen.
+/// `step` blocks north and north west of it, or None where nothing was seen.
 fn shaded(
     column: &mut dyn FnMut(i32, i32) -> Option<Column>,
     x: i32,
@@ -711,13 +727,13 @@ fn shaded(
     if color & KIND == 0 {
         return Some(UNKNOWN);
     }
-    // Land against land; water against water, by the height of its bottom.
-    let water = color & KIND == WATER;
-    let like = |c: &Column| c.0 & WALL == 0 && (c.0 & KIND == WATER) == water && c.0 & KIND != 0;
-    let level = |c: Column| if water { c.1 - i16::from(c.2) } else { c.1 };
+    // Against land and water alike, water by the height of its bottom: as
+    // Xaero's, where the shore is a step down to the bottom.
+    let like = |c: &Column| c.0 & WALL == 0 && c.0 & KIND != 0;
+    let level = |c: Column| if c.0 & KIND == WATER { c.1 - i16::from(c.2) } else { c.1 };
     let north = column(x, z - step).filter(like).map(level);
-    let west = column(x - step, z).filter(like).map(level);
-    Some(shade(color, level((color, height, depth, light)), north, west, light, how))
+    let north_west = column(x - step, z - step).filter(like).map(level);
+    Some(shade(color, level((color, height, depth, light)), north, north_west, step, light, how))
 }
 
 /// Chunk offsets at Chebyshev distance `ring`.
@@ -1297,7 +1313,8 @@ const ARROW_COLORS: &[(&str, &str)] = &[
 const ARROW_RGB: [u32; 5] = [0xE03030, 0xF0F0F0, 0xFFD030, 0x40D050, 0x4080F0];
 const COLOR_MODES: &[(&str, &str)] = &[("accurate", "Accurate"), ("vanilla", "Vanilla")];
 const AUTO_CAVE: &[(&str, &str)] = &[("ceiling3", "3x3 Ceiling"), ("ceiling1", "1x1 Ceiling"), ("off", "OFF")];
-const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Normal"), ("strong", "Strong")];
+// Full is Xaero's (the names stored stay as they were).
+const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Soft"), ("strong", "Full")];
 const GRID_COLORS: &[(&str, &str)] = &[("off", "OFF"), ("black", "Black"), ("white", "White"), ("red", "Red")];
 const GRID_RGB: [[u16; 3]; 4] = [[0, 0, 0], [0, 0, 0], [255, 255, 255], [230, 40, 40]];
 const ALIGNMENTS: &[(&str, &str)] = &[("center", "Center"), ("left", "Left"), ("right", "Right")];
@@ -1348,7 +1365,7 @@ settings! {
         Kind::Slider { min: 8, max: 64, div: 1, unit: "", zero: None };
     cave_timer: i32 = 1000, "cave_timer", "Cave Mode Toggle Timer", BlockMap,
         Kind::Slider { min: 0, max: 5000, div: 1, unit: " ms", zero: None };
-    slopes: usize = 1, "slopes", "Terrain Slopes", BlockMap, Kind::Choice(SLOPES);
+    slopes: usize = 2, "slopes", "Terrain Slopes", BlockMap, Kind::Choice(SLOPES);
     terrain_depth: bool = true, "terrain_depth", "Terrain Depth", BlockMap, Kind::Toggle;
     transparency: bool = true, "transparency", "Block Transparency", BlockMap, Kind::Toggle;
     flowers: bool = true, "flowers", "Show Flowers", BlockMap, Kind::Toggle;
@@ -5147,34 +5164,53 @@ mod tests {
             Shading { slopes: 0, terrain_depth: false, ..Shading::default() },
             Shading { slopes: 2, terrain_depth: false, ..Shading::default() },
         );
-        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, 0, how)[0];
-        let flat_at = at(flat, Some(68), Some(70));
+        let at = |how, n, nw| shade(LAND | 0x808080, 70, n, nw, 1, 0, how)[0];
+        let flat_at = at(flat, Some(68), Some(68));
         assert_eq!(flat_at, 137, "the grade alone");
         let normal = Shading { slopes: 1, ..flat };
-        assert!(at(normal, Some(68), Some(70)) > flat_at, "lit");
-        assert!(at(strong, Some(68), Some(70)) > at(normal, Some(68), Some(70)));
-        // A higher north neighbour is hard shadow, a higher west one soft.
-        let (hard, soft) = (at(normal, Some(71), Some(70)), at(normal, Some(70), Some(71)));
-        assert!(hard < soft && soft < flat_at);
-        assert_eq!(hard, 78);
+        assert!(at(normal, Some(69), Some(69)) > flat_at, "facing north: lit");
+        assert!(at(strong, Some(69), Some(69)) > at(normal, Some(69), Some(69)));
+        // Facing south is in shadow, facing east or west half so.
+        let (south, east) = (at(strong, Some(71), Some(71)), at(strong, Some(70), Some(69)));
+        assert!(south < east && east < flat_at);
+        // Xaero's, measured (relative to flat ground): north neighbour,
+        // north west neighbour, how bright.
+        for (n, nw, xaero) in [
+            (69, 69, 1.18),
+            (71, 71, 0.578),
+            (70, 71, 0.843),
+            (70, 69, 0.843),
+            (70, 73, 0.717),
+            (70, 66, 0.684),
+            (71, 75, 0.578),
+            (69, 64, 0.738),
+            (66, 66, 1.054),
+            (38, 38, 1.0),
+        ] {
+            let got = slope_light(70, Some(n), Some(nw), 1);
+            assert!((got - xaero).abs() <= 0.035, "{n} {nw}: {got} against {xaero}");
+        }
+        assert_eq!(slope_light(70, None, None, 1), 1.0);
+        // A level of the world map further out: steps over its distance.
+        assert_eq!(slope_light(70, Some(66), Some(66), 4), slope_light(70, Some(69), Some(69), 1));
         // Land is even from sea level up, darker below it with Terrain Depth.
         let depth = Shading { terrain_depth: true, ..flat };
-        let high = |how, y| shade(LAND | 0x808080, y, None, None, 0, how)[0];
+        let high = |how, y| shade(LAND | 0x808080, y, None, None, 1, 0, how)[0];
         assert_eq!(high(depth, 63), high(depth, 200));
         assert!(high(depth, 60) < high(depth, 63));
         assert_eq!(high(flat, 60), high(flat, 63));
         // Water's depth was blended in when read: graded as land here.
-        let water = |how| shade(WATER | 0x808080, 60, None, None, 0, how)[0];
+        let water = |how| shade(WATER | 0x808080, 60, None, None, 1, 0, how)[0];
         assert_eq!(water(flat), flat_at);
         // Lit by the sky or block light, as Xaero's at midnight: 9 24ths
         // in the dark, a 24th more for each level of light.
         let night = Shading { sky: 0.0, ..flat };
-        let lit = |l| shade(LAND | 0x808080, 70, None, None, l, night)[0];
+        let lit = |l| shade(LAND | 0x808080, 70, None, None, 1, l, night)[0];
         assert_eq!(lit(0), (137.2f32 * 9.0 / 24.0).round() as u8);
         assert_eq!(lit(13), (137.2f32 * 22.0 / 24.0).round() as u8);
         assert_eq!(lit(15), flat_at);
-        assert_eq!(shade(LAND | 0x808080, 70, None, None, 0, Shading { lighting: false, ..night })[0], flat_at);
-        assert_eq!(shade(LAND | 0x808080, 70, None, None, 0, Shading { sky: 15.0, ..night })[0], flat_at);
+        assert_eq!(shade(LAND | 0x808080, 70, None, None, 1, 0, Shading { lighting: false, ..night })[0], flat_at);
+        assert_eq!(shade(LAND | 0x808080, 70, None, None, 1, 0, Shading { sky: 15.0, ..night })[0], flat_at);
         // The time of day reshades the surface, not cuts.
         let mut s = State::default();
         s.set_day_time(Some(18000));
