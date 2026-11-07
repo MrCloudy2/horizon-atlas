@@ -113,6 +113,10 @@ def cmd_capture(a):
         for _ in range(a.zoom):
             ctl('scroll-at', gui[0] / 2, gui[1] / 2, 1)
         ctl('wait', 20)
+    # The game's clock runs on through the waits: set it again, and let the
+    # maps be lit for it.
+    ctl('time', a.time)
+    ctl('wait', 40)
     ctl('screenshot', Path(a.out).resolve())
     if a.view == 'map':
         ctl('key', 'esc', 'tap')

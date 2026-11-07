@@ -236,6 +236,8 @@ struct Scan<'a> {
     cave_depth: i32,
     /// The bottom shows through water.
     transparency: bool,
+    /// The block light at a world position, 0 to 15.
+    light: &'a dyn Fn(i32, i32, i32) -> u8,
 }
 
 impl Scan<'_> {
@@ -363,6 +365,13 @@ fn scan_tile(scan: &mut Scan<'_>, air: u32, cut: m::Cut) -> m::Tile {
             tile.color[i] = c;
             tile.height[i] = h;
             tile.depth[i] = d;
+            // What lights the top of it: the block over it (over the water),
+            // or its own where it gives light, as lava does.
+            if c & m::WALL == 0 && c & m::KIND != 0 {
+                let (wx, wz) = (scan.chunk.x * 16 + x, scan.chunk.z * 16 + z);
+                let at = |y: i32| (scan.light)(wx, y, wz);
+                tile.light[i] = at(i32::from(h) + 1).max(at(i32::from(h)));
+            }
         }
     }
     tile
@@ -473,6 +482,10 @@ pub(super) fn frame(game: &mut Game<'_>) {
     };
     m::with(|s| s.want_cut(cut));
     let cut = m::with(|s| s.cut);
+    // Only the overworld's sky turns; elsewhere the maps are lit as by day.
+    let overworld = game.native_player().is_some_and(|p| p.dimension == m::OVERWORLD);
+    let ticks = game.native_clock().filter(|_| overworld).map(|c| c.day_time);
+    m::with(|s| s.set_day_time(ticks));
     scan(game, cut, &settings);
     m::with(|s| s.save_now_and_then(10.0));
     if settings.minimap {
@@ -500,6 +513,8 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
     let revision = game.world.revision;
     let air = game.world.air.0;
     let cuts: &[m::Cut] = if cut == m::Cut::Surface { &[m::Cut::Surface] } else { &[cut, m::Cut::Surface] };
+    let world = &game.world;
+    let light = |x: i32, y: i32, z: i32| world.light(x, y, z) & 15;
     let context = game.worker_context();
     let render = &*context.render;
     PALETTE.with(|cell| {
@@ -538,6 +553,7 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
                             | u16::from(!settings.leaves) * LEAVES,
                         cave_depth: settings.cave_depth,
                         transparency: settings.transparency,
+                        light: &light,
                     };
                     let tile = scan_tile(&mut scan, air, c);
                     m::with(|s| s.put_scan(c, key, revision, tile));

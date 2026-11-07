@@ -560,14 +560,18 @@ pub fn cut_for(mode: MapMode, layer_y: i32, head: i32, covered: bool, ceiling: b
 }
 
 /// One chunk's map columns (`z * 16 + x`): the colour (`LAND`, `WATER`,
-/// `| WALL`, with RGB), the height of the block that gave it, and the depth
-/// of the water over it.
+/// `| WALL`, with RGB), the height of the block that gave it, the depth of
+/// the water over it, and the block light over it (0 to 15).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tile {
     pub color: [u32; 256],
     pub height: [i16; 256],
     pub depth: [u8; 256],
+    pub light: [u8; 256],
 }
+
+/// A column: colour, height, water depth, block light.
+pub type Column = (u32, i16, u8, u8);
 
 impl Tile {
     pub fn blank(min_y: i16) -> Self {
@@ -575,12 +579,13 @@ impl Tile {
             color: [0; 256],
             height: [min_y; 256],
             depth: [0; 256],
+            light: [0; 256],
         }
     }
     #[inline]
-    pub fn column(&self, x: i32, z: i32) -> (u32, i16, u8) {
+    pub fn column(&self, x: i32, z: i32) -> Column {
         let i = ((z & 15) * 16 + (x & 15)) as usize;
-        (self.color[i], self.height[i], self.depth[i])
+        (self.color[i], self.height[i], self.depth[i], self.light[i])
     }
 }
 
@@ -602,11 +607,25 @@ pub struct Shading {
     pub edges: f32,
     /// The same on tree tops.
     pub leaf_edges: f32,
+    /// Lit as Xaero's: by the sky and the block light.
+    pub lighting: bool,
+    /// The sky's light now, 0 (midnight) to 15 (day).
+    pub sky: f32,
 }
 
 impl Default for Shading {
     fn default() -> Self {
-        Self { slopes: 1, terrain_depth: true, transparency: true, gain: 1.0, water_gain: 1.0, edges: 1.0, leaf_edges: 1.0 }
+        Self {
+            slopes: 1,
+            terrain_depth: true,
+            transparency: true,
+            gain: 1.0,
+            water_gain: 1.0,
+            edges: 1.0,
+            leaf_edges: 1.0,
+            lighting: true,
+            sky: 15.0,
+        }
     }
 }
 
@@ -629,8 +648,9 @@ fn shade_chunk(store: &mut Store, chunk: (i32, i32), how: Shading) -> Rc<ShadedC
 
 /// A column as the maps show it: land lit by its slope (lighter where it
 /// rises from the north and the west, darker where it falls) and darker
-/// below sea level; water as blended when read; cut walls dark.
-pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, how: Shading) -> [u8; 4] {
+/// below sea level; water as blended when read; cut walls dark; all of it
+/// lit by the sky or the block light `light` over it, whichever is more.
+pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, light: u8, how: Shading) -> [u8; 4] {
     let rgb = color & RGB;
     // As Xaero's, measured from its map: flat ground is one even colour and
     // each step in height a crisp line. The light comes from the north
@@ -670,30 +690,34 @@ pub fn shade(color: u32, height: i16, north: Option<i16>, west: Option<i16>, how
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
     let grade = [1.072, 1.102, 1.163];
     let gain = if color & KIND == WATER { how.water_gain } else { how.gain };
-    let ch = |c: f32, grade: f32| (c * grade * gain * f).round().clamp(0.0, 255.0) as u8;
+    // Measured from Xaero's map at midnight, at dusk and at noon: each level
+    // of light, sky or block, is a 24th, from 9 24ths in the dark, over the
+    // colour as it is by day (white snow stays an even grey).
+    let lit = if how.lighting { (9.0 + how.sky.max(f32::from(light.min(15)))) / 24.0 } else { 1.0 };
+    let ch = |c: f32, grade: f32| ((c * grade * gain * f).min(255.0) * lit).round().clamp(0.0, 255.0) as u8;
     [ch(r, grade[0]), ch(g, grade[1]), ch(b, grade[2]), 255]
 }
 
 /// The colour of column `(x, z)` from `column`, shaded against the columns
 /// `step` blocks north and west of it, or None where nothing was seen.
 fn shaded(
-    column: &mut dyn FnMut(i32, i32) -> Option<(u32, i16, u8)>,
+    column: &mut dyn FnMut(i32, i32) -> Option<Column>,
     x: i32,
     z: i32,
     step: i32,
     how: Shading,
 ) -> Option<[u8; 4]> {
-    let (color, height, depth) = column(x, z)?;
+    let (color, height, depth, light) = column(x, z)?;
     if color & KIND == 0 {
         return Some(UNKNOWN);
     }
     // Land against land; water against water, by the height of its bottom.
     let water = color & KIND == WATER;
-    let like = |c: &(u32, i16, u8)| c.0 & WALL == 0 && (c.0 & KIND == WATER) == water && c.0 & KIND != 0;
-    let level = |c: (u32, i16, u8)| if water { c.1 - i16::from(c.2) } else { c.1 };
+    let like = |c: &Column| c.0 & WALL == 0 && (c.0 & KIND == WATER) == water && c.0 & KIND != 0;
+    let level = |c: Column| if water { c.1 - i16::from(c.2) } else { c.1 };
     let north = column(x, z - step).filter(like).map(level);
     let west = column(x - step, z).filter(like).map(level);
-    Some(shade(color, level((color, height, depth)), north, west, how))
+    Some(shade(color, level((color, height, depth, light)), north, west, light, how))
 }
 
 /// Chunk offsets at Chebyshev distance `ring`.
@@ -712,9 +736,12 @@ pub const REGION: i32 = 32;
 const REGION_CHUNKS: usize = (REGION * REGION) as usize;
 /// The most regions kept in memory (a megabyte each at most).
 const MAX_REGIONS: usize = 160;
-const MAGIC: &[u8; 4] = b"ATL2";
-/// A chunk's bytes in a region file: colours, heights, depths.
-const TILE_BYTES: usize = 256 * 4 + 256 * 2 + 256;
+const MAGIC: &[u8; 4] = b"ATL3";
+/// The format before block light, still read.
+const MAGIC_2: &[u8; 4] = b"ATL2";
+/// A chunk's bytes in a region file: colours, heights, depths, lights.
+const TILE_BYTES: usize = 256 * 4 + 256 * 2 + 256 + 256;
+const TILE_BYTES_2: usize = 256 * 4 + 256 * 2 + 256;
 
 #[derive(Debug)]
 pub struct Region {
@@ -813,6 +840,7 @@ pub fn encode_region(region: &Region) -> Vec<u8> {
             raw.extend_from_slice(&h.to_le_bytes());
         }
         raw.extend_from_slice(&tile.depth);
+        raw.extend_from_slice(&tile.light);
     }
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -821,9 +849,11 @@ pub fn encode_region(region: &Region) -> Vec<u8> {
 }
 
 pub fn decode_region(bytes: &[u8], revision: u64) -> Option<Region> {
-    if bytes.get(..4)? != MAGIC {
-        return None;
-    }
+    let size = match bytes.get(..4)? {
+        m if m == MAGIC => TILE_BYTES,
+        m if m == MAGIC_2 => TILE_BYTES_2,
+        _ => return None,
+    };
     let len = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
     let raw = unpack(bytes.get(8..)?, len)?;
     if raw.len() != len || len < REGION_CHUNKS / 8 {
@@ -835,8 +865,8 @@ pub fn decode_region(bytes: &[u8], revision: u64) -> Option<Region> {
         if raw[i / 8] >> (i % 8) & 1 == 0 {
             continue;
         }
-        let body = raw.get(at..at + TILE_BYTES)?;
-        at += TILE_BYTES;
+        let body = raw.get(at..at + size)?;
+        at += size;
         let mut tile = Tile::blank(0);
         for (j, c) in tile.color.iter_mut().enumerate() {
             *c = u32::from_le_bytes(body[j * 4..j * 4 + 4].try_into().ok()?);
@@ -845,6 +875,9 @@ pub fn decode_region(bytes: &[u8], revision: u64) -> Option<Region> {
             *h = i16::from_le_bytes([body[1024 + j * 2], body[1025 + j * 2]]);
         }
         tile.depth.copy_from_slice(&body[1536..1792]);
+        if size == TILE_BYTES {
+            tile.light.copy_from_slice(&body[1792..2048]);
+        }
         region.chunks[i] = Some(Box::new(tile));
     }
     Some(region)
@@ -941,7 +974,7 @@ impl Store {
     }
 
     /// Column `(x, z)`, if its chunk was ever seen.
-    pub fn column(&mut self, x: i32, z: i32) -> Option<(u32, i16, u8)> {
+    pub fn column(&mut self, x: i32, z: i32) -> Option<Column> {
         let (cx, cz) = (x >> 4, z >> 4);
         let region = self.region((region_of(cx), region_of(cz)))?;
         region.chunks[region_index(cx, cz)]
@@ -1618,6 +1651,7 @@ impl Settings {
             slopes: self.slopes,
             terrain_depth: self.terrain_depth,
             transparency: self.transparency,
+            lighting: self.lighting,
             ..Shading::default()
         }
     }
@@ -2133,6 +2167,8 @@ pub struct State {
     /// Shaded chunks of `shade_cut`, for composing the image every frame.
     pub shade_cache: HashMap<(i32, i32), Rc<ShadedChunk>>,
     pub shade_cut: Option<Cut>,
+    /// The sky's light the maps are shaded for (`sky_light`).
+    pub sky: f32,
     /// The enlarge key is held, or toggled on.
     pub enlarged: bool,
     /// The player list key is held: icons show.
@@ -2189,6 +2225,7 @@ impl Default for State {
             mini_uploaded: None,
             shade_cache: HashMap::new(),
             shade_cut: None,
+            sky: 15.0,
             enlarged: false,
             tab_held: false,
             faces: HashMap::new(),
@@ -2367,20 +2404,16 @@ pub fn facing_text(yaw: f32) -> String {
     names[i].to_owned()
 }
 
-/// How light the world is at day time `ticks`: full all day, 0.45 at night,
-/// easing over dusk and dawn.
-pub fn daylight(ticks: i64) -> f32 {
-    let t = ticks.rem_euclid(24_000) as f32;
-    let night = if t < 12_000.0 {
-        0.0
-    } else if t < 13_700.0 {
-        (t - 12_000.0) / 1700.0
-    } else if t < 22_300.0 {
-        1.0
-    } else {
-        (24_000.0 - t) / 1700.0
-    };
-    1.0 - 0.55 * night
+/// The sky's light at day time `ticks`, 0 at midnight to 15 by day, in
+/// half levels: the game's sky curve, which Xaero's map follows (measured
+/// at noon, dusk and midnight; at time 12500 Xaero's is half a level
+/// darker than this).
+pub fn sky_light(ticks: i64) -> f32 {
+    use std::f32::consts::PI;
+    let f = (ticks.rem_euclid(24_000) as f32 / 24_000.0 - 0.25).rem_euclid(1.0);
+    let angle = (f * 2.0 + (0.5 - (f * PI).cos() / 2.0)) / 3.0;
+    let s = ((angle * 2.0 * PI).cos() * 2.0 + 0.2).clamp(0.0, 1.0);
+    (s * 30.0).round() / 2.0
 }
 
 /// `minecraft:dark_forest` as `Dark Forest`.
@@ -2877,7 +2910,7 @@ impl State {
             water_gain: MINI_WATER_GAIN,
             edges: 0.6,
             leaf_edges: 0.3,
-            ..st.shading()
+            ..self.shading(cut)
         };
         let store = self.maps.store(cut);
         let cache = &mut self.shade_cache;
@@ -2905,7 +2938,7 @@ impl State {
                 for i in 0..n {
                     let o = (j * n + i) * 4;
                     let (x, z) = grid.block(i, j);
-                    let Some((c, h, _)) = store.column(x, z) else {
+                    let Some((c, h, ..)) = store.column(x, z) else {
                         continue;
                     };
                     let dark = i32::from(light(x, i32::from(h) + 1, z)) < st.light_level;
@@ -3574,7 +3607,7 @@ impl State {
                         y <= top + 2.0 && y >= top - f64::from(st.cave_depth) - 8.0
                     }
                     Cut::Surface => match store.column(d.pos[0].floor() as i32, d.pos[2].floor() as i32) {
-                        Some((c, h, _)) if c & KIND != 0 => y >= f64::from(h) - 3.0,
+                        Some((c, h, ..)) if c & KIND != 0 => y >= f64::from(h) - 3.0,
                         _ => (y - player_y).abs() <= 24.0,
                     },
                 }
@@ -3594,13 +3627,32 @@ impl State {
     /// A number that changes when what world map image `key` shows does.
     pub fn tile_stamp(&mut self, key: TileKey) -> u64 {
         let [x0, z0, x1, z1] = key.blocks();
-        self.maps.store(key.cut).stamp(x0, z0, x1, z1)
+        let sky = self.shading(key.cut).sky.to_bits();
+        self.maps.store(key.cut).stamp(x0, z0, x1, z1) ^ u64::from(sky) << 40
+    }
+
+    /// The day time `ticks` now, None where there is no sky (or no clock):
+    /// the maps are shaded again when the sky's light changes.
+    pub fn set_day_time(&mut self, ticks: Option<i64>) {
+        let sky = ticks.map_or(15.0, sky_light);
+        if sky != self.sky {
+            self.sky = sky;
+            self.shade_cache.clear();
+            self.mini_key = None;
+        }
+    }
+
+    /// How the maps shade columns of `cut` now: lit by the sky on the
+    /// surface; in caves and cuts by day, always.
+    pub fn shading(&self, cut: Cut) -> Shading {
+        let sky = if cut == Cut::Surface { self.sky } else { 15.0 };
+        Shading { sky, ..self.settings().shading() }
     }
 
     /// World map image `key`, 128 x 128 RGBA.
     pub fn compose_tile(&mut self, key: TileKey) -> Vec<u8> {
         let mut out = Vec::new();
-        let how = self.settings().shading();
+        let how = self.shading(key.cut);
         compose_map_tile(self.maps.store(key.cut), key, how, &mut out);
         out
     }
@@ -3935,17 +3987,12 @@ impl State {
                 Style::Bare => {}
             }
         }
-        // Lit by the time of day on the surface, as see-through as set.
-        let lit = match info.day_time {
-            Some(t) if st.lighting && self.cut == Cut::Surface => daylight(t),
-            _ => 1.0,
-        };
-        let shade = (lit * 255.0) as u32;
+        // As see-through as set; the light is in the image.
         let alpha = st.opacity.clamp(0, 100) as u32 * 255 / 100;
         draws.push(Draw::ModImage(
             [grid.shift[0], grid.shift[1], grid.shown(), grid.shown()],
             [x, y, side, side],
-            alpha << 24 | shade << 16 | shade << 8 | shade,
+            alpha << 24 | 0xFF_FFFF,
         ));
 
         // Where a world point lands, pulled onto the edge when past it.
@@ -4846,13 +4893,14 @@ mod tests {
         t.color[5] = WATER | 0x3F_76E4;
         t.depth[5] = 4;
         t.height[17] = -12;
+        t.light[17] = 13;
         assert!(store.put(-1, 33, t.clone()));
         assert!(!store.put(-1, 33, t.clone()), "the same tile again is no change");
         assert!(store.has(-1, 33));
         assert!(!store.has(0, 33));
         // Chunk (-1, 33) is blocks x -16..-1, z 528..543.
-        assert_eq!(store.column(-16 + 5, 528), Some((WATER | 0x3F_76E4, 70, 4)));
-        assert_eq!(store.column(-16 + 1, 529), Some((LAND | 0x5D_A040, -12, 0)));
+        assert_eq!(store.column(-16 + 5, 528), Some((WATER | 0x3F_76E4, 70, 4, 0)));
+        assert_eq!(store.column(-16 + 1, 529), Some((LAND | 0x5D_A040, -12, 0, 13)));
         assert_eq!(store.column(5, 528), None);
         let before = store.stamp(-16, 528, -1, 543);
         store.put(-1, 33, grass(71));
@@ -4861,9 +4909,24 @@ mod tests {
         // Read back by a new store.
         let mut again = Store::default();
         again.open(Some(dir.clone()));
-        assert_eq!(again.column(-16 + 3, 530), Some((LAND | 0x5D_A040, 71, 0)));
+        assert_eq!(again.column(-16 + 3, 530), Some((LAND | 0x5D_A040, 71, 0, 0)));
         assert!(!again.has(-2, 33));
         let _ = std::fs::remove_dir_all(&dir);
+        // A region from before block light reads as unlit.
+        let mut region = Region::new(0);
+        region.chunks[0] = Some(Box::new(t.clone()));
+        let mut old = encode_region(&region);
+        old[..4].copy_from_slice(MAGIC_2);
+        let len = u32::from_le_bytes(old[4..8].try_into().unwrap()) as usize;
+        let mut raw = unpack(&old[8..], len).unwrap();
+        raw.truncate(raw.len() - 256);
+        old.truncate(4);
+        old.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        old.extend(pack(&raw));
+        let read = decode_region(&old, 0).unwrap();
+        let tile = read.chunks[0].as_deref().unwrap();
+        assert_eq!((tile.color, tile.height, tile.depth), (t.color, t.height, t.depth));
+        assert_eq!(tile.light, [0; 256]);
     }
 
     #[test]
@@ -5084,7 +5147,7 @@ mod tests {
             Shading { slopes: 0, terrain_depth: false, ..Shading::default() },
             Shading { slopes: 2, terrain_depth: false, ..Shading::default() },
         );
-        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, how)[0];
+        let at = |how, n, w| shade(LAND | 0x808080, 70, n, w, 0, how)[0];
         let flat_at = at(flat, Some(68), Some(70));
         assert_eq!(flat_at, 137, "the grade alone");
         let normal = Shading { slopes: 1, ..flat };
@@ -5096,13 +5159,33 @@ mod tests {
         assert_eq!(hard, 78);
         // Land is even from sea level up, darker below it with Terrain Depth.
         let depth = Shading { terrain_depth: true, ..flat };
-        let high = |how, y| shade(LAND | 0x808080, y, None, None, how)[0];
+        let high = |how, y| shade(LAND | 0x808080, y, None, None, 0, how)[0];
         assert_eq!(high(depth, 63), high(depth, 200));
         assert!(high(depth, 60) < high(depth, 63));
         assert_eq!(high(flat, 60), high(flat, 63));
         // Water's depth was blended in when read: graded as land here.
-        let water = |how| shade(WATER | 0x808080, 60, None, None, how)[0];
+        let water = |how| shade(WATER | 0x808080, 60, None, None, 0, how)[0];
         assert_eq!(water(flat), flat_at);
+        // Lit by the sky or block light, as Xaero's at midnight: 9 24ths
+        // in the dark, a 24th more for each level of light.
+        let night = Shading { sky: 0.0, ..flat };
+        let lit = |l| shade(LAND | 0x808080, 70, None, None, l, night)[0];
+        assert_eq!(lit(0), (137.2f32 * 9.0 / 24.0).round() as u8);
+        assert_eq!(lit(13), (137.2f32 * 22.0 / 24.0).round() as u8);
+        assert_eq!(lit(15), flat_at);
+        assert_eq!(shade(LAND | 0x808080, 70, None, None, 0, Shading { lighting: false, ..night })[0], flat_at);
+        assert_eq!(shade(LAND | 0x808080, 70, None, None, 0, Shading { sky: 15.0, ..night })[0], flat_at);
+        // The time of day reshades the surface, not cuts.
+        let mut s = State::default();
+        s.set_day_time(Some(18000));
+        assert_eq!(s.shading(Cut::Surface).sky, 0.0);
+        assert_eq!(s.shading(Cut::Below(31)).sky, 15.0);
+        let key = TileKey { cut: Cut::Surface, level: 0, x: 0, z: 0 };
+        let dark = s.tile_stamp(key);
+        s.set_day_time(Some(6000));
+        assert_ne!(s.tile_stamp(key), dark);
+        s.set_day_time(None);
+        assert_eq!(s.sky, 15.0, "no clock, no sky: day");
         // Auto waits for the timer; other modes don't.
         let mut s = State::default();
         s.want_cut(Cut::Below(31));
@@ -5273,9 +5356,12 @@ mod tests {
         assert_eq!(s.settings().zoom, 2.0);
         s.set_cut(Cut::Below(31));
         assert_eq!(s.mini_zoom(), 1.0, "closer in caves");
-        assert_eq!(daylight(6000), 1.0);
-        assert_eq!(daylight(100), 1.0, "right after sunrise");
-        assert!(daylight(18000) < 0.5);
+        assert_eq!(sky_light(6000), 15.0);
+        assert_eq!(sky_light(1000), 15.0, "after sunrise");
+        assert_eq!(sky_light(18000), 0.0);
+        // Measured from Xaero's at 12500: 5.1.
+        assert!((sky_light(12500) - 5.5).abs() <= 0.5);
+        assert!(sky_light(12000) > sky_light(12500) && sky_light(12500) > sky_light(13000));
     }
 
     #[test]
@@ -5313,6 +5399,8 @@ mod tests {
             let mut s = State::default();
             s.settings = Some(st);
             s.seed = Some(12345);
+            // Night, for Lighting.
+            s.set_day_time(Some(18000));
             s.enlarged = enlarged;
             s.tab_held = tab;
             s.set_cut(cut);
