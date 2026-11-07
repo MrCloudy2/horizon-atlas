@@ -1,9 +1,9 @@
 name = "Atlas"
-summary = "A sharp minimap, a world map of everywhere you've been and waypoints, with cave and layer modes, in the style of Xaero's mods."
+summary = "A clone of Xaero's Minimap and World Map: a sharp minimap, a world map of everywhere you've been, and waypoints."
 description = """
 ![Atlas in the game](https://raw.githubusercontent.com/MrCloudy2/horizon-atlas/main/docs/images/hero.jpg)
 
-A minimap, a world map and waypoints that share one map of the world, kept on disk per world, server and dimension.
+Atlas is meant to be a close copy of Xaero's Minimap and Xaero's World Map for Horizon: the same look, the same keys and the same settings. The minimap, the world map and the waypoints share one map of the world, kept on disk per world, server and dimension.
 
 - **Minimap**: drawn at your screen's resolution, turns with you, with entity dots that fade with height. Hold Tab for mob faces, player faces and item icons.
 - **World map (M)**: drag and zoom. B makes a waypoint under the pointer.
@@ -16,8 +16,10 @@ A minimap, a world map and waypoints that share one map of the world, kept on di
 
 ![The world map](https://raw.githubusercontent.com/MrCloudy2/horizon-atlas/main/docs/images/world-map.jpg)
 
-The look follows Xaero's Minimap and World Map, but no code or art comes from them. Built on Waypoints by Nirokx (MIT); the map columns follow Horizon's minimap (MIT).
+**What it does and doesn't do.** Atlas reads the world your client already has and draws on your screen. It writes only its own folder, `horizon-mods/.horizon-mod-data/atlas/` (settings, waypoints and maps). It opens no network connections. It sends something to the server only when you click Teleport (a `/tp` command, for operators) or Share (a chat message with the waypoint).
 
-Pinned to Horizon `f319701`: it reads the game's world directly, so a newer Nightly may need a new release. Turn off Horizon's own Minimap to avoid two maps."""
-authors = ["MrCloudy2", "Nirokx"]
+Atlas is its own code. It copies the look and features of Xaero's mods, but no code or art comes from them, and it isn't made or endorsed by Xaero. Built on Waypoints by Nirokx (MIT); the map columns follow Horizon's minimap (MIT).
+
+Checked on Horizon Nightly 2026-11-05 (`66f3981`). It reads the game's world directly, so a much newer Nightly may need a new release. Turn off Horizon's own Minimap to avoid two maps."""
+authors = ["MrCloudy2"]
 license = "MIT"
