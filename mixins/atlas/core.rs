@@ -598,15 +598,6 @@ pub struct Shading {
     pub terrain_depth: bool,
     /// Deep water is darker.
     pub transparency: bool,
-    /// Land's brightness.
-    pub gain: f32,
-    /// Water's brightness.
-    pub water_gain: f32,
-    /// How deep the shadow of a height step is: at the minimap's zoom a
-    /// softer line reads better.
-    pub edges: f32,
-    /// The same on tree tops.
-    pub leaf_edges: f32,
     /// Lit as Xaero's: by the sky and the block light.
     pub lighting: bool,
     /// The sky's light now, 0 (midnight) to 15 (day).
@@ -619,10 +610,6 @@ impl Default for Shading {
             slopes: 2,
             terrain_depth: true,
             transparency: true,
-            gain: 1.0,
-            water_gain: 1.0,
-            edges: 1.0,
-            leaf_edges: 1.0,
             lighting: true,
             sky: 15.0,
         }
@@ -664,8 +651,7 @@ pub fn shade(
     let rgb = color & RGB;
     let shadow = slope_light(height, north, north_west, step);
     let k = [0.0, 0.5, 1.0][how.slopes.min(2)];
-    let edges = if color & KIND == LEAF { how.leaf_edges } else { how.edges };
-    let slope = 1.0 + (shadow - 1.0) * k * edges;
+    let slope = 1.0 + (shadow - 1.0) * k;
     let f = if color & WALL != 0 {
         [0.38; 3]
     } else if color & KIND == WATER {
@@ -688,12 +674,11 @@ pub fn shade(
     // been fitted to it.
     let [_, r, g, b] = rgb.to_be_bytes().map(f32::from);
     let grade = [1.072, 1.102, 1.163];
-    let gain = if color & KIND == WATER { how.water_gain } else { how.gain };
     // Measured from Xaero's map at midnight, at dusk and at noon: each level
     // of light, sky or block, is a 24th, from 9 24ths in the dark, over the
     // colour as it is by day (white snow stays an even grey).
     let lit = if how.lighting { (9.0 + how.sky.max(f32::from(light.min(15)))) / 24.0 } else { 1.0 };
-    let ch = |c: f32, i: usize| ((c * grade[i] * gain * f[i]).min(255.0) * lit).round().clamp(0.0, 255.0) as u8;
+    let ch = |c: f32, i: usize| ((c * grade[i] * f[i]).min(255.0) * lit).round().clamp(0.0, 255.0) as u8;
     [ch(r, 0), ch(g, 1), ch(b, 2), 255]
 }
 
@@ -1071,13 +1056,6 @@ pub const MINI: usize = 128;
 pub const MINI_MAX: usize = 1024;
 /// A block on the minimap at zoom 1, in screen pixels, as Xaero draws it.
 pub const PIXELS_PER_BLOCK: f32 = 1.0;
-/// The minimap's land against the world map's. Xaero's minimap sand was
-/// `d8d4b0`; this keeps it there until the minimap is measured at noon in
-/// the test scene as the world map was.
-const MINI_LAND_GAIN: f32 = 0.945;
-/// The same for water: about what it was before the world map's water was
-/// fitted.
-const MINI_WATER_GAIN: f32 = 0.7;
 
 /// How the minimap's edge looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2922,13 +2900,9 @@ impl State {
             self.shade_cache.clear();
             self.shade_cut = Some(cut);
         }
-        let how = Shading {
-            gain: MINI_LAND_GAIN,
-            water_gain: MINI_WATER_GAIN,
-            edges: 0.6,
-            leaf_edges: 0.3,
-            ..self.shading(cut)
-        };
+        // Xaero's minimap is coloured as its world map, block for block
+        // (measured at noon and at midnight).
+        let how = self.shading(cut);
         let store = self.maps.store(cut);
         let cache = &mut self.shade_cache;
         // Rows of texels stay in one chunk for a while: remember the last.
