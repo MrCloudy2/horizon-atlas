@@ -459,6 +459,10 @@ pub enum Action {
     Teleport(usize),
     /// The next map mode (Auto, Cave, Layer).
     CycleMapMode,
+    /// The world map shows the next dimension's map.
+    CycleMapDimension,
+    /// Every waypoint of the set off, or all on again when none is on.
+    ToggleAll,
     /// The Layer mode's height up or down a block (16 with Shift).
     LayerStep(i32),
 }
@@ -1406,6 +1410,8 @@ settings! {
     light_level: i32 = 1, "light_level", "Light Overlay Below Level", Overlay,
         Kind::Slider { min: 1, max: 15, div: 1, unit: "", zero: None };
     slime: bool = false, "slime", "Slime Chunks", Overlay, Kind::Toggle;
+    portals: bool = false, "portals", "Portal Highlights", Overlay, Kind::Toggle;
+    view_square: bool = false, "view_distance", "Server View Distance", Overlay, Kind::Toggle;
 
     coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
     biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
@@ -1442,6 +1448,7 @@ settings! {
     keep_deathpoints: bool = true, "keep_deathpoints", "Keep Old Deathpoints", Waypoints, Kind::Toggle;
     delete_reached: bool = true, "delete_reached", "Delete Reached Deathpoints", Waypoints, Kind::Toggle;
     cross_dim_tp: bool = true, "cross_dim_tp", "Cross-Dimensional TP", Waypoints, Kind::Toggle;
+    ow_in_nether: bool = false, "ow_in_nether", "Overworld Waypoints in Nether", Waypoints, Kind::Toggle;
     new_to_bottom: bool = false, "new_to_bottom", "New Waypoints to Bottom", Waypoints, Kind::Toggle;
     hide_coords: bool = false, "hide_coords", "Hide Waypoint Coordinates", Waypoints, Kind::Toggle;
     max_render: i32 = 0, "max_render", "Max WP Render Dist.", Waypoints,
@@ -1831,6 +1838,55 @@ pub fn tint_slime(grid: &MiniGrid, round: bool, seed: i64, image: &mut [u8]) {
     }
 }
 
+/// A portal highlight's colour: purple for a Nether portal (XaeroPlus's
+/// default), teal for an End portal or gateway.
+pub fn portal_rgb(kinds: u8) -> u32 {
+    if kinds & NETHER_PORTAL != 0 { 0xA0_40FF } else { 0x30_E0C0 }
+}
+
+/// Tints the chunks holding portals on a composed minimap image.
+pub fn tint_portals(grid: &MiniGrid, portals: &HashMap<(i32, i32), u8>, image: &mut [u8]) {
+    let n = grid.n;
+    for j in 0..n {
+        for i in 0..n {
+            let o = (j * n + i) * 4;
+            if image.len() < o + 4 || image[o + 3] == 0 {
+                continue;
+            }
+            let (x, z) = grid.block(i, j);
+            if let Some(&kinds) = portals.get(&(x >> 4, z >> 4)) {
+                let c = portal_rgb(kinds);
+                tint(image, o, [(c >> 16) as u16, (c >> 8 & 255) as u16, (c & 255) as u16]);
+            }
+        }
+    }
+}
+
+/// Draws the edge of the square of chunks `radius` around chunk `centre`
+/// (the server's view distance) on a composed minimap image.
+pub fn tint_square(grid: &MiniGrid, centre: (i32, i32), radius: i32, image: &mut [u8]) {
+    let (x0, z0) = ((centre.0 - radius) * 16, (centre.1 - radius) * 16);
+    let (x1, z1) = ((centre.0 + radius + 1) * 16 - 1, (centre.1 + radius + 1) * 16 - 1);
+    let w = (grid.bpp.ceil() as i32).clamp(1, 8);
+    let n = grid.n;
+    for j in 0..n {
+        for i in 0..n {
+            let o = (j * n + i) * 4;
+            if image.len() < o + 4 || image[o + 3] == 0 {
+                continue;
+            }
+            let (x, z) = grid.block(i, j);
+            let inside = x >= x0 && x <= x1 && z >= z0 && z <= z1;
+            let edge = x < x0 + w || x > x1 - w || z < z0 + w || z > z1 - w;
+            if inside && edge {
+                for k in 0..3 {
+                    image[o + k] = 255;
+                }
+            }
+        }
+    }
+}
+
 /// Mixes `rgb` two fifths into texel `o` of an image.
 fn tint(image: &mut [u8], o: usize, rgb: [u16; 3]) {
     for (k, c) in rgb.into_iter().enumerate() {
@@ -1875,6 +1931,10 @@ pub struct MiniKey {
     pub n: usize,
     pub grid: (usize, i32),
     pub light: Option<i32>,
+    /// The portals' revision, when they show.
+    pub portals: Option<u64>,
+    /// The view distance square: the player's chunk and the radius.
+    pub square: Option<(i32, i32, i32)>,
 }
 
 // ---- The world map -----------------------------------------------------------------
@@ -2055,13 +2115,70 @@ impl MapImages {
     }
 }
 
+/// Kinds of portal a chunk holds (`Portals`), a bit each.
+pub const NETHER_PORTAL: u8 = 1;
+pub const END_PORTAL: u8 = 2;
+pub const END_GATEWAY: u8 = 4;
+
+/// The chunks seen holding portals, and which kinds: kept per dimension in
+/// its map folder, as XaeroPlus's portal highlights are.
+#[derive(Debug, Default)]
+pub struct Portals {
+    pub chunks: HashMap<(i32, i32), u8>,
+    /// Changes when a chunk is added or dropped.
+    pub revision: u64,
+    dirty: bool,
+}
+
+const PORTALS_FILE: &str = "portals.txt";
+
+impl Portals {
+    /// `cx cz kinds` a line.
+    pub fn decode(text: &str) -> Self {
+        let chunks = text
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace().map(str::parse::<i32>);
+                let (cx, cz, k) = (f.next()?.ok()?, f.next()?.ok()?, f.next()?.ok()?);
+                let k = u8::try_from(k).ok().filter(|k| *k != 0)?;
+                Some(((cx, cz), k))
+            })
+            .collect();
+        Portals { chunks, ..Portals::default() }
+    }
+
+    pub fn encode(&self) -> String {
+        let mut rows: Vec<_> = self.chunks.iter().collect();
+        rows.sort();
+        rows.iter().map(|((x, z), k)| format!("{x} {z} {k}\n")).collect()
+    }
+
+    /// Chunk `chunk` was scanned and holds `kinds` (0: none): true when that
+    /// changed what is known.
+    pub fn put(&mut self, chunk: (i32, i32), kinds: u8) -> bool {
+        let before = self.chunks.get(&chunk).copied().unwrap_or(0);
+        if before == kinds {
+            return false;
+        }
+        if kinds == 0 {
+            self.chunks.remove(&chunk);
+        } else {
+            self.chunks.insert(chunk, kinds);
+        }
+        self.revision += 1;
+        self.dirty = true;
+        true
+    }
+}
+
 /// The map columns of every cut of one world's dimension, each cut in its
-/// own folder under `dir`.
+/// own folder under `dir`, and the portals seen there.
 #[derive(Debug, Default)]
 pub struct Maps {
     pub dir: Option<PathBuf>,
     stores: HashMap<Cut, Store>,
     next_revision: u64,
+    pub portals: Portals,
 }
 
 /// The most cuts kept open at once.
@@ -2075,7 +2192,39 @@ impl Maps {
         }
         self.save();
         self.stores.clear();
+        let revision = self.portals.revision + 1;
+        self.portals = dir
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join(PORTALS_FILE)).ok())
+            .map(|t| Portals::decode(&t))
+            .unwrap_or_default();
+        self.portals.revision = revision;
         self.dir = dir;
+    }
+
+    /// The cut folder of this dimension holding the most map, else the
+    /// surface: what a map of a dimension the player isn't in shows.
+    pub fn fullest_cut(&self) -> Cut {
+        let Some(dir) = &self.dir else {
+            return Cut::Surface;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Cut::Surface;
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let cut = if name == "surface" {
+                    Cut::Surface
+                } else {
+                    Cut::Below(name.strip_prefix("below")?.parse().ok()?)
+                };
+                let size: u64 = std::fs::read_dir(e.path()).ok()?.flatten().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
+                Some((size, cut))
+            })
+            .max_by_key(|(size, cut)| (*size, *cut == Cut::Surface))
+            .map_or(Cut::Surface, |(_, cut)| cut)
     }
     /// The store of `cut`, opened the first time.
     pub fn store(&mut self, cut: Cut) -> &mut Store {
@@ -2103,11 +2252,26 @@ impl Maps {
         self.next_revision = self.next_revision.max(st.next_revision);
         st
     }
-    /// Writes what changed of every cut: true when all of it was.
+    /// Writes what changed of every cut, and the portals: true when all of
+    /// it was.
     pub fn save(&mut self) -> bool {
         let mut all = true;
         for st in self.stores.values_mut() {
             all &= st.save();
+        }
+        if self.portals.dirty
+            && let Some(dir) = &self.dir
+        {
+            let tmp = dir.join("portals.txt.tmp");
+            let done = std::fs::create_dir_all(dir)
+                .and_then(|()| std::fs::write(&tmp, self.portals.encode()))
+                .and_then(|()| std::fs::rename(&tmp, dir.join(PORTALS_FILE)));
+            if done.is_ok() {
+                self.portals.dirty = false;
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+                all = false;
+            }
         }
         all
     }
@@ -2198,6 +2362,13 @@ pub struct State {
     pub last_save: Option<Instant>,
     /// The camera this frame is drawn from: position, yaw, pitch.
     pub frame_camera: Option<([f64; 3], f32, f32)>,
+    /// The dimension the world map shows when it isn't the player's, its
+    /// maps (only read), and the cut shown of them.
+    pub map_shown: Option<String>,
+    pub other_maps: Maps,
+    pub other_cut: Cut,
+    /// The server's view distance in chunks, as it last said.
+    pub view_distance: Option<i32>,
 }
 
 impl Default for State {
@@ -2250,6 +2421,10 @@ impl Default for State {
             mouse: [0.0; 2],
             last_save: None,
             frame_camera: None,
+            map_shown: None,
+            other_maps: Maps::default(),
+            other_cut: Cut::Surface,
+            view_distance: None,
         }
     }
 }
@@ -2474,6 +2649,24 @@ fn centre(w: &Waypoint) -> [f64; 3] {
         f64::from(w.pos[1]) + 0.5,
         f64::from(w.pos[2]) + 0.5,
     ]
+}
+
+/// Blocks of `to` a block of `from` spans across: 8 from the Overworld to
+/// the Nether, 1/8 back, None between the End and the rest.
+fn dimension_scale(from: &str, to: &str) -> Option<f64> {
+    match (from, to) {
+        _ if from == to => Some(1.0),
+        (OVERWORLD, NETHER) => Some(1.0 / 8.0),
+        (NETHER, OVERWORLD) => Some(8.0),
+        _ => None,
+    }
+}
+
+/// Where a point `at` of dimension `from` is in dimension `to` (x and z
+/// scaled, y kept), if it has a place there.
+pub fn convert(at: [f64; 3], from: &str, to: &str) -> Option<[f64; 3]> {
+    let k = dimension_scale(from, to)?;
+    Some([at[0] * k, at[1], at[2] * k])
 }
 
 
@@ -2730,6 +2923,8 @@ impl State {
         }
         self.maps.open(dir);
         self.map_dimension = dimension;
+        self.map_shown = None;
+        self.other_maps.open(None);
         self.scans.clear();
         self.shade_cache.clear();
         self.images.clear();
@@ -2856,6 +3051,12 @@ impl State {
 
     /// Forgets the scans of chunks more than `radius` chunks from `centre`
     /// (they are rescanned when they load again).
+    /// Chunk `chunk` of the player's dimension holds portals of `kinds`
+    /// (0: none).
+    pub fn put_portals(&mut self, chunk: (i32, i32), kinds: u8) {
+        self.maps.portals.put(chunk, kinds);
+    }
+
     pub fn forget_far_scans(&mut self, centre: (i32, i32), radius: i32) {
         if self.scans.len() < 4096 {
             return;
@@ -2911,6 +3112,8 @@ impl State {
             undiscovered: st.undiscovered,
             grid: (st.chunk_grid, st.grid_width),
             light: st.light_overlay.then_some(st.light_level),
+            portals: st.portals.then_some(self.maps.portals.revision),
+            square: self.view_distance.filter(|_| st.view_square).map(|vd| (bx >> 4, bz >> 4, vd)),
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
             return false;
@@ -2941,6 +3144,12 @@ impl State {
         }
         if st.chunk_grid > 0 {
             tint_grid(&grid, st.chunk_grid, st.grid_width, &mut self.mini_image);
+        }
+        if st.portals {
+            tint_portals(&grid, &self.maps.portals.chunks, &mut self.mini_image);
+        }
+        if let Some((cx, cz, vd)) = key.square {
+            tint_square(&grid, (cx, cz), vd, &mut self.mini_image);
         }
         if st.light_overlay {
             let store = self.maps.store(cut);
@@ -2981,11 +3190,12 @@ impl State {
 
     /// The create form, filled in with block `block` of `dimension`.
     pub fn open_create_at(&mut self, block: [i32; 3], dimension: &str, back: Back, skip: Option<char>) {
+        let (block, dimension) = self.new_home(block, dimension);
         self.mode = Mode::Edit(Editor {
             index: None,
             name: self.default_name(),
             coords: block.map(|v| v.to_string()),
-            dimension: dimension.to_owned(),
+            dimension,
             color: PALETTE[self.waypoints.len() % PALETTE.len()],
             hidden: false,
             focus: Field::Name,
@@ -3062,7 +3272,7 @@ impl State {
         if let Some(h) = here
             && self.map.follow
         {
-            self.map.centre = [h.pos[0], h.pos[2]];
+            self.centre_on(h);
         }
     }
 
@@ -3166,6 +3376,27 @@ impl State {
         }
     }
 
+    /// Where waypoint `w` shows in `dimension`: its block centre there, or
+    /// None. With Overworld Waypoints in Nether, the Overworld's show in the
+    /// Nether too, at an eighth of their coordinates.
+    fn spot(&self, w: &Waypoint, dimension: &str) -> Option<[f64; 3]> {
+        if w.dimension == dimension {
+            return Some(centre(w));
+        }
+        let crossed = self.settings().ow_in_nether && w.dimension == OVERWORLD && dimension == NETHER;
+        crossed.then(|| convert(centre(w), OVERWORLD, NETHER)).flatten()
+    }
+
+    /// Where a new waypoint at `block` of `dimension` goes: with Overworld
+    /// Waypoints in Nether, one made in the Nether is the Overworld's, at
+    /// eight times its coordinates.
+    fn new_home(&self, block: [i32; 3], dimension: &str) -> ([i32; 3], String) {
+        if self.settings().ow_in_nether && dimension == NETHER {
+            return ([block[0] * 8, block[1], block[2] * 8], OVERWORLD.to_owned());
+        }
+        (block, dimension.to_owned())
+    }
+
     /// Whether a waypoint shows on the maps and in the world.
     fn shows(&self, w: &Waypoint) -> bool {
         let st = self.settings();
@@ -3189,10 +3420,11 @@ impl State {
     /// A temporary waypoint where the player stands.
     pub fn add_temporary(&mut self, here: &Here) {
         let n = self.waypoints.iter().filter(|w| w.kind == WpKind::Temporary).count() + 1;
+        let (pos, dimension) = self.new_home(here.pos.map(|v| v.floor() as i32), &here.dimension);
         self.add_waypoint(Waypoint {
             name: format!("Temp {n}"),
-            pos: here.pos.map(|v| v.floor() as i32),
-            dimension: here.dimension.clone(),
+            pos,
+            dimension,
             color: 0xFFFF55,
             set: self.set.clone(),
             kind: WpKind::Temporary,
@@ -3327,6 +3559,18 @@ impl State {
                 }
             }
             Action::FocusFilter => self.filter_focus = true,
+            Action::CycleMapDimension => {
+                let next = next_dimension(&self.shown_dimension());
+                self.show_dimension(next, here);
+            }
+            Action::ToggleAll => {
+                let set = self.set.clone();
+                let hide = self.waypoints.iter().any(|w| w.set == set && !w.hidden);
+                for w in self.waypoints.iter_mut().filter(|w| w.set == set) {
+                    w.hidden = hide;
+                }
+                self.persist();
+            }
             Action::AddEdit => match self.selected {
                 Some(i) => self.open_edit(i, Back::List),
                 None => {
@@ -3399,7 +3643,7 @@ impl State {
             Action::Centre => {
                 self.map.follow = true;
                 if let Some(h) = here {
-                    self.map.centre = [h.pos[0], h.pos[2]];
+                    self.centre_on(h);
                 }
             }
         }
@@ -3634,11 +3878,64 @@ impl State {
         }
     }
 
+    /// The world map's centre on the player, where they would be in the
+    /// dimension it shows (the End and the rest: where it already looks).
+    fn centre_on(&mut self, h: &Here) {
+        if let Some(at) = convert(h.pos, &h.dimension, &self.shown_dimension()) {
+            self.map.centre = [at[0], at[2]];
+        }
+    }
+
+    /// The dimension the world map shows.
+    pub fn shown_dimension(&self) -> String {
+        self.map_shown.clone().or_else(|| self.map_dimension.clone()).unwrap_or_else(|| OVERWORLD.to_owned())
+    }
+
+    /// The cut the world map shows: the player's, or the other
+    /// dimension's fullest.
+    pub fn map_cut(&self) -> Cut {
+        if self.map_shown.is_some() { self.other_cut } else { self.cut }
+    }
+
+    /// The maps of the dimension the world map shows.
+    fn view_maps(&mut self) -> &mut Maps {
+        if self.map_shown.is_some() { &mut self.other_maps } else { &mut self.maps }
+    }
+
+    /// The world map shows dimension `to` (the player's own: follows them
+    /// again), centred where the player would be there.
+    pub fn show_dimension(&mut self, to: &str, here: Option<&Here>) {
+        let own = self.map_dimension.clone().unwrap_or_else(|| OVERWORLD.to_owned());
+        let from = self.shown_dimension();
+        if to == from {
+            return;
+        }
+        if to == own {
+            self.map_shown = None;
+            self.other_maps.open(None);
+            self.map.follow = true;
+        } else {
+            let dir = match (&self.dir, &self.world) {
+                (Some(d), Some(w)) => Some(map_dir(d, w, to)),
+                _ => None,
+            };
+            self.other_maps.open(dir);
+            self.other_cut = self.other_maps.fullest_cut();
+            self.map_shown = Some(to.to_owned());
+            self.map.follow = false;
+            let player = here.map_or([self.map.centre[0], 64.0, self.map.centre[1]], |h| h.pos);
+            let at = convert(player, &own, to).unwrap_or([0.0; 3]);
+            self.map.centre = [at[0], at[2]];
+        }
+        // Images are keyed by cut and place, not dimension.
+        self.images.clear();
+    }
+
     /// A number that changes when what world map image `key` shows does.
     pub fn tile_stamp(&mut self, key: TileKey) -> u64 {
         let [x0, z0, x1, z1] = key.blocks();
         let sky = self.shading(key.cut).sky.to_bits();
-        self.maps.store(key.cut).stamp(x0, z0, x1, z1) ^ u64::from(sky) << 40
+        self.view_maps().store(key.cut).stamp(x0, z0, x1, z1) ^ u64::from(sky) << 40
     }
 
     /// The day time `ticks` now, None where there is no sky (or no clock):
@@ -3663,7 +3960,7 @@ impl State {
     pub fn compose_tile(&mut self, key: TileKey) -> Vec<u8> {
         let mut out = Vec::new();
         let how = self.shading(key.cut);
-        compose_map_tile(self.maps.store(key.cut), key, how, &mut out);
+        compose_map_tile(self.view_maps().store(key.cut), key, how, &mut out);
         out
     }
 
@@ -3672,9 +3969,9 @@ impl State {
     pub fn map_block(&mut self, at: [f32; 2], here: Option<&Here>) -> [i32; 3] {
         let [x, z] = self.map.world(at, self.screen_size);
         let (x, z) = (x.floor() as i32, z.floor() as i32);
-        let cut = self.cut;
+        let cut = self.map_cut();
         let y = self
-            .maps
+            .view_maps()
             .store(cut)
             .column(x, z)
             .filter(|c| c.0 & KIND != 0)
@@ -3686,9 +3983,10 @@ impl State {
 
     /// The create form for the block under the world map's pointer.
     fn create_at_pointer(&mut self, at: [f32; 2], here: Option<&Here>, skip: Option<char>) {
-        let Some(dimension) = here.map(|h| h.dimension.clone()) else {
+        if here.is_none() {
             return;
-        };
+        }
+        let dimension = self.shown_dimension();
         let block = self.map_block(at, here);
         self.open_create_at(block, &dimension, Back::Map, skip);
     }
@@ -3732,23 +4030,24 @@ impl State {
             return Vec::new();
         }
         let view = basis(camera.yaw, camera.pitch);
-        let mut shown: Vec<(f64, [f32; 2], &Waypoint)> = self
+        let mut shown: Vec<(f64, [f32; 2], &Waypoint, [f64; 3])> = self
             .waypoints
             .iter()
-            .filter(|w| self.shows(w) && w.dimension == dimension)
+            .filter(|w| self.shows(w))
             .filter_map(|w| {
-                let d = distance(player, centre(w));
+                let spot = self.spot(w, dimension)?;
+                let d = distance(player, spot);
                 if d < f64::from(st.min_render) || (st.max_render > 0 && d > f64::from(st.max_render)) {
                     return None;
                 }
-                let at = project(camera.pos, view, camera.fov, centre(w), size)?;
+                let at = project(camera.pos, view, camera.fov, spot, size)?;
                 let on_screen = at[0] >= 0.0 && at[0] <= size[0] && at[1] >= 0.0 && at[1] <= size[1];
-                on_screen.then_some((d, at, w))
+                on_screen.then_some((d, at, w, spot))
             })
             .collect();
         shown.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut draws = Vec::new();
-        for (d, [x, y], w) in shown {
+        for (d, [x, y], w, spot) in shown {
             // As Xaero's: a see-through square of its colour with its
             // letter, its name small under it, and its distance while it is
             // looked at, placed to the sub-pixel so they glide as the view
@@ -3765,8 +4064,7 @@ impl State {
             draws.push(Draw::Label(letter, [x - lw / 2.0 + 0.4, y - 3.6 * ls], a(0xFF) | ink_on(color), ls, false));
 
             let looking = {
-                let c = centre(w);
-                let to = sub(c, camera.pos);
+                let to = sub(spot, camera.pos);
                 let flat = (to[0] * to[0] + to[2] * to[2]).sqrt().max(1e-6);
                 let yaw_to = (-to[0]).atan2(to[2]).to_degrees();
                 let pitch_to = (-to[1]).atan2(flat).to_degrees();
@@ -4081,10 +4379,13 @@ impl State {
         }
 
         // Waypoints: their letter on their colour, on the edge when far.
-        let marks = self.waypoints.iter().filter(|w| st.on_map && self.shows(w) && w.dimension == here.dimension);
+        let marks = self
+            .waypoints
+            .iter()
+            .filter(|w| st.on_map && self.shows(w))
+            .filter_map(|w| Some((w, self.spot(w, &here.dimension)?)));
         let map_alpha = st.map_opacity.clamp(0, 100) as u32 * 255 / 100;
-        for w in marks {
-            let c = centre(w);
+        for (w, c) in marks {
             if let Some((p, _)) = place(c[0] - here.pos[0], c[2] - here.pos[2], true) {
                 letter_marker(&mut draws, p, w, 4.0 * st.map_scale, false, map_alpha);
             }
@@ -4203,24 +4504,29 @@ impl State {
         if let Some(h) = here
             && self.map.follow
         {
-            self.map.centre = [h.pos[0], h.pos[2]];
+            self.centre_on(h);
         }
         out.fill([0.0, 0.0, size[0], size[1]], MAP_VOID);
-        for (key, dst) in self.map.tiles(size, self.cut) {
+        for (key, dst) in self.map.tiles(size, self.map_cut()) {
             if let Some(&slot) = self.images.slots.get(&key) {
                 let t = MAP_TEXELS as f32;
                 out.draws.push(Draw::Image(slot, [0.0, 0.0, t, t], dst, 0xFFFF_FFFF));
             }
         }
-        let dimension = here.map(|h| h.dimension.as_str()).unwrap_or(OVERWORLD);
+        let dimension = self.shown_dimension();
+        // The player, where they would be in the dimension shown.
+        let player = here.and_then(|h| Some((convert(h.pos, &h.dimension, &dimension)?, h.yaw)));
+        self.draw_map_overlays(out, size, player.map(|p| p.0));
 
         // Waypoints: their letter, and their name over it.
         let mut hot = None;
         for (i, w) in self.waypoints.iter().enumerate() {
-            if w.dimension != dimension || (w.hidden && !live) || !(w.hidden || self.shows(w)) {
+            if (w.hidden && !live) || !(w.hidden || self.shows(w)) {
                 continue;
             }
-            let c = centre(w);
+            let Some(c) = self.spot(w, &dimension) else {
+                continue;
+            };
             let at = self.map.screen(c[0], c[2], size);
             if at[0] < -40.0 || at[1] < -20.0 || at[0] > size[0] + 40.0 || at[1] > size[1] + 20.0 {
                 continue;
@@ -4243,10 +4549,10 @@ impl State {
             }
         }
 
-        if let Some(h) = here {
-            let at = self.map.screen(h.pos[0], h.pos[2], size);
+        if let Some((pos, yaw)) = player {
+            let at = self.map.screen(pos[0], pos[2], size);
             let st = self.settings();
-            arrow(&mut out.draws, at, 180.0 + h.yaw, 10.0 * st.arrow_scale, st.arrow_argb());
+            arrow(&mut out.draws, at, 180.0 + yaw, 10.0 * st.arrow_scale, st.arrow_argb());
         }
 
         // Top left: the scale (pixels a block).
@@ -4256,14 +4562,31 @@ impl State {
         // Top centre: the block under the pointer.
         if live {
             let [bx, by, bz] = self.map_block(out.mouse, here);
-            let at = format!("X: {bx}  Y: {by}  Z: {bz}");
+            let mut at = format!("X: {bx}  Y: {by}  Z: {bz}");
+            // The same place in the paired dimension, as XaeroPlus's.
+            let other = match dimension.as_str() {
+                OVERWORLD => Some(("Nether", bx.div_euclid(8), bz.div_euclid(8))),
+                NETHER => Some(("Overworld", bx * 8, bz * 8)),
+                _ => None,
+            };
+            if let Some((name, x, z)) = other {
+                at += &format!("   {name}: {x}, {z}");
+            }
             let w = out.width(&at);
             out.text(&at, [((size[0] - w) / 2.0).round(), 4.0], INK);
         }
-        if self.cut != Cut::Surface {
-            let cut = self.cut.label();
-            let w = out.width(&cut);
-            out.text(&cut, [((size[0] - w) / 2.0).round(), 15.0], MUTED);
+        let cut = self.map_cut();
+        let mut under = Vec::new();
+        if self.map_shown.is_some() {
+            under.push(dimension_label(&dimension));
+        }
+        if cut != Cut::Surface {
+            under.push(cut.label());
+        }
+        if !under.is_empty() {
+            let line = under.join(", ");
+            let w = out.width(&line);
+            out.text(&line, [((size[0] - w) / 2.0).round(), 15.0], MUTED);
         }
 
         // Top right: the compass rose.
@@ -4281,6 +4604,7 @@ impl State {
             buttons.push(("-".into(), Action::LayerStep(-1)));
         }
         buttons.push((format!("Mode: {}", st.mode.label()), Action::CycleMapMode));
+        buttons.push((dimension_label(&dimension), Action::CycleMapDimension));
         buttons.push(("Settings".into(), Action::GoPage(Page::Main)));
         let mut x = size[0] - 4.0;
         let by = size[1] - 18.0;
@@ -4299,6 +4623,50 @@ impl State {
         };
         let hint = out.fit(&hint, x - 8.0);
         out.text(&hint, [4.0, size[1] - 14.0], MUTED);
+    }
+
+    /// The world map's portal highlights and the server's view distance
+    /// around `player` (where they are in the dimension shown).
+    fn draw_map_overlays(&mut self, out: &mut Out<'_>, size: [f32; 2], player: Option<[f64; 3]>) {
+        let st = self.settings();
+        let chunk_rect = |map: &MapView, x0: i32, z0: i32, x1: i32, z1: i32| {
+            let a = map.screen(f64::from(x0) * 16.0, f64::from(z0) * 16.0, size);
+            let b = map.screen(f64::from(x1 + 1) * 16.0, f64::from(z1 + 1) * 16.0, size);
+            [a[0], a[1], b[0] - a[0], b[1] - a[1]]
+        };
+        if st.portals {
+            let [x0, z0] = self.map.world([0.0, 0.0], size);
+            let [x1, z1] = self.map.world(size, size);
+            let (cx0, cz0, cx1, cz1) = ((x0 as i32 >> 4) - 1, (z0 as i32 >> 4) - 1, (x1 as i32 >> 4) + 1, (z1 as i32 >> 4) + 1);
+            let map = self.map.clone();
+            for (&(cx, cz), &kinds) in &self.view_maps().portals.chunks {
+                if cx < cx0 || cx > cx1 || cz < cz0 || cz > cz1 {
+                    continue;
+                }
+                let mut r = chunk_rect(&map, cx, cz, cx, cz);
+                // At least 3 pixels, so they show zoomed far out.
+                for k in 0..2 {
+                    if r[k + 2] < 3.0 {
+                        r[k] -= (3.0 - r[k + 2]) / 2.0;
+                        r[k + 2] = 3.0;
+                    }
+                }
+                out.fill(r, 0x9000_0000 | portal_rgb(kinds));
+            }
+        }
+        if st.view_square
+            && let (Some(p), Some(vd)) = (player, self.view_distance)
+            && self.map_shown.is_none()
+        {
+            let (cx, cz) = ((p[0].floor() as i32) >> 4, (p[2].floor() as i32) >> 4);
+            let r = chunk_rect(&self.map, cx - vd, cz - vd, cx + vd, cz + vd);
+            let w = 1.0;
+            let c = 0xC0FF_FFFF;
+            out.fill([r[0], r[1], r[2], w], c);
+            out.fill([r[0], r[1] + r[3] - w, r[2], w], c);
+            out.fill([r[0], r[1], w, r[3]], c);
+            out.fill([r[0] + r[2] - w, r[1], w, r[3]], c);
+        }
     }
 
     /// The settings screen, laid out as Xaero's: the title and page number,
@@ -4428,6 +4796,9 @@ impl State {
             out.text(&t, [frect[0] + 3.0, frect[1] + 3.0], INK);
         }
         out.widgets.push(Widget { rect: frect, action: Action::FocusFilter });
+        // As XaeroPlus's: the whole set off or on at once.
+        let all = if self.waypoints.iter().any(|w| w.set == self.set && !w.hidden) { "Disable All" } else { "Enable All" };
+        mc_button(out, [frect[0] + frect[2] + 4.0, 50.0, 62.0, 15.0], all, Some(Action::ToggleAll));
 
         let wanted = self.list_filter.trim().to_lowercase();
         let rows: Vec<usize> = self
@@ -4937,6 +5308,150 @@ mod tests {
         let tile = read.chunks[0].as_deref().unwrap();
         assert_eq!((tile.color, tile.height, tile.depth), (t.color, t.height, t.depth));
         assert_eq!(tile.light, [0; 256]);
+    }
+
+    #[test]
+    fn overworld_waypoints_show_in_the_nether_at_an_eighth() {
+        let mut s = State { settings: Some(Settings { ow_in_nether: true, ..Settings::default() }), ..State::default() };
+        let base = Waypoint { name: "Base".into(), pos: [800, 70, -160], ..Waypoint::default() };
+        s.waypoints.push(base.clone());
+        assert_eq!(s.spot(&base, NETHER), Some([100.0625, 70.5, -19.9375]));
+        assert_eq!(s.spot(&base, OVERWORLD), Some([800.5, 70.5, -159.5]));
+        assert_eq!(s.spot(&base, END), None);
+        // It is drawn in the Nether's world, where it stands there.
+        let camera = Camera { pos: [100.5, 71.6, -10.0], yaw: 180.0, pitch: 0.0, fov: 70.0 };
+        let labels = s.labels(camera, [100.5, 70.0, -10.0], NETHER, [480.0, 270.0], &measure);
+        assert!(!labels.is_empty());
+        // One made in the Nether is the Overworld's, eight times as far.
+        let h = Here { pos: [10.5, 64.0, -3.5], dimension: NETHER.into(), yaw: 0.0 };
+        s.open_create(&h, Back::Game, None);
+        let Mode::Edit(e) = &s.mode else { panic!() };
+        assert_eq!((e.coords.clone(), e.dimension.as_str()), (["80", "64", "-32"].map(String::from), OVERWORLD));
+        // Off, the Nether shows only its own.
+        s.settings = Some(Settings::default());
+        assert_eq!(s.spot(&base, NETHER), None);
+        assert!(s.labels(camera, [100.5, 70.0, -10.0], NETHER, [480.0, 270.0], &measure).is_empty());
+    }
+
+    #[test]
+    fn disable_all_turns_the_set_off_then_on() {
+        let mut s = State::default();
+        for (name, set) in [("a", DEFAULT_SET), ("b", DEFAULT_SET), ("c", "other")] {
+            s.waypoints.push(Waypoint { name: name.into(), set: set.into(), ..Waypoint::default() });
+        }
+        s.waypoints[1].hidden = true;
+        s.act(Action::ToggleAll, None);
+        assert_eq!(s.waypoints.iter().map(|w| w.hidden).collect::<Vec<_>>(), [true, true, false]);
+        s.act(Action::ToggleAll, None);
+        assert_eq!(s.waypoints.iter().map(|w| w.hidden).collect::<Vec<_>>(), [false, false, false]);
+        // The list has the button.
+        s.open_list(None);
+        let (_, w) = s.screen([480.0, 270.0], [0.0, 0.0], None, &measure);
+        assert!(w.iter().any(|x| x.action == Action::ToggleAll));
+    }
+
+    #[test]
+    fn portals_are_kept_per_dimension_and_highlighted() {
+        let dir = std::env::temp_dir().join(format!("atlas-test-portals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut maps = Maps::default();
+        maps.open(Some(dir.clone()));
+        assert!(maps.portals.put((3, -2), NETHER_PORTAL));
+        assert!(!maps.portals.put((3, -2), NETHER_PORTAL), "the same again is no change");
+        assert!(maps.portals.put((-40, 7), END_GATEWAY | END_PORTAL));
+        assert!(maps.portals.put((9, 9), NETHER_PORTAL));
+        // A portal broken: the chunk is scanned again with none.
+        assert!(maps.portals.put((9, 9), 0));
+        assert!(maps.save());
+        let mut again = Maps::default();
+        again.open(Some(dir.clone()));
+        assert_eq!(again.portals.chunks, HashMap::from([((3, -2), NETHER_PORTAL), ((-40, 7), END_GATEWAY | END_PORTAL)]));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Bad lines are skipped.
+        assert_eq!(Portals::decode("1 2 1\nx 3 1\n4 5 0\n").chunks.len(), 1);
+
+        // The minimap tints a portal's chunk and redraws when one is found.
+        let mut s = State { settings: Some(Settings { portals: true, ..Settings::default() }), ..State::default() };
+        s.maps.store(Cut::Surface).put(0, 0, grass(64));
+        s.update_minimap(8.0, 8.0, 0.0);
+        let before = s.mini_image.clone();
+        s.put_portals((0, 0), NETHER_PORTAL);
+        assert!(s.update_minimap(8.0, 8.0, 0.0), "a new portal redraws it");
+        assert_ne!(s.mini_image, before);
+        // The world map fills its chunk.
+        let h = here(OVERWORLD);
+        s.open_map(Some(&h), None);
+        let (draws, _) = s.screen([400.0, 200.0], [0.0, 0.0], Some(&h), &measure);
+        assert!(draws.iter().any(|d| matches!(d, Draw::Fill(_, c) if c & RGB == portal_rgb(NETHER_PORTAL))));
+    }
+
+    #[test]
+    fn the_view_distance_square_edges_its_chunks() {
+        let grid = mini_grid(8.0, 8.0, 0.0, false, 1.0, 120);
+        let mut image = vec![100u8; 120 * 120 * 4];
+        tint_square(&grid, (0, 0), 1, &mut image);
+        let at = |x: i32, z: i32| {
+            let (i, j) = (0..120).flat_map(|j| (0..120).map(move |i| (i, j))).find(|&(i, j)| grid.block(i, j) == (x, z)).unwrap();
+            image[(j * 120 + i) * 4]
+        };
+        // The square is chunks -1..=1: blocks -16..=31.
+        assert_eq!(at(-16, 0), 255);
+        assert_eq!(at(31, 5), 255);
+        assert_eq!(at(5, -16), 255);
+        assert_eq!(at(0, 0), 100);
+        assert_eq!(at(-17, 0), 100);
+    }
+
+    #[test]
+    fn the_world_map_shows_another_dimensions_map() {
+        let data = std::env::temp_dir().join(format!("atlas-test-dims-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        // A Nether map saved earlier: a cave cut with a tile at chunk (1, 1).
+        let mut nether = Maps::default();
+        nether.open(Some(map_dir(&data, "world-x", NETHER)));
+        nether.store(Cut::Below(40)).put(1, 1, grass(30));
+        nether.portals.put((1, 1), NETHER_PORTAL);
+        assert!(nether.save());
+
+        let mut s = State::default();
+        s.load_world(Some("world-x".into()), data.clone());
+        s.load_map(Some(OVERWORLD.into()), Some(map_dir(&data, "world-x", OVERWORLD)));
+        s.maps.store(Cut::Surface).put(0, 0, grass(70));
+        let h = Here { pos: [160.0, 70.0, 80.0], dimension: OVERWORLD.into(), yaw: 0.0 };
+        s.open_map(Some(&h), None);
+        let size = [400.0, 200.0];
+        let (_, w) = s.screen(size, [0.0, 0.0], Some(&h), &measure);
+        assert!(w.iter().any(|x| x.action == Action::CycleMapDimension));
+        s.act(Action::CycleMapDimension, Some(&h));
+        assert_eq!(s.shown_dimension(), NETHER);
+        assert_eq!(s.map_cut(), Cut::Below(40), "the Nether's fullest cut");
+        assert_eq!(s.map.centre, [20.0, 10.0], "where the player would be there");
+        assert!(!s.map.follow);
+        // Its tiles come from the Nether's map, not the Overworld's.
+        let tile = s.compose_tile(TileKey { cut: Cut::Below(40), level: 0, x: 0, z: 0 });
+        let o = ((20 * MAP_TEXELS + 20) * 4) as usize;
+        assert_ne!(tile[o + 3], 0);
+        assert_eq!(tile[(4 * MAP_TEXELS * 4 + 4 * 4) as usize + 3], 0, "the Overworld's chunk (0, 0) isn't in it");
+        // Centre follows the player there too, at an eighth.
+        s.act(Action::Centre, Some(&h));
+        s.screen(size, [0.0, 0.0], Some(&h), &measure);
+        assert_eq!(s.map.centre, [20.0, 10.0]);
+        // A waypoint made on it is the Nether's.
+        s.create_at_pointer([200.0, 100.0], Some(&h), None);
+        let Mode::Edit(e) = &s.mode else { panic!() };
+        assert_eq!(e.dimension, NETHER);
+        // The End, then back to the player's own: it follows them again.
+        s.open_map(Some(&h), None);
+        s.act(Action::CycleMapDimension, Some(&h));
+        assert_eq!(s.shown_dimension(), END);
+        assert_eq!(s.map_cut(), Cut::Surface);
+        s.act(Action::CycleMapDimension, Some(&h));
+        assert_eq!(s.shown_dimension(), OVERWORLD);
+        assert!(s.map_shown.is_none() && s.map.follow);
+        assert_eq!(s.map_cut(), s.cut);
+        // Nothing was written into the Nether's folder by looking.
+        assert!(!map_dir(&data, "world-x", NETHER).join("surface").exists());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
@@ -5479,6 +5994,9 @@ mod tests {
             t.color[9] = WATER | 0x3F_76E4;
             t.depth[9] = 9;
             s.maps.store(cut).put(0, 0, t);
+            // A portal under the player, and the server's view distance.
+            s.put_portals((0, 0), NETHER_PORTAL);
+            s.view_distance = Some(1);
             for (i, set) in ["a", "b"].into_iter().enumerate() {
                 s.waypoints.push(Waypoint {
                     name: "Wp".into(),
@@ -5547,6 +6065,8 @@ mod tests {
             "delete_reached",
             "new_to_bottom",
             "cross_dim_tp",
+            // Only in the Nether: its own test.
+            "ow_in_nether",
         ];
         // All the rest must change what is drawn.
         let base = Settings {

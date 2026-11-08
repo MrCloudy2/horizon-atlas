@@ -19,7 +19,9 @@ they are above or below you. **Hold Tab** for mob faces, player faces and item i
 ## World map
 
 Press **M**. It shows everything you have explored, saved per world, server and dimension. Drag to move, scroll to
-zoom, and press **B** over any spot to make a waypoint there.
+zoom, and press **B** over any spot to make a waypoint there. The dimension button shows another dimension's map
+from wherever you are (the Nether's centred where you would be there), and the pointer's line gives the same spot's
+Nether or Overworld coordinates.
 
 ![The world map](docs/images/world-map.jpg)
 
@@ -39,7 +41,9 @@ Both maps share three modes, and each keeps its own saved map:
 with their letter and name, and their distance while you look at them.
 
 **U** opens the waypoint screen: sets, a filter, and Add/Edit, Teleport (T, for operators), Share, Enable/Disable and
-Delete. Dying leaves a deathpoint, which goes away when you reach it.
+Delete, and Disable All / Enable All for the whole set. Dying leaves a deathpoint, which goes away when you reach it.
+With **Overworld Waypoints in Nether** on, Overworld waypoints show in the Nether at an eighth of their coordinates,
+and ones made in the Nether are saved as the Overworld's.
 
 ![The waypoint screen](docs/images/waypoints.jpg)
 
@@ -54,7 +58,8 @@ Delete. Dying leaves a deathpoint, which goes away when you reach it.
 - **View**: size, shape, zoom, opacity, lighting, frame style and colour, enlarged minimap (hold **Z**)
 - **Block map**: colour mode, cave mode, slopes, transparency, grass, flowers, leaves
 - **Entity radar**: categories, dot size, icons, names, height limit, depth fade, player cross or arrow
-- **Overlays**: chunk grid, light overlay, slime chunks
+- **Overlays**: chunk grid, light overlay, slime chunks, portal highlights (chunks with Nether portals, End portals
+  or gateways), the server's view distance
 - **Information**: coordinates, biome, time, facing, dimension, chunk, light and weather lines
 - **Waypoints**: scales, opacity, render distance, deathpoints, compass
 
@@ -95,6 +100,8 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 
 - Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT)
 - The map columns follow Horizon's minimap (MIT)
+- Portal highlights, dimension switching, the view distance square, Overworld waypoints in the Nether and Disable
+  All come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

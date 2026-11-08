@@ -55,6 +55,8 @@ struct Palette {
     layers: Vec<u32>,
     water: u32,
     lava: u32,
+    /// Each state's portal kind (`m::NETHER_PORTAL`...), 0 for the rest.
+    portals: Vec<u8>,
 }
 
 /// The average colour of each texture layer: alpha-weighted, ignoring the
@@ -102,6 +104,16 @@ impl Palette {
         };
         let water = sprite("block/water_still").unwrap_or(0xB0_B0B0);
         let lava = sprite("block/lava_still").unwrap_or(0xCF_5B13);
+        let portals = facts
+            .states
+            .iter()
+            .map(|f| match f.name.strip_prefix("minecraft:").unwrap_or(&f.name) {
+                "nether_portal" => m::NETHER_PORTAL,
+                "end_portal" => m::END_PORTAL,
+                "end_gateway" => m::END_GATEWAY,
+                _ => 0,
+            })
+            .collect();
         Self {
             states: facts.states.len(),
             texture_layers: render.texture_layers,
@@ -109,6 +121,7 @@ impl Palette {
             layers,
             water,
             lava,
+            portals,
         }
     }
 
@@ -377,6 +390,24 @@ fn scan_tile(scan: &mut Scan<'_>, air: u32, cut: m::Cut) -> m::Tile {
     tile
 }
 
+/// The kinds of portal in a chunk: each section's palette is asked first,
+/// so a section without one costs a look at its few palette entries.
+fn portals_in(chunk: &horizon_client::chunk::Chunk, kinds: &[u8]) -> u8 {
+    let kind = |id: u32| kinds.get(id as usize).copied().unwrap_or(0);
+    let mut found = 0;
+    for sec in chunk.sections.iter() {
+        if !sec.blocks.maybe_has(|id| kind(id) != 0) {
+            continue;
+        }
+        for bit in [m::NETHER_PORTAL, m::END_PORTAL, m::END_GATEWAY] {
+            if found & bit == 0 && sec.blocks.has(|id| kind(id) & bit != 0) {
+                found |= bit;
+            }
+        }
+    }
+    found
+}
+
 /// Where the player is, for `atlas_mod`.
 pub(super) fn here(game: &Game<'_>) -> Option<m::Here> {
     let p = game.native_player()?;
@@ -486,6 +517,10 @@ pub(super) fn frame(game: &mut Game<'_>) {
     let overworld = game.native_player().is_some_and(|p| p.dimension == m::OVERWORLD);
     let ticks = game.native_clock().filter(|_| overworld).map(|c| c.day_time);
     m::with(|s| s.set_day_time(ticks));
+    // The server's view distance (Login, SetChunkCacheRadius); in a world
+    // of one's own, the render distance it is served at.
+    let view = game.remote.as_ref().map_or(game.settings.render_distance, |r| r.view_distance);
+    m::with(|s| s.view_distance = Some(view));
     scan(game, cut, &settings);
     m::with(|s| s.save_now_and_then(10.0));
     if settings.minimap {
@@ -557,6 +592,12 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
                     };
                     let tile = scan_tile(&mut scan, air, c);
                     m::with(|s| s.put_scan(c, key, revision, tile));
+                    // The surface is scanned whenever the chunk changes:
+                    // its portals with it.
+                    if c == m::Cut::Surface {
+                        let kinds = portals_in(chunk, &palette.portals);
+                        m::with(|s| s.put_portals(key, kinds));
+                    }
                     if started.elapsed() >= budget {
                         return;
                     }
@@ -627,7 +668,7 @@ fn upload_minimap(game: &mut Game<'_>) {
 
 /// Composes and uploads the world map's tiles that changed, a few a frame.
 fn upload_map_tiles(game: &mut Game<'_>) {
-    let tiles = m::with(|s| s.map.tiles(s.screen_size, s.cut));
+    let tiles = m::with(|s| s.map.tiles(s.screen_size, s.map_cut()));
     let mut budget = 6;
     for (key, _) in tiles {
         let id = m::with(|s| s.images.id(key));
