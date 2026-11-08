@@ -84,7 +84,7 @@ All but Tab can be changed in Options > Mods > Atlas.
 
 ## Install
 
-Download `atlas-0.1.0.hnmod` from [Releases](https://github.com/MrCloudy2/horizon-atlas/releases), add it to your native
+Download `atlas-0.2.0.hnmod` from [Releases](https://github.com/MrCloudy2/horizon-atlas/releases), add it to your native
 mods in the Horizon launcher, and build. Atlas is pinned to Horizon Nightly 2026-11-05 (`f319701`), because it reads the
 game's world directly, so a newer Nightly may need a new release. Turn off Horizon's own Minimap so you don't get two.
 
@@ -109,7 +109,7 @@ L=~/.local/share/horizon-launcher
 export PATH=$L/rust/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH CARGO_HOME=$L/cargo
 cargo test --offline                      # the mod's logic
 tools/check.sh                            # applies the bundle to Horizon and type-checks the game
-python3 tools/package.py --install        # makes target/atlas-0.1.0.hnmod and installs it in the launcher
+python3 tools/package.py --install        # makes target/atlas-0.2.0.hnmod and installs it in the launcher
 tools/build-game.sh && tools/play.sh      # an Atlas-only game, offscreen, for testing; drive it with tools/ctl.sh
 ```
 

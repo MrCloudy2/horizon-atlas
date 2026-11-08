@@ -24,7 +24,7 @@ use std::time::Instant;
 /// The mod's id (its data folder and its keys' lines), name and version.
 pub const ID: &str = "atlas";
 pub const NAME: &str = "Horizon Atlas";
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const DESCRIPTION: &str = "A smooth minimap, a world map of everywhere you have been and waypoints on both. M opens the map, B makes a waypoint, U lists them.";
 /// The file the settings are kept in, in the mod's folder.
 pub const SETTINGS_FILE: &str = "settings.txt";
@@ -996,46 +996,67 @@ impl Store {
         stamp
     }
 
-    /// Writes the regions that changed.
-    pub fn save(&mut self) {
+    /// Writes the regions that changed: true when all of them were. One
+    /// that couldn't be written stays changed, so the next save tries again.
+    pub fn save(&mut self) -> bool {
         let dirty: Vec<(i32, i32)> = self
             .regions
             .iter()
             .filter(|(_, r)| r.dirty)
             .map(|(k, _)| *k)
             .collect();
+        let mut all = true;
         for r in dirty {
-            self.write(r);
+            all &= self.write(r).is_ok();
         }
+        all
     }
 
-    fn write(&mut self, r: (i32, i32)) {
+    /// Writes region `r` to its file, and only then counts it as saved.
+    /// Without a folder nothing is kept, so there is nothing to fail.
+    fn write(&mut self, r: (i32, i32)) -> std::io::Result<()> {
         let Some(path) = self.path(r) else {
-            return;
+            if let Some(region) = self.regions.get_mut(&r) {
+                region.dirty = false;
+            }
+            return Ok(());
         };
         let Some(region) = self.regions.get_mut(&r) else {
-            return;
+            return Ok(());
         };
         let bytes = encode_region(region);
-        region.dirty = false;
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
         }
         // Whole files only: a new file, then renamed over the old one.
         let tmp = path.with_extension("atl.tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let done = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
+        done?;
+        region.dirty = false;
+        Ok(())
     }
 
-    /// Forgets the least recently used regions past `MAX_REGIONS`.
+    /// Forgets the least recently used regions past `MAX_REGIONS`. A
+    /// changed region is written first and kept if that fails, so no map is
+    /// lost; then the store grows instead.
     fn trim(&mut self) {
+        let mut unsaved = HashSet::new();
         while self.regions.len() >= MAX_REGIONS {
-            let Some(oldest) = self.regions.iter().min_by_key(|(_, r)| r.used).map(|(k, _)| *k) else {
+            let Some(oldest) = self
+                .regions
+                .iter()
+                .filter(|(k, _)| !unsaved.contains(*k))
+                .min_by_key(|(_, r)| r.used)
+                .map(|(k, _)| *k)
+            else {
                 return;
             };
-            if self.regions[&oldest].dirty {
-                self.write(oldest);
+            if self.regions[&oldest].dirty && self.write(oldest).is_err() {
+                unsaved.insert(oldest);
+                continue;
             }
             self.regions.remove(&oldest);
         }
@@ -2061,16 +2082,12 @@ impl Maps {
         if !self.stores.contains_key(&cut) {
             if self.stores.len() >= MAX_CUTS {
                 // Close one other cut (Surface last).
-                let other = self
-                    .stores
-                    .keys()
-                    .copied()
-                    .filter(|c| *c != cut)
-                    .max_by_key(|c| *c != Cut::Surface);
-                if let Some(other) = other
-                    && let Some(mut st) = self.stores.remove(&other)
+                // One that can't be written stays open, so its map isn't lost.
+                let mut others: Vec<Cut> = self.stores.keys().copied().filter(|c| *c != cut).collect();
+                others.sort_by_key(|c| *c == Cut::Surface);
+                if let Some(other) = others.into_iter().find(|c| self.stores.get_mut(c).is_some_and(Store::save))
+                    && let Some(st) = self.stores.remove(&other)
                 {
-                    st.save();
                     self.next_revision = self.next_revision.max(st.next_revision);
                 }
             }
@@ -2086,11 +2103,13 @@ impl Maps {
         self.next_revision = self.next_revision.max(st.next_revision);
         st
     }
-    /// Writes what changed of every cut.
-    pub fn save(&mut self) {
+    /// Writes what changed of every cut: true when all of it was.
+    pub fn save(&mut self) -> bool {
+        let mut all = true;
         for st in self.stores.values_mut() {
-            st.save();
+            all &= st.save();
         }
+        all
     }
 }
 
@@ -4918,6 +4937,41 @@ mod tests {
         let tile = read.chunks[0].as_deref().unwrap();
         assert_eq!((tile.color, tile.height, tile.depth), (t.color, t.height, t.depth));
         assert_eq!(tile.light, [0; 256]);
+    }
+
+    #[test]
+    fn a_region_that_cant_be_written_is_kept_and_tried_again() {
+        let base = std::env::temp_dir().join(format!("atlas-test-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // The map's folder is a file, so no region can be written under it.
+        let dir = base.join("map");
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let mut store = Store::default();
+        store.open(Some(dir.clone()));
+        store.put(0, 0, grass(70));
+        assert!(!store.save(), "the failed write is reported");
+        assert!(store.regions.values().all(|r| r.dirty), "and the region still counts as changed");
+        // Filling the store past its limit forgets no unsaved region.
+        for i in 1..MAX_REGIONS as i32 + 5 {
+            store.put(i * REGION, 0, grass(70));
+        }
+        assert_eq!(store.regions_loaded(), MAX_REGIONS + 5);
+        assert_eq!(store.column(3, 3), Some((LAND | 0x5D_A040, 70, 0, 0)));
+        // Once the folder can be written, the next save writes everything.
+        std::fs::remove_file(&dir).unwrap();
+        assert!(store.save());
+        assert!(store.regions.values().all(|r| !r.dirty));
+        let mut again = Store::default();
+        again.open(Some(dir.clone()));
+        assert_eq!(again.column(3, 3), Some((LAND | 0x5D_A040, 70, 0, 0)));
+        assert!(again.has((MAX_REGIONS as i32 + 4) * REGION, 0));
+        // And with the folder writable, trimming forgets saved regions again.
+        for i in 0..MAX_REGIONS as i32 + 5 {
+            again.put(i * REGION, REGION, grass(71));
+        }
+        assert!(again.regions_loaded() <= MAX_REGIONS);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
