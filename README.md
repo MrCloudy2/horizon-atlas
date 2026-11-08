@@ -59,7 +59,8 @@ and ones made in the Nether are saved as the Overworld's.
 - **Block map**: colour mode, cave mode, slopes, transparency, grass, flowers, leaves
 - **Entity radar**: categories, dot size, icons, names, height limit, depth fade, player cross or arrow
 - **Overlays**: chunk grid, light overlay, slime chunks, portal highlights (chunks with Nether portals, End portals
-  or gateways), the server's view distance
+  or gateways), the server's view distance, new chunks (red: generated as they came) and old chunks (green: loaded
+  from the server's saves), from each chunk's block palettes as the server sent them; on servers only
 - **Information**: coordinates, biome, time, facing, dimension, chunk, light and weather lines
 - **Waypoints**: scales, opacity, render distance, deathpoints, compass
 
@@ -100,8 +101,8 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 
 - Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT)
 - The map columns follow Horizon's minimap (MIT)
-- Portal highlights, dimension switching, the view distance square, Overworld waypoints in the Nether and Disable
-  All come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+- Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
+  switching, the view distance square, Overworld waypoints in the Nether and Disable All come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

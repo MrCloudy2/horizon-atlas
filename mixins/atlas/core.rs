@@ -1412,6 +1412,8 @@ settings! {
     slime: bool = false, "slime", "Slime Chunks", Overlay, Kind::Toggle;
     portals: bool = false, "portals", "Portal Highlights", Overlay, Kind::Toggle;
     view_square: bool = false, "view_distance", "Server View Distance", Overlay, Kind::Toggle;
+    new_chunks: bool = false, "new_chunks", "New Chunks", Overlay, Kind::Toggle;
+    old_chunks: bool = false, "old_chunks", "Old Chunks", Overlay, Kind::Toggle;
 
     coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
     biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
@@ -1844,8 +1846,13 @@ pub fn portal_rgb(kinds: u8) -> u32 {
     if kinds & NETHER_PORTAL != 0 { 0xA0_40FF } else { 0x30_E0C0 }
 }
 
-/// Tints the chunks holding portals on a composed minimap image.
-pub fn tint_portals(grid: &MiniGrid, portals: &HashMap<(i32, i32), u8>, image: &mut [u8]) {
+/// A new chunk red, an old one green, as XaeroPlus's.
+pub fn new_chunk_rgb(mark: u8) -> u32 {
+    if mark == NEW_CHUNK { 0xFF_0000 } else { 0x00_FF00 }
+}
+
+/// Tints each chunk `rgb` gives a colour on a composed minimap image.
+pub fn tint_chunks(grid: &MiniGrid, image: &mut [u8], rgb: impl Fn((i32, i32)) -> Option<u32>) {
     let n = grid.n;
     for j in 0..n {
         for i in 0..n {
@@ -1854,12 +1861,16 @@ pub fn tint_portals(grid: &MiniGrid, portals: &HashMap<(i32, i32), u8>, image: &
                 continue;
             }
             let (x, z) = grid.block(i, j);
-            if let Some(&kinds) = portals.get(&(x >> 4, z >> 4)) {
-                let c = portal_rgb(kinds);
+            if let Some(c) = rgb((x >> 4, z >> 4)) {
                 tint(image, o, [(c >> 16) as u16, (c >> 8 & 255) as u16, (c & 255) as u16]);
             }
         }
     }
+}
+
+/// Tints the chunks holding portals on a composed minimap image.
+pub fn tint_portals(grid: &MiniGrid, portals: &HashMap<(i32, i32), u8>, image: &mut [u8]) {
+    tint_chunks(grid, image, |c| portals.get(&c).map(|k| portal_rgb(*k)));
 }
 
 /// Draws the edge of the square of chunks `radius` around chunk `centre`
@@ -1933,6 +1944,8 @@ pub struct MiniKey {
     pub light: Option<i32>,
     /// The portals' revision, when they show.
     pub portals: Option<u64>,
+    /// The new chunks' revision and which show (new, old).
+    pub new_chunks: Option<(u64, bool, bool)>,
     /// The view distance square: the player's chunk and the radius.
     pub square: Option<(i32, i32, i32)>,
 }
@@ -2115,15 +2128,82 @@ impl MapImages {
     }
 }
 
-/// Kinds of portal a chunk holds (`Portals`), a bit each.
+/// Kinds of portal a chunk holds (`Maps::portals`), a bit each.
 pub const NETHER_PORTAL: u8 = 1;
 pub const END_PORTAL: u8 = 2;
 pub const END_GATEWAY: u8 = 4;
 
-/// The chunks seen holding portals, and which kinds: kept per dimension in
-/// its map folder, as XaeroPlus's portal highlights are.
+/// A chunk's mark in `Maps::new_chunks`: generated when it came (its
+/// palettes as the generator left them), or loaded from the server's saves.
+pub const NEW_CHUNK: u8 = 1;
+pub const OLD_CHUNK: u8 = 2;
+
+/// Whether a section's block palette is as the generator left it, never
+/// saved by the server (XaeroPlus's PaletteNewChunks, MIT, rfresh2; the idea
+/// from etianl's Trouser-Streak). A server saving a chunk rebuilds each
+/// palette from the blocks present, in the order they are met; a new chunk
+/// is sent before it is saved. So a small (linear, up to 4 bits) palette
+/// out of that order, or a larger (hash map) one with entries no block
+/// uses, was never saved. `bits`, `palette` and `words` are as sent.
+pub fn fresh_palette(bits: u8, palette: &[u32], words: &[u64]) -> bool {
+    if bits == 0 || palette.len() < 2 || bits > 8 {
+        return false;
+    }
+    let per = 64 / usize::from(bits);
+    let mask = (1u64 << bits) - 1;
+    let index = |i: usize| words.get(i / per).map_or(0, |w| (w >> ((i % per) * usize::from(bits)) & mask) as usize);
+    let mut seen = vec![false; palette.len()];
+    if bits <= 4 {
+        // Linear: entries first met in palette order, else fresh.
+        let mut next = 0;
+        for i in 0..4096 {
+            let v = index(i);
+            if v >= seen.len() || seen[v] {
+                continue;
+            }
+            if v != next {
+                return true;
+            }
+            seen[v] = true;
+            next += 1;
+            if next == seen.len() {
+                return false;
+            }
+        }
+        return false;
+    }
+    // Hash map: an entry nothing uses.
+    let mut used = 0;
+    for i in 0..4096 {
+        let v = index(i);
+        if v < seen.len() && !seen[v] {
+            seen[v] = true;
+            used += 1;
+            if used == seen.len() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a chunk was new when it came, from its sections' block palettes
+/// as sent (`bits`, palette, words): three fresh sections at least, as
+/// XaeroPlus counts (a server may tick a chunk before sending it, which
+/// can leave one section looking fresh).
+pub fn is_new_chunk<'a>(sections: impl IntoIterator<Item = (u8, &'a [u32], &'a [u64])>) -> bool {
+    sections
+        .into_iter()
+        .filter(|(bits, palette, words)| fresh_palette(*bits, palette, words))
+        .nth(2)
+        .is_some()
+}
+
+/// Marks on chunks, a byte each: the portals seen in them (kinds of
+/// portal), or whether they were new when they came. Kept per dimension in
+/// its map folder, as XaeroPlus's highlights are.
 #[derive(Debug, Default)]
-pub struct Portals {
+pub struct ChunkMarks {
     pub chunks: HashMap<(i32, i32), u8>,
     /// Changes when a chunk is added or dropped.
     pub revision: u64,
@@ -2131,8 +2211,9 @@ pub struct Portals {
 }
 
 const PORTALS_FILE: &str = "portals.txt";
+const NEW_CHUNKS_FILE: &str = "newchunks.txt";
 
-impl Portals {
+impl ChunkMarks {
     /// `cx cz kinds` a line.
     pub fn decode(text: &str) -> Self {
         let chunks = text
@@ -2144,13 +2225,31 @@ impl Portals {
                 Some(((cx, cz), k))
             })
             .collect();
-        Portals { chunks, ..Portals::default() }
+        ChunkMarks { chunks, ..ChunkMarks::default() }
     }
 
     pub fn encode(&self) -> String {
         let mut rows: Vec<_> = self.chunks.iter().collect();
         rows.sort();
         rows.iter().map(|((x, z), k)| format!("{x} {z} {k}\n")).collect()
+    }
+
+    /// Writes them to `file` in `dir` when they changed: false when that
+    /// failed (they stay changed, to be tried again).
+    fn save(&mut self, dir: &std::path::Path, file: &str) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let tmp = dir.join(format!("{file}.tmp"));
+        let done = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&tmp, self.encode()))
+            .and_then(|()| std::fs::rename(&tmp, dir.join(file)));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        self.dirty = false;
+        true
     }
 
     /// Chunk `chunk` was scanned and holds `kinds` (0: none): true when that
@@ -2178,7 +2277,9 @@ pub struct Maps {
     pub dir: Option<PathBuf>,
     stores: HashMap<Cut, Store>,
     next_revision: u64,
-    pub portals: Portals,
+    pub portals: ChunkMarks,
+    /// New (`NEW_CHUNK`) and old (`OLD_CHUNK`) chunks.
+    pub new_chunks: ChunkMarks,
 }
 
 /// The most cuts kept open at once.
@@ -2192,13 +2293,18 @@ impl Maps {
         }
         self.save();
         self.stores.clear();
-        let revision = self.portals.revision + 1;
-        self.portals = dir
-            .as_ref()
-            .and_then(|d| std::fs::read_to_string(d.join(PORTALS_FILE)).ok())
-            .map(|t| Portals::decode(&t))
-            .unwrap_or_default();
-        self.portals.revision = revision;
+        let read = |file: &str, revision: u64| {
+            let mut marks = dir
+                .as_ref()
+                .and_then(|d| std::fs::read_to_string(d.join(file)).ok())
+                .map(|t| ChunkMarks::decode(&t))
+                .unwrap_or_default();
+            // Never the same revision as before: what is drawn follows.
+            marks.revision = revision + 1;
+            marks
+        };
+        self.portals = read(PORTALS_FILE, self.portals.revision);
+        self.new_chunks = read(NEW_CHUNKS_FILE, self.new_chunks.revision);
         self.dir = dir;
     }
 
@@ -2259,18 +2365,9 @@ impl Maps {
         for st in self.stores.values_mut() {
             all &= st.save();
         }
-        if self.portals.dirty
-            && let Some(dir) = &self.dir
-        {
-            let tmp = dir.join("portals.txt.tmp");
-            let done = std::fs::create_dir_all(dir)
-                .and_then(|()| std::fs::write(&tmp, self.portals.encode()))
-                .and_then(|()| std::fs::rename(&tmp, dir.join(PORTALS_FILE)));
-            if done.is_ok() {
-                self.portals.dirty = false;
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-                all = false;
+        if let Some(dir) = &self.dir {
+            for (marks, file) in [(&mut self.portals, PORTALS_FILE), (&mut self.new_chunks, NEW_CHUNKS_FILE)] {
+                all &= marks.save(dir, file);
             }
         }
         all
@@ -3051,6 +3148,17 @@ impl State {
 
     /// Forgets the scans of chunks more than `radius` chunks from `centre`
     /// (they are rescanned when they load again).
+    /// Whether chunk `chunk` of the player's dimension still needs its
+    /// new-or-old check (each chunk is checked once, the first time it comes).
+    pub fn wants_new_check(&self, chunk: (i32, i32)) -> bool {
+        !self.maps.new_chunks.chunks.contains_key(&chunk)
+    }
+
+    /// Chunk `chunk` came new (true) or old.
+    pub fn put_new_chunk(&mut self, chunk: (i32, i32), new: bool) {
+        self.maps.new_chunks.put(chunk, if new { NEW_CHUNK } else { OLD_CHUNK });
+    }
+
     /// Chunk `chunk` of the player's dimension holds portals of `kinds`
     /// (0: none).
     pub fn put_portals(&mut self, chunk: (i32, i32), kinds: u8) {
@@ -3113,6 +3221,7 @@ impl State {
             grid: (st.chunk_grid, st.grid_width),
             light: st.light_overlay.then_some(st.light_level),
             portals: st.portals.then_some(self.maps.portals.revision),
+            new_chunks: (st.new_chunks || st.old_chunks).then_some((self.maps.new_chunks.revision, st.new_chunks, st.old_chunks)),
             square: self.view_distance.filter(|_| st.view_square).map(|vd| (bx >> 4, bz >> 4, vd)),
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
@@ -3144,6 +3253,10 @@ impl State {
         }
         if st.chunk_grid > 0 {
             tint_grid(&grid, st.chunk_grid, st.grid_width, &mut self.mini_image);
+        }
+        if st.new_chunks || st.old_chunks {
+            let shown = |m: u8| (m == NEW_CHUNK && st.new_chunks) || (m == OLD_CHUNK && st.old_chunks);
+            tint_chunks(&grid, &mut self.mini_image, |c| self.maps.new_chunks.chunks.get(&c).copied().filter(|m| shown(*m)).map(new_chunk_rgb));
         }
         if st.portals {
             tint_portals(&grid, &self.maps.portals.chunks, &mut self.mini_image);
@@ -4634,15 +4747,21 @@ impl State {
             let b = map.screen(f64::from(x1 + 1) * 16.0, f64::from(z1 + 1) * 16.0, size);
             [a[0], a[1], b[0] - a[0], b[1] - a[1]]
         };
-        if st.portals {
-            let [x0, z0] = self.map.world([0.0, 0.0], size);
-            let [x1, z1] = self.map.world(size, size);
-            let (cx0, cz0, cx1, cz1) = ((x0 as i32 >> 4) - 1, (z0 as i32 >> 4) - 1, (x1 as i32 >> 4) + 1, (z1 as i32 >> 4) + 1);
-            let map = self.map.clone();
-            for (&(cx, cz), &kinds) in &self.view_maps().portals.chunks {
-                if cx < cx0 || cx > cx1 || cz < cz0 || cz > cz1 {
-                    continue;
+        let [x0, z0] = self.map.world([0.0, 0.0], size);
+        let [x1, z1] = self.map.world(size, size);
+        let (cx0, cz0, cx1, cz1) = ((x0 as i32 >> 4) - 1, (z0 as i32 >> 4) - 1, (x1 as i32 >> 4) + 1, (z1 as i32 >> 4) + 1);
+        let map = self.map.clone();
+        let on_screen = |&(&(cx, cz), _): &(&(i32, i32), &u8)| cx >= cx0 && cx <= cx1 && cz >= cz0 && cz <= cz1;
+        if st.new_chunks || st.old_chunks {
+            for (&(cx, cz), &mark) in self.view_maps().new_chunks.chunks.iter().filter(on_screen) {
+                if (mark == NEW_CHUNK && st.new_chunks) || (mark == OLD_CHUNK && st.old_chunks) {
+                    // As XaeroPlus's: 100 of 255 opaque.
+                    out.fill(chunk_rect(&map, cx, cz, cx, cz), 0x6400_0000 | new_chunk_rgb(mark));
                 }
+            }
+        }
+        if st.portals {
+            for (&(cx, cz), &kinds) in self.view_maps().portals.chunks.iter().filter(on_screen) {
                 let mut r = chunk_rect(&map, cx, cz, cx, cz);
                 // At least 3 pixels, so they show zoomed far out.
                 for k in 0..2 {
@@ -5368,7 +5487,7 @@ mod tests {
         assert_eq!(again.portals.chunks, HashMap::from([((3, -2), NETHER_PORTAL), ((-40, 7), END_GATEWAY | END_PORTAL)]));
         let _ = std::fs::remove_dir_all(&dir);
         // Bad lines are skipped.
-        assert_eq!(Portals::decode("1 2 1\nx 3 1\n4 5 0\n").chunks.len(), 1);
+        assert_eq!(ChunkMarks::decode("1 2 1\nx 3 1\n4 5 0\n").chunks.len(), 1);
 
         // The minimap tints a portal's chunk and redraws when one is found.
         let mut s = State { settings: Some(Settings { portals: true, ..Settings::default() }), ..State::default() };
@@ -5383,6 +5502,74 @@ mod tests {
         s.open_map(Some(&h), None);
         let (draws, _) = s.screen([400.0, 200.0], [0.0, 0.0], Some(&h), &measure);
         assert!(draws.iter().any(|d| matches!(d, Draw::Fill(_, c) if c & RGB == portal_rgb(NETHER_PORTAL))));
+    }
+
+    /// `indices` packed `bits` to a field, as a section is sent.
+    fn pack_indices(indices: &[usize], bits: u8) -> Vec<u64> {
+        let per = 64 / usize::from(bits);
+        let mut words = vec![0u64; 4096_usize.div_ceil(per)];
+        for (i, &v) in indices.iter().enumerate() {
+            words[i / per] |= (v as u64) << ((i % per) * usize::from(bits));
+        }
+        words
+    }
+
+    #[test]
+    fn a_palette_the_server_never_saved_is_fresh() {
+        // Linear: a saved section's entries are first met in palette order.
+        let mut idx = vec![0usize; 4096];
+        idx[100] = 1;
+        idx[200] = 2;
+        let saved = pack_indices(&idx, 4);
+        assert!(!fresh_palette(4, &[0, 1, 9], &saved));
+        // Out of order: generated, never saved.
+        idx[100] = 2;
+        idx[200] = 1;
+        assert!(fresh_palette(4, &[0, 1, 9], &pack_indices(&idx, 4)));
+        // Hash map: an entry nothing uses means it was never compacted.
+        let idx: Vec<usize> = (0..4096).map(|i| i % 20).collect();
+        let palette: Vec<u32> = (0..20).collect();
+        assert!(!fresh_palette(5, &palette, &pack_indices(&idx, 5)));
+        let idx: Vec<usize> = (0..4096).map(|i| i % 19).collect();
+        assert!(fresh_palette(5, &palette, &pack_indices(&idx, 5)));
+        // One block kind, or the global palette: nothing to tell.
+        assert!(!fresh_palette(0, &[1], &[]));
+        assert!(!fresh_palette(15, &[], &[0; 1024]));
+        // A chunk needs three fresh sections: one may be a tick's change.
+        let fresh = pack_indices(&{ let mut v = vec![0; 4096]; v[5] = 2; v[6] = 1; v }, 4);
+        let pal = [0u32, 1, 2];
+        let sec = (4u8, &pal[..], &fresh[..]);
+        let plain = (4u8, &pal[..], &saved[..]);
+        assert!(!is_new_chunk([sec, sec, plain, plain]));
+        assert!(is_new_chunk([sec, plain, sec, sec]));
+    }
+
+    #[test]
+    fn new_and_old_chunks_are_kept_and_drawn() {
+        let dir = std::env::temp_dir().join(format!("atlas-test-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = State { settings: Some(Settings { new_chunks: true, ..Settings::default() }), ..State::default() };
+        s.load_map(Some(OVERWORLD.into()), Some(dir.clone()));
+        assert!(s.wants_new_check((0, 0)));
+        s.put_new_chunk((0, 0), true);
+        s.put_new_chunk((1, 0), false);
+        assert!(!s.wants_new_check((0, 0)), "each chunk is checked once");
+        assert!(s.maps.save());
+        let mut again = Maps::default();
+        again.open(Some(dir.clone()));
+        assert_eq!(again.new_chunks.chunks, HashMap::from([((0, 0), NEW_CHUNK), ((1, 0), OLD_CHUNK)]));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Red on the world map for the new; the old only when asked for.
+        let h = here(OVERWORLD);
+        s.open_map(Some(&h), None);
+        let fills = |s: &mut State, rgb: u32| {
+            let (draws, _) = s.screen([400.0, 200.0], [0.0, 0.0], Some(&h), &measure);
+            draws.iter().filter(|d| matches!(d, Draw::Fill(_, c) if c & 0xFF00_0000 == 0x6400_0000 && c & RGB == rgb)).count()
+        };
+        assert_eq!(fills(&mut s, 0xFF_0000), 1);
+        assert_eq!(fills(&mut s, 0x00_FF00), 0);
+        s.settings = Some(Settings { new_chunks: true, old_chunks: true, ..Settings::default() });
+        assert_eq!(fills(&mut s, 0x00_FF00), 1);
     }
 
     #[test]
@@ -5997,6 +6184,8 @@ mod tests {
             // A portal under the player, and the server's view distance.
             s.put_portals((0, 0), NETHER_PORTAL);
             s.view_distance = Some(1);
+            s.put_new_chunk((0, 0), true);
+            s.put_new_chunk((-1, 0), false);
             for (i, set) in ["a", "b"].into_iter().enumerate() {
                 s.waypoints.push(Waypoint {
                     name: "Wp".into(),

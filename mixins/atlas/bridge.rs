@@ -408,6 +408,27 @@ fn portals_in(chunk: &horizon_client::chunk::Chunk, kinds: &[u8]) -> u8 {
     found
 }
 
+/// XaeroPlus's new chunks: each chunk that came is checked once, as soon
+/// as the budget allows, before block changes reshape its palettes. Only
+/// from a server: a world of one's own hands the client its own sections.
+fn check_new_chunks(game: &Game<'_>) {
+    if game.integrated.is_some() {
+        return;
+    }
+    let started = Instant::now();
+    for (key, chunk) in &game.world.chunks {
+        if !m::with(|s| s.wants_new_check(*key)) {
+            continue;
+        }
+        let wire: Vec<_> = chunk.sections.iter().map(|sec| sec.blocks.to_wire()).collect();
+        let new = m::is_new_chunk(wire.iter().map(|(bits, palette, words)| (*bits, palette.as_slice(), *words)));
+        m::with(|s| s.put_new_chunk(*key, new));
+        if started.elapsed() >= Duration::from_micros(1000) {
+            return;
+        }
+    }
+}
+
 /// Where the player is, for `atlas_mod`.
 pub(super) fn here(game: &Game<'_>) -> Option<m::Here> {
     let p = game.native_player()?;
@@ -522,6 +543,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
     let view = game.remote.as_ref().map_or(game.settings.render_distance, |r| r.view_distance);
     m::with(|s| s.view_distance = Some(view));
     scan(game, cut, &settings);
+    if settings.new_chunks || settings.old_chunks {
+        check_new_chunks(game);
+    }
     m::with(|s| s.save_now_and_then(10.0));
     if settings.minimap {
         upload_minimap(game);
