@@ -2280,6 +2280,32 @@ pub struct Maps {
     pub portals: ChunkMarks,
     /// New (`NEW_CHUNK`) and old (`OLD_CHUNK`) chunks.
     pub new_chunks: ChunkMarks,
+    /// Folders switched away from while some of their changes couldn't be
+    /// written: saved again with the rest until they are, or taken back.
+    left: Vec<Left>,
+}
+
+/// What `Maps` held of a folder it left before all of it was written.
+#[derive(Debug)]
+struct Left {
+    dir: PathBuf,
+    stores: HashMap<Cut, Store>,
+    portals: ChunkMarks,
+    new_chunks: ChunkMarks,
+}
+
+impl Left {
+    /// Writes what is still changed: true when all of it was.
+    fn save(&mut self) -> bool {
+        let mut all = true;
+        for st in self.stores.values_mut() {
+            all &= st.save();
+        }
+        for (marks, file) in [(&mut self.portals, PORTALS_FILE), (&mut self.new_chunks, NEW_CHUNKS_FILE)] {
+            all &= marks.save(&self.dir, file);
+        }
+        all
+    }
 }
 
 /// The most cuts kept open at once.
@@ -2291,8 +2317,37 @@ impl Maps {
         if self.dir == dir {
             return;
         }
-        self.save();
-        self.stores.clear();
+        let saved = self.save();
+        let stores = std::mem::take(&mut self.stores);
+        for st in stores.values() {
+            self.next_revision = self.next_revision.max(st.next_revision);
+        }
+        let (portals_revision, new_chunks_revision) = (self.portals.revision, self.new_chunks.revision);
+        if !saved && let Some(old) = self.dir.take() {
+            // Kept, not dropped: the next saves try again once the storage is back.
+            self.left.push(Left {
+                dir: old,
+                stores,
+                portals: std::mem::take(&mut self.portals),
+                new_chunks: std::mem::take(&mut self.new_chunks),
+            });
+        }
+        if let Some(d) = &dir
+            && let Some(i) = self.left.iter().position(|l| &l.dir == d)
+        {
+            // Back to a folder whose newest changes never reached the disk: carry on from them.
+            let l = self.left.swap_remove(i);
+            self.stores = l.stores;
+            for st in self.stores.values_mut() {
+                st.next_revision = st.next_revision.max(self.next_revision);
+            }
+            self.portals = l.portals;
+            self.portals.revision = self.portals.revision.max(portals_revision) + 1;
+            self.new_chunks = l.new_chunks;
+            self.new_chunks.revision = self.new_chunks.revision.max(new_chunks_revision) + 1;
+            self.dir = dir;
+            return;
+        }
         let read = |file: &str, revision: u64| {
             let mut marks = dir
                 .as_ref()
@@ -2303,8 +2358,8 @@ impl Maps {
             marks.revision = revision + 1;
             marks
         };
-        self.portals = read(PORTALS_FILE, self.portals.revision);
-        self.new_chunks = read(NEW_CHUNKS_FILE, self.new_chunks.revision);
+        self.portals = read(PORTALS_FILE, portals_revision);
+        self.new_chunks = read(NEW_CHUNKS_FILE, new_chunks_revision);
         self.dir = dir;
     }
 
@@ -2370,6 +2425,7 @@ impl Maps {
                 all &= marks.save(dir, file);
             }
         }
+        self.left.retain_mut(|l| !l.save());
         all
     }
 }
@@ -5502,6 +5558,38 @@ mod tests {
         s.open_map(Some(&h), None);
         let (draws, _) = s.screen([400.0, 200.0], [0.0, 0.0], Some(&h), &measure);
         assert!(draws.iter().any(|d| matches!(d, Draw::Fill(_, c) if c & RGB == portal_rgb(NETHER_PORTAL))));
+    }
+
+    #[test]
+    fn a_map_left_while_its_save_fails_is_kept_until_it_is_written() {
+        let root = std::env::temp_dir().join(format!("atlas-test-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A file where the world's folder should be: every write under it fails.
+        let blocker = root.join("world");
+        std::fs::write(&blocker, b"").unwrap();
+        let dir = blocker.join("overworld");
+        let other = root.join("nether");
+        let mut maps = Maps::default();
+        maps.open(Some(dir.clone()));
+        maps.store(Cut::Surface).put(0, 0, grass(64));
+        assert!(maps.portals.put((1, 1), NETHER_PORTAL));
+        assert!(!maps.save());
+        // Changing dimension while the storage fails keeps the changes.
+        maps.open(Some(other.clone()));
+        assert!(maps.portals.chunks.is_empty());
+        maps.open(Some(dir.clone()));
+        assert_eq!(maps.portals.chunks, HashMap::from([((1, 1), NETHER_PORTAL)]), "taken back on return");
+        maps.open(Some(other.clone()));
+        // The storage is back: the next save writes them.
+        std::fs::remove_file(&blocker).unwrap();
+        assert!(maps.save());
+        assert!(maps.left.is_empty());
+        let mut again = Maps::default();
+        again.open(Some(dir.clone()));
+        assert_eq!(again.portals.chunks, HashMap::from([((1, 1), NETHER_PORTAL)]));
+        assert!(std::fs::read_dir(dir.join(Cut::Surface.folder())).unwrap().next().is_some(), "the region was written");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `indices` packed `bits` to a field, as a section is sent.
