@@ -26,6 +26,9 @@ pub const ID: &str = "atlas";
 pub const NAME: &str = "Horizon Atlas";
 pub const VERSION: &str = "0.2.0";
 pub const DESCRIPTION: &str = "A smooth minimap, a world map of everywhere you have been and waypoints on both. M opens the map, B makes a waypoint, U lists them.";
+/// Where bugs and ideas go: the last button of Options > Mods > Atlas.
+pub const ISSUES_URL: &str = "https://github.com/MrCloudy2/horizon-atlas/issues";
+const REPORT_LABEL: &str = "Report an Issue";
 /// The file the settings are kept in, in the mod's folder.
 pub const SETTINGS_FILE: &str = "settings.txt";
 /// The settings file's first line (see `Settings::read`).
@@ -1649,7 +1652,13 @@ impl Settings {
                 out.push(OPTS[i].text(self.raw(i)));
             }
         }
+        out.push(REPORT_LABEL.to_owned());
         out
+    }
+
+    /// Whether button `i` of `labels` is Report an Issue.
+    pub fn is_report(i: usize) -> bool {
+        i == QUICK.len() + 1
     }
 
     /// Button `i` of `labels` clicked.
@@ -6375,6 +6384,14 @@ mod tests {
         assert_eq!(s, Settings::default());
         s.click(1);
         assert!(!s.minimap);
+        // The last: Report an Issue, which changes no setting.
+        let labels = s.labels();
+        let last = labels.len() - 1;
+        assert_eq!(labels[last], "Report an Issue");
+        assert!(Settings::is_report(last) && !Settings::is_report(1));
+        let before = s;
+        s.click(last);
+        assert_eq!(s, before);
     }
 
     #[test]

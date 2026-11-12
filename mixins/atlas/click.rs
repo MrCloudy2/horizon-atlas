@@ -4,6 +4,13 @@ fn atlas_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
     if mod_id != m::ID {
         return;
     }
+    // Report an Issue: the game's own "open this link?" screen, back to
+    // this page after.
+    if m::Settings::is_report(button) {
+        let back = game.screen;
+        game.confirm_trusted_link(m::ISSUES_URL, back);
+        return;
+    }
     let g = &*game;
     let mut st = m::with(|s| s.settings_with(|k| g.native_setting(m::ID, k)));
     st.click(button);
