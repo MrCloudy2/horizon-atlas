@@ -62,7 +62,8 @@ and ones made in the Nether are saved as the Overworld's.
   or gateways), the server's view distance, new chunks (red: generated as they came) and old chunks (green: loaded
   from the server's saves), from each chunk's block palettes as the server sent them; on servers only
 - **Information**: coordinates, biome, time, facing, dimension, chunk, light and weather lines
-- **Waypoints**: scales, opacity, render distance, deathpoints, compass
+- **Waypoints**: scales, opacity, render distance, deathpoints, compass, beacons (a beam over each waypoint)
+- **Miscellaneous**: minimap FPS limit, map sharing
 
 `/atlas <setting> <value>` in chat sets any of them exactly, and `/atlas help` lists them:
 
@@ -72,6 +73,21 @@ and ones made in the Nether are saved as the Overworld's.
 /atlas mode layer 40     auto | cave | layer [height]
 /atlas seed <seed>       this world's seed, for slime chunks (a server never sends it)
 ```
+
+## Map sharing
+
+A Horizon server running Atlas can share its map: every chunk any player has loaded shows on the world map of every
+player who runs Atlas, nearest first, and changes follow as the server sees them.
+
+- **On the server**: Share Map with Players (Miscellaneous) is Auto by default: everyone on a dedicated server, nobody
+  from a world of your own opened to LAN. Set it to Operators, Everyone or OFF (`share_map=ops` in the server's
+  `settings.txt`, or `/atlas share_map all` in your own world). Map Sharing Rate caps what each player is sent, 256 KB/s
+  by default. The shared map is kept in the world's folder, `atlas-share/`.
+- **On the client**: nothing to do; turn off Use the Server's Map to keep only what you see yourself.
+- **How**: the server offers it when you join (players without Atlas never hear of it), your Atlas says what it already
+  has, and the rest comes in the background. It sends each column's blocks rather than colours, so your own settings and
+  resource pack colour them. Your own view of a chunk wins over the server's.
+- Only the surface is shared, not cave layers. Chunks from before Atlas was on the server are added when they next load.
 
 ## Keys
 
@@ -97,12 +113,17 @@ game's world directly, so a newer Nightly may need a new release. Turn off Horiz
 Everything Atlas keeps is in `horizon-mods/.horizon-mod-data/atlas/` in the game folder: `settings.txt`, waypoints and
 seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 
+## Bugs and ideas
+
+[Open an issue](https://github.com/MrCloudy2/horizon-atlas/issues), or use Report an Issue in Options > Mods > Atlas.
+
 ## Credits
 
 - Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT)
 - The map columns follow Horizon's minimap (MIT)
 - Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
-  switching, the view distance square, Overworld waypoints in the Nether and Disable All come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+  switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons and the minimap
+  FPS limiter come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

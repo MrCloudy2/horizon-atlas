@@ -193,3 +193,79 @@ helper = "camera.rs"
 bindings = [
   { name = "value", ty = "(glam::DVec3, f32, f32)", value = "$value" },
 ]
+
+# Map sharing: the server's side (chunks, ticks, players, messages) and the
+# client's (the server's messages).
+[[injection]]
+id = "share_chunk"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_chunk_load"
+helper = "share_chunk.rs"
+bindings = [
+  { name = "dimension", ty = "&str", value = "dimension" },
+  { name = "chunk", ty = "[i32; 2]", value = "chunk" },
+]
+
+[[injection]]
+id = "share_tick"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_level_tick_post"
+helper = "share_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+]
+
+[[injection]]
+id = "share_client"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_net_from_client"
+helper = "share_client.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "share_server"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_net_from_server"
+helper = "share_server.rs"
+bindings = [
+  { name = "channel", ty = "&str", value = "channel" },
+  { name = "data", ty = "&[u8]", value = "data" },
+]
+
+[[injection]]
+id = "share_left"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_player_logged_out"
+helper = "share_left.rs"
+bindings = [
+  { name = "player", ty = "u128", value = "player" },
+]
+
+[[injection]]
+id = "share_unload"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_level_unload"
+helper = "share_unload.rs"
+bindings = []
+
+[[injection]]
+id = "share_start"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_server_about_to_start"
+helper = "share_start.rs"
+bindings = [
+  { name = "dedicated", ty = "bool", value = "dedicated" },
+]
+
+[[injection]]
+id = "share_stop"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_server_stopping"
+helper = "share_stop.rs"
+bindings = []

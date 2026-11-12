@@ -16,7 +16,7 @@
 // minimap's look follow Horizon's own minimap (`horizon-client-render`'s
 // `minimap.rs`, MIT, Ludovic Marie and the Horizon contributors).
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
@@ -1325,6 +1325,13 @@ const AUTO_CAVE: &[(&str, &str)] = &[("ceiling3", "3x3 Ceiling"), ("ceiling1", "
 const SLOPES: &[(&str, &str)] = &[("off", "OFF"), ("normal", "Soft"), ("strong", "Full")];
 const GRID_COLORS: &[(&str, &str)] = &[("off", "OFF"), ("black", "Black"), ("white", "White"), ("red", "Red")];
 const GRID_RGB: [[u16; 3]; 4] = [[0, 0, 0], [0, 0, 0], [255, 255, 255], [230, 40, 40]];
+/// Who a server shares its map with. Auto: everyone on a dedicated
+/// server, nobody from a world of one's own (opened to LAN).
+const SHARE_MODES: &[(&str, &str)] = &[("auto", "Auto"), ("off", "OFF"), ("ops", "Operators"), ("all", "Everyone")];
+pub const SHARE_AUTO: usize = 0;
+pub const SHARE_OFF: usize = 1;
+pub const SHARE_OPS: usize = 2;
+pub const SHARE_ALL: usize = 3;
 const ALIGNMENTS: &[(&str, &str)] = &[("center", "Center"), ("left", "Left"), ("right", "Right")];
 const NORTH_COLORS: &[(&str, &str)] = &[("default", "Default"), ("red", "Red"), ("yellow", "Yellow"), ("blue", "Blue")];
 const NORTH_RGB: [u32; 4] = [INK, 0xFF5555, 0xFFFF55, 0x5599FF];
@@ -1435,6 +1442,10 @@ settings! {
         Kind::Slider { min: 0, max: 100, div: 1, unit: "", zero: None };
     info_align: usize = 0, "info_align", "Info Text Alignment", Info, Kind::Choice(ALIGNMENTS);
 
+    share_map: usize = 0, "share_map", "Share Map with Players", Misc, Kind::Choice(SHARE_MODES);
+    share_rate: i32 = 256, "share_rate", "Map Sharing Rate", Misc,
+        Kind::Slider { min: 32, max: 4096, div: 1, unit: " KB/s", zero: None };
+    server_map: bool = true, "server_map", "Use the Server's Map", Misc, Kind::Toggle;
     info_scale: f32 = 0.7, "ui_scale", "UI Scale", Misc,
         Kind::Slider { min: 40, max: 150, div: 100, unit: "x", zero: None };
 
@@ -1619,6 +1630,15 @@ impl Settings {
             s.arrow_scale = (s.arrow_scale * 1.5).min(3.0);
         }
         s
+    }
+
+    /// The settings from a file's text when it is whole: every setting has
+    /// its line (one read while the game was writing it is cut short).
+    pub fn read_whole(text: &str) -> Option<Self> {
+        let keys: HashSet<&str> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k.trim()).collect();
+        OPTS.iter()
+            .all(|o| keys.contains(o.key))
+            .then(|| Self::read(|k| (k == SETTINGS_FILE).then(|| text.to_owned())))
     }
 
     /// The player marker's size: Xaero's default 1.5x draws it at the size
@@ -2312,6 +2332,9 @@ pub struct Maps {
     /// Folders switched away from while some of their changes couldn't be
     /// written: saved again with the rest until they are, or taken back.
     left: Vec<Left>,
+    /// What the server shares of this map.
+    pub shared: ShareClient,
+    shared_saved: u64,
 }
 
 /// What `Maps` held of a folder it left before all of it was written.
@@ -2374,6 +2397,8 @@ impl Maps {
             self.portals.revision = self.portals.revision.max(portals_revision) + 1;
             self.new_chunks = l.new_chunks;
             self.new_chunks.revision = self.new_chunks.revision.max(new_chunks_revision) + 1;
+            self.shared.open(Some(d));
+            self.shared_saved = self.shared.since;
             self.dir = dir;
             return;
         }
@@ -2389,6 +2414,8 @@ impl Maps {
         };
         self.portals = read(PORTALS_FILE, portals_revision);
         self.new_chunks = read(NEW_CHUNKS_FILE, new_chunks_revision);
+        self.shared.open(dir.as_deref());
+        self.shared_saved = self.shared.since;
         self.dir = dir;
     }
 
@@ -2453,6 +2480,14 @@ impl Maps {
             for (marks, file) in [(&mut self.portals, PORTALS_FILE), (&mut self.new_chunks, NEW_CHUNKS_FILE)] {
                 all &= marks.save(dir, file);
             }
+            // Only once the map it covers is written.
+            if all && self.shared.since != self.shared_saved {
+                if self.shared.save(dir) {
+                    self.shared_saved = self.shared.since;
+                } else {
+                    all = false;
+                }
+            }
         }
         self.left.retain_mut(|l| !l.save());
         all
@@ -2510,6 +2545,8 @@ pub struct State {
     pub scans: HashMap<(Cut, (i32, i32)), (u64, Instant)>,
     /// The dimension the maps and the scans are of.
     pub map_dimension: Option<String>,
+    /// Whether the server shares its map.
+    pub share_link: ShareLink,
     /// What both maps show now.
     pub cut: Cut,
     /// A change of cut waiting for the toggle timer.
@@ -2583,6 +2620,7 @@ impl Default for State {
             maps: Maps::default(),
             scans: HashMap::new(),
             map_dimension: None,
+            share_link: ShareLink::default(),
             cut: Cut::Surface,
             pending_cut: None,
             mini_key: None,
@@ -3251,6 +3289,16 @@ impl State {
         self.scans.insert((cut, chunk), (revision, Instant::now()));
         if self.maps.store(cut).put(chunk.0, chunk.1, tile) && self.shade_cut == Some(cut) {
             // Its columns, and those shaded against them to the south and east.
+            for c in [chunk, (chunk.0 + 1, chunk.1), (chunk.0, chunk.1 + 1)] {
+                self.shade_cache.remove(&c);
+            }
+        }
+    }
+
+    /// A chunk the server shared, coloured: kept unless the player's own
+    /// scan has it now (the bridge checks it isn't loaded).
+    pub fn put_shared(&mut self, chunk: (i32, i32), tile: Tile) {
+        if self.maps.store(Cut::Surface).put(chunk.0, chunk.1, tile) && self.shade_cut == Some(Cut::Surface) {
             for c in [chunk, (chunk.0 + 1, chunk.1), (chunk.0, chunk.1 + 1)] {
                 self.shade_cache.remove(&c);
             }
@@ -5352,6 +5400,1072 @@ pub fn hit(widgets: &[Widget], at: [f32; 2]) -> Option<Action> {
         .map(|w| w.action.clone())
 }
 
+// ---- Map sharing -------------------------------------------------------------
+//
+// A Horizon server running Atlas can send the map of every chunk it has had
+// loaded to the players who run Atlas too. It doesn't send colours: for each
+// column it keeps the few block states a map column is made of (from the top
+// down through what can be seen through, water included, to the ground), with
+// the column's biome and block light, so each player colours them with their
+// own palette and settings. Chunk states and biomes are the server's own ids,
+// the same ones its chunk packets use.
+//
+// Bounds, so a big world or a busy server stays safe:
+// - memory: the server keeps an index (version and hash per chunk), at most
+//   `MAX_SHARED_CHUNKS`; the columns stay on disk, read by a thread of their
+//   own with a few regions cached;
+// - disk: whole region files, written beside and renamed over the old ones;
+//   one that can't be written stays in memory and is tried again;
+// - time: a player's catch-up walks out from them a few regions a tick, sends
+//   at most `share_rate` KB a second, and the disk is never touched on the
+//   server's thread;
+// - a client keeps at most `MAX_INBOX` shared chunks waiting, and doesn't
+//   count a catch-up as done if it had to drop any.
+
+/// The mod message channel both ways.
+pub const SHARE_CHANNEL: &str = "atlas:map";
+/// The protocol's version, second in every message.
+const SHARE_PROTOCOL: u8 = 1;
+const MSG_HELLO: u8 = 1;
+const MSG_CHUNKS: u8 = 2;
+const MSG_DONE: u8 = 3;
+const MSG_OFFER: u8 = 4;
+/// Runs of block states one column keeps at most.
+pub const MAX_RUNS: usize = 24;
+/// Chunks a server keeps the map of at most: about 30 bytes each in memory,
+/// about 2 KB each on disk.
+pub const MAX_SHARED_CHUNKS: usize = 250_000;
+/// One message's bytes at most (Horizon takes 30 000).
+const MESSAGE_BYTES: usize = 28_000;
+/// Messages to one player a tick at most (Horizon takes 32).
+const MESSAGES_PER_TICK: usize = 4;
+/// Chunks of one player's catch-up waiting on the disk thread at most.
+const IN_FLIGHT: usize = 48;
+/// Changes kept per player while they catch up; past it the oldest wait for
+/// their next join.
+const MAX_LIVE: usize = 4096;
+/// Regions a catch-up looks at a tick.
+const REGIONS_PER_TICK: usize = 8;
+/// Regions the disk thread keeps in memory (about 2.5 MB each at most).
+const SHARE_CACHE: usize = 8;
+/// Unwritten regions kept at most before new changes are dropped (they come
+/// back when their chunks load again).
+const MAX_UNSAVED: usize = 32;
+/// Shared chunks a client keeps waiting to be coloured at most.
+pub const MAX_INBOX: usize = 4096;
+/// A dimension id's length at most.
+const MAX_DIMENSION: usize = 128;
+/// How far out chunk coordinates may be (the world's border is 30 million
+/// blocks out).
+const MAX_CHUNK: i64 = 1_875_000;
+
+fn put_var(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7F) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn put_zig(out: &mut Vec<u8>, v: i64) {
+    put_var(out, ((v << 1) ^ (v >> 63)) as u64);
+}
+
+/// Reads what `put_var` and `put_zig` wrote; None past the end or for
+/// anything malformed.
+struct Reader<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, at: 0 }
+    }
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.at)?;
+        self.at += 1;
+        Some(b)
+    }
+    fn var(&mut self) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.u8()?;
+            v |= u64::from(b & 0x7F) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    fn zig(&mut self) -> Option<i64> {
+        let v = self.var()?;
+        Some((v >> 1) as i64 ^ -((v & 1) as i64))
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let s = self.data.get(self.at..end)?;
+        self.at = end;
+        Some(s)
+    }
+    fn done(&self) -> bool {
+        self.at == self.data.len()
+    }
+}
+
+/// `count` blocks of `state`, from `top` down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub top: i32,
+    pub count: u32,
+    pub state: u32,
+}
+
+/// One column of a shared chunk, top down.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SharedColumn {
+    pub biome: u16,
+    /// The block light over its top.
+    pub light: u8,
+    pub runs: Vec<Run>,
+}
+
+/// What a server shares of a chunk: its 256 columns (`z * 16 + x`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedChunk {
+    pub x: i32,
+    pub z: i32,
+    pub min_y: i32,
+    pub columns: Vec<SharedColumn>,
+}
+
+/// How the share treats a block on the way down a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Not on maps (air, a torch): left out.
+    Skip,
+    /// On maps but a setting may see through it (flowers, glass, plants,
+    /// leaves): kept, and the column goes on.
+    Through,
+    /// Water or lava without a sturdy top: kept, and on.
+    Fluid,
+    /// Where the column ends.
+    Ground,
+}
+
+/// The runs of one column from `top` down to `bottom`: `state` gives the
+/// block at a height, `part` how the share treats it.
+pub fn share_column(top: i32, bottom: i32, mut state: impl FnMut(i32) -> u32, mut part: impl FnMut(u32) -> Part) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    let mut y = top;
+    while y > bottom {
+        let s = state(y);
+        let p = part(s);
+        if p != Part::Skip {
+            match runs.last_mut() {
+                Some(r) if r.state == s && r.top - r.count as i32 == y => r.count += 1,
+                _ => {
+                    if runs.len() == MAX_RUNS {
+                        break;
+                    }
+                    runs.push(Run { top: y, count: 1, state: s });
+                }
+            }
+            if p == Part::Ground {
+                break;
+            }
+        }
+        y -= 1;
+    }
+    runs
+}
+
+impl SharedChunk {
+    /// The state at block `(x, y, z)` of the chunk (x and z in 0..16),
+    /// `air` where nothing was kept.
+    pub fn state(&self, x: i32, y: i32, z: i32, air: u32) -> u32 {
+        let Some(c) = self.columns.get(((z & 15) * 16 + (x & 15)) as usize) else {
+            return air;
+        };
+        c.runs
+            .iter()
+            .find(|r| y <= r.top && y > r.top - r.count as i32)
+            .map_or(air, |r| r.state)
+    }
+    pub fn biome(&self, x: i32, z: i32) -> u16 {
+        self.columns.get(((z & 15) * 16 + (x & 15)) as usize).map_or(0, |c| c.biome)
+    }
+    pub fn light(&self, x: i32, z: i32) -> u8 {
+        self.columns.get(((z & 15) * 16 + (x & 15)) as usize).map_or(0, |c| c.light)
+    }
+    /// The highest block kept.
+    pub fn top(&self) -> i32 {
+        self.columns.iter().filter_map(|c| c.runs.first()).map(|r| r.top).max().unwrap_or(self.min_y)
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        put_zig(out, i64::from(self.x));
+        put_zig(out, i64::from(self.z));
+        put_zig(out, i64::from(self.min_y));
+        for c in &self.columns {
+            put_var(out, u64::from(c.biome));
+            out.push(c.light);
+            out.push(c.runs.len() as u8);
+            for r in &c.runs {
+                put_zig(out, i64::from(r.top));
+                put_var(out, u64::from(r.count));
+                put_var(out, u64::from(r.state));
+            }
+        }
+    }
+
+    /// One chunk as `encode` wrote it; None for anything out of bounds.
+    fn read(b: &mut Reader<'_>) -> Option<Self> {
+        let x = b.zig()?;
+        let z = b.zig()?;
+        let min_y = b.zig()?;
+        if x.abs() > MAX_CHUNK || z.abs() > MAX_CHUNK || !(-4096..=4096).contains(&min_y) {
+            return None;
+        }
+        let min_y = min_y as i32;
+        let mut columns = Vec::with_capacity(256);
+        for _ in 0..256 {
+            let biome = u16::try_from(b.var()?).ok()?;
+            let light = b.u8()?.min(15);
+            let n = usize::from(b.u8()?);
+            if n > MAX_RUNS {
+                return None;
+            }
+            let mut runs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let top = b.zig()?;
+                let count = b.var()?;
+                let state = u32::try_from(b.var()?).ok()?;
+                if !(i64::from(min_y)..=i64::from(min_y) + 8192).contains(&top) || count == 0 || count > 8192 {
+                    return None;
+                }
+                runs.push(Run { top: top as i32, count: count as u32, state });
+            }
+            columns.push(SharedColumn { biome, light, runs });
+        }
+        Some(Self { x: x as i32, z: z as i32, min_y, columns })
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut b = Reader::new(data);
+        let c = Self::read(&mut b)?;
+        b.done().then_some(c)
+    }
+}
+
+/// A 64-bit FNV-1a hash: whether a chunk's share changed.
+fn share_hash(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The client's hello: what it has of `dimension` (the one it is in), up
+/// to version `since`.
+pub fn encode_hello(dimension: &str, since: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_dimension(&mut out, MSG_HELLO, dimension);
+    put_var(&mut out, since);
+    out
+}
+
+pub fn decode_hello(data: &[u8]) -> Option<(String, u64)> {
+    let mut b = Reader::new(data);
+    (b.u8()? == MSG_HELLO && b.u8()? == SHARE_PROTOCOL).then_some(())?;
+    let dimension = read_dimension(&mut b)?;
+    let since = b.var()?;
+    b.done().then_some((dimension, since))
+}
+
+/// What the server sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FromServer {
+    /// Chunks of `dimension`, each with its version.
+    Chunks(String, Vec<(u64, SharedChunk)>),
+    /// The catch-up of `dimension` is done: the player has it all up to
+    /// version `upto`.
+    Done(String, u64),
+    /// The server shares its map: say what you have.
+    Offer,
+}
+
+fn put_dimension(out: &mut Vec<u8>, kind: u8, dimension: &str) {
+    out.extend([kind, SHARE_PROTOCOL]);
+    let d = &dimension.as_bytes()[..dimension.len().min(MAX_DIMENSION)];
+    put_var(out, d.len() as u64);
+    out.extend_from_slice(d);
+}
+
+fn read_dimension(b: &mut Reader<'_>) -> Option<String> {
+    let n = usize::try_from(b.var()?).ok()?;
+    if n > MAX_DIMENSION {
+        return None;
+    }
+    String::from_utf8(b.take(n)?.to_vec()).ok()
+}
+
+pub fn encode_offer() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_dimension(&mut out, MSG_OFFER, "");
+    out
+}
+
+pub fn encode_done(dimension: &str, upto: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_dimension(&mut out, MSG_DONE, dimension);
+    put_var(&mut out, upto);
+    out
+}
+
+impl FromServer {
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut b = Reader::new(data);
+        let kind = b.u8()?;
+        if b.u8()? != SHARE_PROTOCOL {
+            return None;
+        }
+        let dimension = read_dimension(&mut b)?;
+        let out = match kind {
+            MSG_CHUNKS => {
+                let n = usize::try_from(b.var()?).ok()?;
+                if n > MESSAGE_BYTES {
+                    return None;
+                }
+                let mut chunks = Vec::new();
+                for _ in 0..n {
+                    let version = b.var()?;
+                    let len = usize::try_from(b.var()?).ok()?;
+                    chunks.push((version, SharedChunk::decode(b.take(len)?)?));
+                }
+                Self::Chunks(dimension, chunks)
+            }
+            MSG_DONE => Self::Done(dimension, b.var()?),
+            MSG_OFFER => Self::Offer,
+            _ => return None,
+        };
+        b.done().then_some(out)
+    }
+}
+
+/// Packs `(version, encoded chunk)`s into messages of at most
+/// `MESSAGE_BYTES`, taking from the front of `out` while `budget` bytes and
+/// `MESSAGES_PER_TICK` messages last. A chunk too big for any message is
+/// dropped.
+fn pack_chunks(dimension: &str, out: &mut VecDeque<(u64, Vec<u8>)>, mut budget: usize) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    while messages.len() < MESSAGES_PER_TICK && !out.is_empty() && budget > 0 {
+        let mut body = Vec::new();
+        let mut n = 0u64;
+        while let Some((_, bytes)) = out.front() {
+            let need = bytes.len() + 20;
+            if need > MESSAGE_BYTES - 200 {
+                out.pop_front();
+                continue;
+            }
+            if body.len() + need > MESSAGE_BYTES - 200 || (n > 0 && body.len() + need > budget) {
+                break;
+            }
+            let (version, bytes) = out.pop_front().expect("front");
+            put_var(&mut body, version);
+            put_var(&mut body, bytes.len() as u64);
+            body.extend_from_slice(&bytes);
+            n += 1;
+        }
+        if n == 0 {
+            break;
+        }
+        let mut msg = Vec::with_capacity(body.len() + 160);
+        put_dimension(&mut msg, MSG_CHUNKS, dimension);
+        put_var(&mut msg, n);
+        msg.extend_from_slice(&body);
+        budget = budget.saturating_sub(msg.len());
+        messages.push(msg);
+    }
+    messages
+}
+
+// ---- The server's disk thread ------------------------------------------------------
+
+/// A region file of the share: a header of `REGION_CHUNKS` entries
+/// (version, hash, offset, length) and the chunks' bytes after it.
+const SHARE_MAGIC: &[u8; 4] = b"ATS1";
+const SHARE_HEADER: usize = 4 + REGION_CHUNKS * 24;
+/// A chunk's bytes at most on disk: anything bigger is a broken file.
+const MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct ShareRegion {
+    chunks: HashMap<u16, (u64, u64, Vec<u8>)>,
+    dirty: bool,
+    used: u64,
+}
+
+/// A region file's header: each chunk's version, hash and bytes' place.
+/// A chunk's entry in a region file's header: its index in the region,
+/// version, hash, and where its bytes are (offset, length).
+type HeaderEntry = (u16, u64, u64, usize, usize);
+
+fn read_share_header(data: &[u8]) -> Option<Vec<HeaderEntry>> {
+    if data.len() < SHARE_HEADER || &data[..4] != SHARE_MAGIC {
+        return None;
+    }
+    let mut out = Vec::new();
+    for i in 0..REGION_CHUNKS {
+        let e = &data[4 + i * 24..4 + i * 24 + 24];
+        let version = u64::from_le_bytes(e[0..8].try_into().ok()?);
+        if version == 0 {
+            continue;
+        }
+        let hash = u64::from_le_bytes(e[8..16].try_into().ok()?);
+        let at = u32::from_le_bytes(e[16..20].try_into().ok()?) as usize;
+        let len = u32::from_le_bytes(e[20..24].try_into().ok()?) as usize;
+        if len > MAX_CHUNK_BYTES || at < SHARE_HEADER || at.checked_add(len)? > data.len() {
+            continue;
+        }
+        out.push((i as u16, version, hash, at, len));
+    }
+    Some(out)
+}
+
+fn encode_share_region(region: &ShareRegion) -> Vec<u8> {
+    let mut header = vec![0u8; SHARE_HEADER];
+    header[..4].copy_from_slice(SHARE_MAGIC);
+    let mut body = Vec::new();
+    for (&i, (version, hash, bytes)) in &region.chunks {
+        let e = 4 + usize::from(i) * 24;
+        header[e..e + 8].copy_from_slice(&version.to_le_bytes());
+        header[e + 8..e + 16].copy_from_slice(&hash.to_le_bytes());
+        header[e + 16..e + 20].copy_from_slice(&((SHARE_HEADER + body.len()) as u32).to_le_bytes());
+        header[e + 20..e + 24].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        body.extend_from_slice(bytes);
+    }
+    header.extend(body);
+    header
+}
+
+/// What the server's thread asks of the disk thread.
+enum Job {
+    /// The index of every dimension folder under the share's.
+    Index,
+    Write { dimension: String, chunk: (i32, i32), version: u64, hash: u64, bytes: Vec<u8> },
+    Read { player: u128, session: u64, dimension: String, chunks: Vec<(i32, i32)> },
+    /// Write what changed.
+    Flush,
+}
+
+/// What it answers.
+enum Answer {
+    /// A dimension's chunks on disk: (chunk, version, hash).
+    Index(String, Vec<((i32, i32), u64, u64)>),
+    /// The index is all there.
+    Indexed,
+    /// The chunks read for `player`, each with its version; one not found is
+    /// left out.
+    Read { player: u128, session: u64, asked: usize, found: Vec<(u64, Vec<u8>)> },
+}
+
+struct Disk {
+    dir: PathBuf,
+    regions: HashMap<(String, (i32, i32)), ShareRegion>,
+    clock: u64,
+}
+
+impl Disk {
+    fn region_path(&self, dimension: &str, r: (i32, i32)) -> PathBuf {
+        self.dir.join(safe_name(dimension)).join(format!("r.{}.{}.ats", r.0, r.1))
+    }
+
+    fn region(&mut self, dimension: &str, r: (i32, i32)) -> &mut ShareRegion {
+        self.clock += 1;
+        let key = (dimension.to_owned(), r);
+        if !self.regions.contains_key(&key) {
+            self.trim();
+            let mut region = ShareRegion::default();
+            if let Ok(data) = std::fs::read(self.region_path(dimension, r))
+                && let Some(entries) = read_share_header(&data)
+            {
+                for (i, version, hash, at, len) in entries {
+                    region.chunks.insert(i, (version, hash, data[at..at + len].to_vec()));
+                }
+            }
+            self.regions.insert(key.clone(), region);
+        }
+        let clock = self.clock;
+        let region = self.regions.get_mut(&key).expect("just inserted");
+        region.used = clock;
+        region
+    }
+
+    /// Writes region `key` beside its file and renames it over: whole files only.
+    fn write(&mut self, key: &(String, (i32, i32))) -> bool {
+        let path = self.region_path(&key.0, key.1);
+        let Some(region) = self.regions.get_mut(key) else {
+            return true;
+        };
+        if !region.dirty {
+            return true;
+        }
+        let bytes = encode_share_region(region);
+        let tmp = path.with_extension("ats.tmp");
+        let done = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&tmp, bytes))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        region.dirty = false;
+        true
+    }
+
+    /// Closes the least used regions past `SHARE_CACHE`, written first; one
+    /// that can't be written stays.
+    fn trim(&mut self) {
+        let mut kept = HashSet::new();
+        while self.regions.len() >= SHARE_CACHE + kept.len() {
+            let Some(oldest) = self
+                .regions
+                .iter()
+                .filter(|(k, _)| !kept.contains(*k))
+                .min_by_key(|(_, r)| r.used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if self.write(&oldest) {
+                self.regions.remove(&oldest);
+            } else {
+                kept.insert(oldest);
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        let keys: Vec<_> = self.regions.keys().cloned().collect();
+        for k in keys {
+            self.write(&k);
+        }
+    }
+
+    fn unsaved(&self) -> usize {
+        self.regions.values().filter(|r| r.dirty).count()
+    }
+
+    fn index(&self, answer: &std::sync::mpsc::Sender<Answer>) {
+        let Ok(dims) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for d in dims.flatten() {
+            let Some(dimension) = d.path().join("dimension.txt").to_str().and_then(|p| std::fs::read_to_string(p).ok())
+            else {
+                continue;
+            };
+            let dimension = dimension.trim().to_owned();
+            let mut all = Vec::new();
+            let Ok(files) = std::fs::read_dir(d.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().into_owned();
+                let Some(rest) = name.strip_prefix("r.").and_then(|n| n.strip_suffix(".ats")) else {
+                    continue;
+                };
+                let Some((rx, rz)) = rest.split_once('.') else {
+                    continue;
+                };
+                let (Ok(rx), Ok(rz)) = (rx.parse::<i32>(), rz.parse::<i32>()) else {
+                    continue;
+                };
+                // The header only.
+                let mut head = vec![0u8; SHARE_HEADER];
+                let read = std::fs::File::open(f.path()).and_then(|mut file| {
+                    use std::io::Read;
+                    file.read_exact(&mut head)
+                });
+                if read.is_err() || &head[..4] != SHARE_MAGIC {
+                    continue;
+                }
+                for i in 0..REGION_CHUNKS {
+                    let e = &head[4 + i * 24..4 + i * 24 + 16];
+                    let version = u64::from_le_bytes(e[0..8].try_into().unwrap_or_default());
+                    let hash = u64::from_le_bytes(e[8..16].try_into().unwrap_or_default());
+                    if version != 0 {
+                        let chunk = (rx * REGION + (i as i32 % REGION), rz * REGION + (i as i32 / REGION));
+                        all.push((chunk, version, hash));
+                    }
+                }
+            }
+            let _ = answer.send(Answer::Index(dimension, all));
+        }
+    }
+
+    fn run(mut self, jobs: std::sync::mpsc::Receiver<Job>, answer: std::sync::mpsc::Sender<Answer>) {
+        let mut last_flush = Instant::now();
+        loop {
+            let job = jobs.recv_timeout(std::time::Duration::from_secs(5));
+            match job {
+                Ok(Job::Index) => {
+                    self.index(&answer);
+                    let _ = answer.send(Answer::Indexed);
+                }
+                Ok(Job::Write { dimension, chunk, version, hash, bytes }) => {
+                    let r = (region_of(chunk.0), region_of(chunk.1));
+                    let key = (dimension.clone(), r);
+                    // Too much unwritten (a full disk): drop it; the chunk is
+                    // shared again when it next loads.
+                    if !self.regions.get(&key).is_some_and(|r| r.dirty) && self.unsaved() >= MAX_UNSAVED {
+                        continue;
+                    }
+                    if !self.dir.join(safe_name(&dimension)).join("dimension.txt").exists() {
+                        let d = self.dir.join(safe_name(&dimension));
+                        let _ = std::fs::create_dir_all(&d).and_then(|()| std::fs::write(d.join("dimension.txt"), &dimension));
+                    }
+                    let region = self.region(&dimension, r);
+                    region.chunks.insert(region_index(chunk.0, chunk.1) as u16, (version, hash, bytes));
+                    region.dirty = true;
+                }
+                Ok(Job::Read { player, session, dimension, chunks }) => {
+                    let asked = chunks.len();
+                    let mut found = Vec::new();
+                    for c in chunks {
+                        let region = self.region(&dimension, (region_of(c.0), region_of(c.1)));
+                        if let Some((version, _, bytes)) = region.chunks.get(&(region_index(c.0, c.1) as u16)) {
+                            found.push((*version, bytes.clone()));
+                        }
+                    }
+                    let _ = answer.send(Answer::Read { player, session, asked, found });
+                }
+                Ok(Job::Flush) => {
+                    self.flush();
+                    last_flush = Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.flush();
+                    return;
+                }
+            }
+            if last_flush.elapsed().as_secs() >= 10 {
+                self.flush();
+                last_flush = Instant::now();
+            }
+        }
+    }
+}
+
+// ---- The server's side ---------------------------------------------------------------
+
+/// A region's chunks in the server's index: index in region → (version,
+/// hash).
+type RegionIndex = HashMap<u16, (u64, u64)>;
+
+/// A player taking the share: their catch-up, walking out from where they
+/// were, then the changes since.
+#[derive(Debug, Default)]
+struct Follower {
+    /// Each hello starts a new one: the disk's answers to an older one are
+    /// left out.
+    session: u64,
+    dimension: String,
+    since: u64,
+    upto: u64,
+    /// The chunk the walk is centred on, and the regions left to walk,
+    /// nearest first (filled at the first step).
+    at: (i32, i32),
+    regions: std::collections::BinaryHeap<std::cmp::Reverse<(i64, i32, i32)>>,
+    started: bool,
+    walked: bool,
+    /// Chunks to read, nearest first.
+    ready: VecDeque<(i32, i32)>,
+    waiting: usize,
+    /// Read and waiting to be sent.
+    out: VecDeque<(u64, Vec<u8>)>,
+    live: VecDeque<(i32, i32)>,
+    live_set: HashSet<(i32, i32)>,
+    done_sent: bool,
+    hello_at: Option<Instant>,
+}
+
+/// The server's share of one world.
+#[derive(Default)]
+pub struct ShareServer {
+    /// The share's folder (`<world>/atlas-share`); None: closed.
+    pub dir: Option<PathBuf>,
+    /// Dimension → region → chunk index in region → (version, hash).
+    index: HashMap<String, HashMap<(i32, i32), RegionIndex>>,
+    /// The farthest region from the origin, per dimension, for the walks.
+    reach: HashMap<String, i32>,
+    indexed: bool,
+    followers: HashMap<u128, Follower>,
+    /// The players told the map is shared.
+    offered: HashSet<u128>,
+    sessions: u64,
+    next_version: u64,
+    total: usize,
+    pub full: bool,
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    answers: Option<std::sync::mpsc::Receiver<Answer>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for ShareServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareServer").field("dir", &self.dir).field("total", &self.total).finish()
+    }
+}
+
+impl ShareServer {
+    /// Opens the share in `dir` (a world's), starting its disk thread and
+    /// reading its index there.
+    pub fn open(&mut self, dir: PathBuf) {
+        if self.dir.as_ref() == Some(&dir) {
+            return;
+        }
+        self.close();
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let (tx, answers) = std::sync::mpsc::channel();
+        let disk = Disk { dir: dir.clone(), regions: HashMap::new(), clock: 0 };
+        let Ok(thread) = std::thread::Builder::new().name("atlas-share".into()).spawn(move || disk.run(rx, tx)) else {
+            return;
+        };
+        self.thread = Some(thread);
+        let _ = jobs.send(Job::Index);
+        self.jobs = Some(jobs);
+        self.answers = Some(answers);
+        self.dir = Some(dir);
+    }
+
+    /// Stops the disk thread once it has written what changed, and waits
+    /// for it: only as a world closes, so the next share of the folder reads
+    /// it whole.
+    pub fn close(&mut self) {
+        // Closing the channel has it write and stop.
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        *self = Self::default();
+    }
+
+    pub fn ready(&self) -> bool {
+        self.indexed
+    }
+
+    fn version_of(&self, dimension: &str, chunk: (i32, i32)) -> Option<(u64, u64)> {
+        let r = (region_of(chunk.0), region_of(chunk.1));
+        self.index.get(dimension)?.get(&r)?.get(&(region_index(chunk.0, chunk.1) as u16)).copied()
+    }
+
+    fn put_index(&mut self, dimension: &str, chunk: (i32, i32), version: u64, hash: u64) -> bool {
+        let r = (region_of(chunk.0), region_of(chunk.1));
+        let regions = self.index.entry(dimension.to_owned()).or_default();
+        let fresh = !regions.get(&r).is_some_and(|m| m.contains_key(&(region_index(chunk.0, chunk.1) as u16)));
+        if fresh && self.total >= MAX_SHARED_CHUNKS {
+            self.full = true;
+            return false;
+        }
+        regions.entry(r).or_default().insert(region_index(chunk.0, chunk.1) as u16, (version, hash));
+        if fresh {
+            self.total += 1;
+        }
+        let reach = self.reach.entry(dimension.to_owned()).or_default();
+        *reach = (*reach).max(r.0.abs()).max(r.1.abs());
+        self.next_version = self.next_version.max(version + 1);
+        true
+    }
+
+    /// A chunk's share as the server sees it now: kept, and sent to whoever
+    /// follows the dimension, when it changed. True when it did.
+    pub fn observe(&mut self, dimension: &str, chunk: &SharedChunk) -> bool {
+        if !self.indexed || self.jobs.is_none() {
+            return false;
+        }
+        let key = (chunk.x, chunk.z);
+        let mut bytes = Vec::new();
+        chunk.encode(&mut bytes);
+        let hash = share_hash(&bytes);
+        if self.version_of(dimension, key).is_some_and(|(_, h)| h == hash) {
+            return false;
+        }
+        let version = self.next_version.max(1);
+        if !self.put_index(dimension, key, version, hash) {
+            return false;
+        }
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(Job::Write { dimension: dimension.to_owned(), chunk: key, version, hash, bytes });
+        }
+        for f in self.followers.values_mut() {
+            if f.dimension == dimension && f.hello_at.is_some() && version > f.upto && f.live_set.insert(key) {
+                f.live.push_back(key);
+                if f.live.len() > MAX_LIVE
+                    && let Some(old) = f.live.pop_front()
+                {
+                    f.live_set.remove(&old);
+                }
+            }
+        }
+        true
+    }
+
+    /// A player's hello: they have `dimension` up to `since`, at chunk
+    /// `at`. A hello again within two seconds is ignored.
+    pub fn hello(&mut self, player: u128, dimension: &str, since: u64, at: (i32, i32)) {
+        if !self.offered.contains(&player) {
+            return;
+        }
+        let upto = self.next_version.saturating_sub(1);
+        let f = self.followers.entry(player).or_default();
+        if f.dimension == dimension && f.hello_at.is_some_and(|t| t.elapsed().as_secs() < 2) {
+            return;
+        }
+        self.sessions += 1;
+        *f = Follower {
+            session: self.sessions,
+            dimension: dimension.to_owned(),
+            since,
+            upto,
+            at,
+            hello_at: Some(Instant::now()),
+            ..Follower::default()
+        };
+    }
+
+    /// Has the disk thread write what changed (a level closed).
+    pub fn flush(&self) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(Job::Flush);
+        }
+    }
+
+    pub fn leave(&mut self, player: u128) {
+        self.followers.remove(&player);
+        self.offered.remove(&player);
+    }
+
+    /// `allowed`: the players the map is shared with now. Offers it to the
+    /// new ones (once the index is read) and stops it for those no longer
+    /// in.
+    pub fn offers(&mut self, allowed: &[u128]) -> Vec<(u128, Vec<u8>)> {
+        self.offered.retain(|p| allowed.contains(p));
+        self.followers.retain(|p, _| allowed.contains(p));
+        if !self.indexed {
+            return Vec::new();
+        }
+        allowed
+            .iter()
+            .filter(|p| self.offered.insert(**p))
+            .map(|p| (*p, encode_offer()))
+            .collect()
+    }
+
+    /// Takes the disk thread's answers.
+    fn take_answers(&mut self) {
+        let mut got = Vec::new();
+        if let Some(answers) = &self.answers {
+            while let Ok(a) = answers.try_recv() {
+                got.push(a);
+                if got.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        for a in got {
+            match a {
+                Answer::Index(dimension, all) => {
+                    for (chunk, version, hash) in all {
+                        if !self.put_index(&dimension, chunk, version, hash) {
+                            break;
+                        }
+                    }
+                }
+                Answer::Indexed => self.indexed = true,
+                Answer::Read { player, session, asked, found } => {
+                    if let Some(f) = self.followers.get_mut(&player)
+                        && f.session == session
+                    {
+                        f.waiting = f.waiting.saturating_sub(asked);
+                        f.out.extend(found);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Once a server tick: moves each follower's catch-up on and gives the
+    /// messages to send, at most `rate` bytes a second each. `here`: each
+    /// player's dimension now; a catch-up of another waits (the player's
+    /// hello can come before the server has them there, and a new hello
+    /// replaces it once they are gone).
+    pub fn tick(&mut self, rate: usize, here: &HashMap<u128, String>) -> Vec<(u128, Vec<u8>)> {
+        self.take_answers();
+        if !self.indexed {
+            return Vec::new();
+        }
+        let budget = (rate / 20).max(MESSAGE_BYTES / 4);
+        let mut sends = Vec::new();
+        let ids: Vec<u128> = self.followers.keys().copied().collect();
+        for id in ids {
+            let Some(mut f) = self.followers.remove(&id) else {
+                continue;
+            };
+            if f.hello_at.is_some() && here.get(&id) == Some(&f.dimension) {
+                self.walk(&mut f);
+                // Changes first, then the catch-up.
+                while f.ready.len() < IN_FLIGHT * 2
+                    && let Some(c) = f.live.pop_front()
+                {
+                    f.live_set.remove(&c);
+                    f.ready.push_front(c);
+                }
+                if f.waiting == 0 && f.out.len() < IN_FLIGHT && !f.ready.is_empty() {
+                    let n = f.ready.len().min(IN_FLIGHT);
+                    let chunks: Vec<_> = f.ready.drain(..n).collect();
+                    f.waiting = chunks.len();
+                    if let Some(jobs) = &self.jobs {
+                        let _ = jobs.send(Job::Read { player: id, session: f.session, dimension: f.dimension.clone(), chunks });
+                    }
+                }
+                for msg in pack_chunks(&f.dimension, &mut f.out, budget) {
+                    sends.push((id, msg));
+                }
+                if f.walked && f.ready.is_empty() && f.waiting == 0 && f.out.is_empty() && !f.done_sent {
+                    sends.push((id, encode_done(&f.dimension, f.upto)));
+                    f.done_sent = true;
+                }
+            }
+            self.followers.insert(id, f);
+        }
+        sends
+    }
+
+    /// Walks a follower's catch-up out a few regions a tick, nearest region
+    /// first: the chunks newer than they have, nearest first.
+    fn walk(&self, f: &mut Follower) {
+        if f.walked || f.ready.len() >= IN_FLIGHT * 2 {
+            return;
+        }
+        let Some(regions) = self.index.get(&f.dimension) else {
+            f.walked = true;
+            return;
+        };
+        let distance = |c: (i32, i32)| i64::from((c.0 - f.at.0).abs().max((c.1 - f.at.1).abs()));
+        if !f.started {
+            // Heapified in one go: linear in the regions.
+            let mid = |r: (i32, i32)| (r.0 * REGION + REGION / 2, r.1 * REGION + REGION / 2);
+            f.regions = regions.keys().map(|&r| std::cmp::Reverse((distance(mid(r)), r.0, r.1))).collect();
+            f.started = true;
+        }
+        for _ in 0..REGIONS_PER_TICK {
+            let Some(std::cmp::Reverse((_, rx, rz))) = f.regions.pop() else {
+                f.walked = true;
+                return;
+            };
+            let Some(chunks) = regions.get(&(rx, rz)) else {
+                continue;
+            };
+            let mut new: Vec<(i32, i32)> = chunks
+                .iter()
+                .filter(|(_, (v, _))| *v > f.since && *v <= f.upto)
+                .map(|(&i, _)| (rx * REGION + i32::from(i) % REGION, rz * REGION + i32::from(i) / REGION))
+                .collect();
+            new.sort_by_key(|&c| distance(c));
+            f.ready.extend(new);
+        }
+    }
+}
+
+// ---- The client's side -----------------------------------------------------------------
+
+/// What came from the server, in order, waiting to be coloured.
+#[derive(Debug)]
+pub enum Shared {
+    Chunk(SharedChunk),
+    Done(u64),
+}
+
+/// The client's share of the map it is on.
+#[derive(Debug, Default)]
+pub struct ShareClient {
+    /// The server's version this map has everything up to.
+    pub since: u64,
+    pub inbox: VecDeque<Shared>,
+    /// Some came that the inbox had no room for: this catch-up isn't whole.
+    pub dropped: bool,
+    /// The dimension the hello was sent for (and the map folder), so it is
+    /// sent again on a change.
+    pub hello_for: Option<PathBuf>,
+    /// Chunks received.
+    pub received: u64,
+}
+
+/// The client's side of a connection: whether the server offered its map
+/// (kept across dimensions, unlike `ShareClient`).
+#[derive(Debug, Default)]
+pub struct ShareLink {
+    pub offered: bool,
+    /// The server the offer came from (the world key).
+    pub from: Option<String>,
+}
+
+pub const SHARED_FILE: &str = "shared.txt";
+
+impl ShareClient {
+    /// A message from the server, for the map of `dimension`.
+    pub fn receive(&mut self, dimension: &str, data: &[u8]) {
+        match FromServer::decode(data) {
+            Some(FromServer::Offer) => {}
+            Some(FromServer::Chunks(d, chunks)) if d == dimension => {
+                for (_, c) in chunks {
+                    if self.inbox.len() >= MAX_INBOX {
+                        self.dropped = true;
+                        continue;
+                    }
+                    self.received += 1;
+                    self.inbox.push_back(Shared::Chunk(c));
+                }
+            }
+            Some(FromServer::Done(d, upto)) if d == dimension => {
+                if self.dropped {
+                    self.dropped = false;
+                } else {
+                    self.inbox.push_back(Shared::Done(upto));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Reads `since` from the map folder.
+    pub fn open(&mut self, dir: Option<&std::path::Path>) {
+        let since = dir
+            .and_then(|d| std::fs::read_to_string(d.join(SHARED_FILE)).ok())
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("since=")?.trim().parse().ok()))
+            .unwrap_or(0);
+        *self = Self { since, ..Self::default() };
+    }
+
+    /// Writes `since` to the map folder, beside and renamed over.
+    pub fn save(&self, dir: &std::path::Path) -> bool {
+        let tmp = dir.join(format!("{SHARED_FILE}.tmp"));
+        let done = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&tmp, format!("since={}\n", self.since)))
+            .and_then(|()| std::fs::rename(&tmp, dir.join(SHARED_FILE)));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5612,6 +6726,308 @@ mod tests {
         // Nearer than the minimum distance: none.
         s.settings = Some(Settings { beacons: true, beacon_min: 100, ..Settings::default() });
         assert!(quads(&s, [480.0, 270.0]).is_empty());
+    }
+
+    fn shared_chunk(x: i32, z: i32, ground: u32) -> SharedChunk {
+        let columns = (0..256)
+            .map(|i| SharedColumn {
+                biome: 3,
+                light: (i % 16) as u8,
+                runs: share_column(80, -64, |y| if y == 64 { ground } else if y < 64 { 7 } else { 0 }, |s| match s {
+                    0 => Part::Skip,
+                    _ => Part::Ground,
+                }),
+            })
+            .collect();
+        SharedChunk { x, z, min_y: -64, columns }
+    }
+
+    #[test]
+    fn shared_columns_keep_what_a_map_shows() {
+        // Air, a flower, two of water, sand: the flower and water kept, down
+        // to the sand.
+        let state = |y: i32| match y {
+            70.. => 0,
+            69 => 5,
+            67 | 68 => 9,
+            66 => 12,
+            _ => 1,
+        };
+        let part = |s: u32| match s {
+            0 => Part::Skip,
+            5 => Part::Through,
+            9 => Part::Fluid,
+            _ => Part::Ground,
+        };
+        let runs = share_column(100, -64, state, part);
+        assert_eq!(
+            runs,
+            [
+                Run { top: 69, count: 1, state: 5 },
+                Run { top: 68, count: 2, state: 9 },
+                Run { top: 66, count: 1, state: 12 },
+            ]
+        );
+        // Never more than MAX_RUNS, however striped.
+        let striped = share_column(400, -64, |y| (y & 1) as u32 + 1, |_| Part::Through);
+        assert_eq!(striped.len(), MAX_RUNS);
+        let c = SharedChunk { x: 0, z: 0, min_y: -64, columns: vec![SharedColumn { biome: 2, light: 7, runs }; 256] };
+        assert_eq!(c.state(3, 67, 9, 0), 9);
+        assert_eq!(c.state(3, 75, 9, 0), 0);
+        assert_eq!(c.top(), 69);
+    }
+
+    #[test]
+    fn shared_chunks_round_trip_and_refuse_what_is_broken() {
+        let c = shared_chunk(-12, 70_000, 4);
+        let mut bytes = Vec::new();
+        c.encode(&mut bytes);
+        assert_eq!(SharedChunk::decode(&bytes), Some(c.clone()));
+        // Cut short anywhere, or with anything after: refused.
+        for n in [0, 1, 5, bytes.len() / 2, bytes.len() - 1] {
+            assert!(SharedChunk::decode(&bytes[..n]).is_none(), "{n}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(SharedChunk::decode(&longer).is_none());
+        // Past the world's edge: refused.
+        let far = SharedChunk { x: 3_000_000, ..c.clone() };
+        let mut b = Vec::new();
+        far.encode(&mut b);
+        assert!(SharedChunk::decode(&b).is_none());
+        // Noise never panics, and never makes a huge chunk.
+        let mut seed = 0x1234_5678u64;
+        for _ in 0..2000 {
+            let n = (seed % 600) as usize;
+            let noise: Vec<u8> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 33) as u8
+                })
+                .collect();
+            if let Some(c) = SharedChunk::decode(&noise) {
+                assert!(c.columns.iter().all(|c| c.runs.len() <= MAX_RUNS));
+            }
+            let _ = FromServer::decode(&noise);
+            let _ = decode_hello(&noise);
+            // Flipped bits of a real one.
+            let mut bad = bytes.clone();
+            let at = (seed as usize) % bad.len();
+            bad[at] ^= 1 << (seed % 8);
+            let _ = SharedChunk::decode(&bad);
+        }
+    }
+
+    #[test]
+    fn share_messages_stay_under_the_limits() {
+        assert_eq!(decode_hello(&encode_hello(NETHER, 77)), Some((NETHER.to_owned(), 77)));
+        let mut out: VecDeque<(u64, Vec<u8>)> = (0..40)
+            .map(|i| {
+                let mut b = Vec::new();
+                shared_chunk(i, 0, 4).encode(&mut b);
+                (i as u64 + 1, b)
+            })
+            .collect();
+        let messages = pack_chunks(OVERWORLD, &mut out, usize::MAX);
+        assert!(messages.len() <= MESSAGES_PER_TICK);
+        let mut got = Vec::new();
+        for m in &messages {
+            assert!(m.len() <= 30_000, "{}", m.len());
+            let Some(FromServer::Chunks(d, chunks)) = FromServer::decode(m) else {
+                panic!("not chunks");
+            };
+            assert_eq!(d, OVERWORLD);
+            got.extend(chunks.into_iter().map(|(v, c)| (v, c.x)));
+        }
+        // In order, none lost: what didn't fit waits.
+        assert_eq!(got.len() + out.len(), 40);
+        assert!(got.iter().enumerate().all(|(i, (v, x))| *v == i as u64 + 1 && *x == i as i32));
+        // A small budget sends less, but always something.
+        let mut few: VecDeque<_> = (0..10).map(|i| (i, vec![0u8; 3000])).collect();
+        let m = pack_chunks(OVERWORLD, &mut few, 1);
+        assert_eq!(m.len(), 1);
+        assert_eq!(few.len(), 9);
+        assert_eq!(FromServer::decode(&encode_done(NETHER, 9)), Some(FromServer::Done(NETHER.into(), 9)));
+    }
+
+    /// Ticks `server` until `until` says so, at most two seconds.
+    fn tick_until(server: &mut ShareServer, sent: &mut Vec<(u128, Vec<u8>)>, until: impl Fn(&ShareServer, &[(u128, Vec<u8>)]) -> bool) {
+        let start = Instant::now();
+        while !until(server, sent) {
+            assert!(start.elapsed().as_secs() < 5, "timed out");
+            let here = HashMap::from([(1, OVERWORLD.to_owned()), (2, NETHER.to_owned()), (3, OVERWORLD.to_owned())]);
+            sent.extend(server.tick(1 << 20, &here));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn received(sent: &[(u128, Vec<u8>)], player: u128) -> (Vec<(i32, i32)>, Option<u64>) {
+        let mut chunks = Vec::new();
+        let mut done = None;
+        for (p, m) in sent.iter().filter(|(p, _)| *p == player) {
+            let _ = p;
+            match FromServer::decode(m) {
+                Some(FromServer::Chunks(_, c)) => chunks.extend(c.into_iter().map(|(_, c)| (c.x, c.z))),
+                Some(FromServer::Done(_, upto)) => done = Some(upto),
+                Some(FromServer::Offer) => {}
+                None => panic!("a broken message"),
+            }
+        }
+        (chunks, done)
+    }
+
+    #[test]
+    fn the_server_shares_its_map_nearest_first_and_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("atlas-share-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = ShareServer::default();
+        server.open(dir.clone());
+        let mut sent = Vec::new();
+        tick_until(&mut server, &mut sent, |s, _| s.ready());
+        // 70 chunks spread over regions, one far off.
+        let mut all: Vec<(i32, i32)> = (0..69).map(|i| (i % 10 * 7 - 30, i / 10 * 9 - 20)).collect();
+        all.push((5000, 5000));
+        for &(x, z) in &all {
+            assert!(server.observe(OVERWORLD, &shared_chunk(x, z, 4)));
+        }
+        // The same again changes nothing.
+        assert!(!server.observe(OVERWORLD, &shared_chunk(-30, -20, 4)));
+        // Not offered: a hello is ignored.
+        server.hello(1, OVERWORLD, 0, (0, 0));
+        assert!(server.tick(1 << 20, &HashMap::new()).is_empty());
+        let offers = server.offers(&[1, 2, 3]);
+        assert_eq!(offers.len(), 3);
+        assert_eq!(FromServer::decode(&offers[0].1), Some(FromServer::Offer));
+        assert!(server.offers(&[1, 2, 3]).is_empty(), "once");
+        // A player at (0, 0) with nothing gets it all, then Done.
+        server.hello(1, OVERWORLD, 0, (0, 0));
+        tick_until(&mut server, &mut sent, |_, sent| received(sent, 1).1.is_some());
+        let (chunks, done) = received(&sent, 1);
+        assert_eq!(chunks.len(), all.len());
+        assert_eq!(done, Some(all.len() as u64));
+        assert_eq!(*chunks.last().unwrap(), (5000, 5000), "the far one last");
+        // A change reaches them live.
+        sent.clear();
+        assert!(server.observe(OVERWORLD, &shared_chunk(2, 2, 5)));
+        tick_until(&mut server, &mut sent, |_, sent| !received(sent, 1).0.is_empty());
+        assert_eq!(received(&sent, 1).0, [(2, 2)]);
+        // Another dimension's player doesn't get it.
+        server.hello(2, NETHER, 0, (0, 0));
+        sent.clear();
+        tick_until(&mut server, &mut sent, |_, sent| received(sent, 2).1.is_some());
+        assert!(received(&sent, 2).0.is_empty());
+        // A player who had up to 60 gets only what is newer.
+        server.hello(3, OVERWORLD, 60, (0, 0));
+        sent.clear();
+        tick_until(&mut server, &mut sent, |_, sent| received(sent, 3).1.is_some());
+        assert_eq!(received(&sent, 3).0.len(), all.len() + 1 - 60);
+
+        // Closed and opened again: the index is read from disk, so nothing
+        // known is shared again, and versions go on.
+        server.close();
+        let mut server = ShareServer::default();
+        server.open(dir.clone());
+        let mut s = Vec::new();
+        tick_until(&mut server, &mut s, |s, _| s.ready());
+        assert_eq!(server.total, all.len() + 1);
+        assert!(!server.observe(OVERWORLD, &shared_chunk(2, 2, 5)));
+        assert!(server.observe(OVERWORLD, &shared_chunk(2, 2, 6)));
+        server.offers(&[1]);
+        server.hello(1, OVERWORLD, all.len() as u64 + 1, (0, 0));
+        sent.clear();
+        tick_until(&mut server, &mut sent, |_, sent| received(sent, 1).1.is_some());
+        assert_eq!(received(&sent, 1).0, [(2, 2)]);
+
+        // A broken region file is left out, not a panic.
+        server.close();
+        for e in std::fs::read_dir(dir.join(safe_name(OVERWORLD))).unwrap().flatten() {
+            if e.file_name().to_string_lossy().ends_with(".ats") {
+                std::fs::write(e.path(), b"ATS1 broken").unwrap();
+            }
+        }
+        let mut server = ShareServer::default();
+        server.open(dir.clone());
+        let mut s = Vec::new();
+        tick_until(&mut server, &mut s, |s, _| s.ready());
+        assert_eq!(server.total, 0);
+        server.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_catch_up_waits_till_the_player_is_in_its_dimension() {
+        let dir = std::env::temp_dir().join(format!("atlas-share-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = ShareServer::default();
+        server.open(dir.clone());
+        let start = Instant::now();
+        while !server.ready() {
+            assert!(start.elapsed().as_secs() < 5);
+            server.tick(1 << 20, &HashMap::new());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(server.observe(NETHER, &shared_chunk(1, 1, 4)));
+        server.offers(&[7]);
+        // The hello for the Nether comes while the server still has them in
+        // the Overworld: it waits, then goes on once they are there.
+        server.hello(7, NETHER, 0, (0, 0));
+        let mut there = HashMap::from([(7, OVERWORLD.to_owned())]);
+        for _ in 0..50 {
+            assert!(server.tick(1 << 20, &there).is_empty());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        there.insert(7, NETHER.to_owned());
+        let mut sent = Vec::new();
+        let start = Instant::now();
+        while received(&sent, 7).1.is_none() {
+            assert!(start.elapsed().as_secs() < 5);
+            sent.extend(server.tick(1 << 20, &there));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(received(&sent, 7).0, [(1, 1)]);
+        server.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_read_while_being_written_are_refused() {
+        let text = Settings { share_map: SHARE_ALL, ..Settings::default() }.to_text();
+        assert_eq!(Settings::read_whole(&text).map(|s| s.share_map), Some(SHARE_ALL));
+        // Trimmed, as the game hands it.
+        assert!(Settings::read_whole(text.trim()).is_some());
+        for cut in [0, 5, text.len() / 2, text.len() - 12] {
+            assert!(Settings::read_whole(&text[..cut]).is_none(), "{cut}");
+        }
+        // A line added by hand at the end, or none of the version line: whole.
+        let edited = format!("{}\nshare_map=ops\n", text.lines().skip(1).collect::<Vec<_>>().join("\n"));
+        assert_eq!(Settings::read_whole(&edited).map(|s| s.share_map), Some(SHARE_OPS));
+    }
+
+    #[test]
+    fn a_client_counts_a_catch_up_only_when_whole() {
+        let mut c = ShareClient::default();
+        let mut b = Vec::new();
+        shared_chunk(0, 0, 4).encode(&mut b);
+        let mut out: VecDeque<_> = (0..3).map(|v| (v, b.clone())).collect();
+        for m in pack_chunks(OVERWORLD, &mut out, usize::MAX) {
+            c.receive(OVERWORLD, &m);
+            // Another dimension's: not for this map.
+            c.receive(NETHER, &m);
+        }
+        c.receive(OVERWORLD, &encode_done(OVERWORLD, 9));
+        assert_eq!(c.inbox.len(), 4);
+        assert!(matches!(c.inbox.back(), Some(Shared::Done(9))));
+        // Too much to hold: the Done doesn't count.
+        let mut c = ShareClient::default();
+        let mut out: VecDeque<_> = (0..MAX_INBOX as u64 + 5).map(|v| (v, b.clone())).collect();
+        while !out.is_empty() {
+            for m in pack_chunks(OVERWORLD, &mut out, usize::MAX) {
+                c.receive(OVERWORLD, &m);
+            }
+        }
+        c.receive(OVERWORLD, &encode_done(OVERWORLD, 9));
+        assert_eq!(c.inbox.len(), MAX_INBOX);
+        assert!(!c.inbox.iter().any(|s| matches!(s, Shared::Done(_))));
     }
 
     #[test]
@@ -6525,7 +7941,10 @@ mod tests {
     fn every_setting_does_something() {
         // Those the game side reads: it must read them.
         let bridge = std::fs::read_to_string("mixins/atlas/bridge.rs").unwrap();
-        const GAME_SIDE: [(&str, &str); 14] = [
+        const GAME_SIDE: [(&str, &str); 17] = [
+            ("share_map", "settings.share_map"),
+            ("share_rate", "settings.share_rate"),
+            ("server_map", "settings.server_map"),
             ("transparency", "settings.transparency"),
             ("minimap", "settings.minimap"),
             ("corner", "settings.corner"),

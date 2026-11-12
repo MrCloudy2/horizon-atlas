@@ -134,45 +134,9 @@ impl Palette {
         let Some(f) = facts.states.get(i) else {
             return Look { rgb: 0, map_rgb: 0, tint: Tint::None, flags: AIR };
         };
-        let mut flags = match f.fluid {
-            Fluid::None => 0,
-            Fluid::Water => 1,
-            Fluid::Lava => 2,
-        };
+        let flags = state_flags(id, facts);
         let state = horizon_world::registry::BlockStateId(id);
-        if facts.is_air(state) {
-            flags |= AIR;
-        }
-        // isFaceSturdy(UP, FULL): Direction.UP's ordinal is 1.
-        if f.sturdy_full >> 1 & 1 != 0 {
-            flags |= STURDY_TOP;
-        }
-        if f.map_color != 0 {
-            flags |= MAPPED;
-        }
         let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
-        const FLOWERS: [&str; 15] = [
-            "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "tulip", "oxeye_daisy",
-            "cornflower", "lily_of_the_valley", "wither_rose", "sunflower", "lilac", "rose_bush",
-            "peony", "torchflower",
-        ];
-        if FLOWERS.iter().any(|n| name.ends_with(n)) {
-            flags |= FLOWER;
-        }
-        if name.contains("stained_glass") {
-            flags |= GLASS;
-        }
-        const PLANTS: [&str; 16] = [
-            "short_grass", "tall_grass", "fern", "large_fern", "short_dry_grass", "tall_dry_grass",
-            "bush", "firefly_bush", "dead_bush", "leaf_litter", "wildflowers", "pink_petals",
-            "vine", "glow_lichen", "moss_carpet", "pale_moss_carpet",
-        ];
-        if PLANTS.contains(&name) {
-            flags |= PLANT;
-        }
-        if name.ends_with("_leaves") {
-            flags |= LEAVES;
-        }
         let leaves = name.ends_with("_leaves");
         let tinted = match name {
             // The game's own: these don't follow the biome.
@@ -231,13 +195,110 @@ impl Palette {
     }
 }
 
+/// What the scan and the share need to know of block state `id`: whether
+/// it is a fluid, air, sturdy on top, on maps, or something a setting can
+/// see through. Facts only (no textures), so a server works it out too.
+fn state_flags(id: u32, facts: &BlockFacts) -> u16 {
+    let Some(f) = facts.states.get(id as usize) else {
+        return AIR;
+    };
+    let mut flags = match f.fluid {
+        Fluid::None => 0,
+        Fluid::Water => 1,
+        Fluid::Lava => 2,
+    };
+    let state = horizon_world::registry::BlockStateId(id);
+    if facts.is_air(state) {
+        flags |= AIR;
+    }
+    // isFaceSturdy(UP, FULL): Direction.UP's ordinal is 1.
+    if f.sturdy_full >> 1 & 1 != 0 {
+        flags |= STURDY_TOP;
+    }
+    if f.map_color != 0 {
+        flags |= MAPPED;
+    }
+    let name = f.name.strip_prefix("minecraft:").unwrap_or(&f.name);
+    const FLOWERS: [&str; 15] = [
+        "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "tulip", "oxeye_daisy",
+        "cornflower", "lily_of_the_valley", "wither_rose", "sunflower", "lilac", "rose_bush",
+        "peony", "torchflower",
+    ];
+    if FLOWERS.iter().any(|n| name.ends_with(n)) {
+        flags |= FLOWER;
+    }
+    if name.contains("stained_glass") {
+        flags |= GLASS;
+    }
+    const PLANTS: [&str; 16] = [
+        "short_grass", "tall_grass", "fern", "large_fern", "short_dry_grass", "tall_dry_grass",
+        "bush", "firefly_bush", "dead_bush", "leaf_litter", "wildflowers", "pink_petals",
+        "vine", "glow_lichen", "moss_carpet", "pale_moss_carpet",
+    ];
+    if PLANTS.contains(&name) {
+        flags |= PLANT;
+    }
+    if name.ends_with("_leaves") {
+        flags |= LEAVES;
+    }
+    flags
+}
+
 thread_local! {
     static PALETTE: RefCell<Option<Palette>> = const { RefCell::new(None) };
 }
 
+/// The blocks a scan reads: a chunk of the world, or one a server shared.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Live(&'a horizon_client::chunk::Chunk),
+    /// With the world's air.
+    Shared(&'a m::SharedChunk, u32),
+}
+
+impl Source<'_> {
+    fn get(&self, x: i32, y: i32, z: i32) -> u32 {
+        match self {
+            Source::Live(c) => c.get(x, y, z),
+            Source::Shared(c, air) => c.state(x, y, z, *air),
+        }
+    }
+    fn biome(&self, x: i32, y: i32, z: i32) -> u16 {
+        match self {
+            Source::Live(c) => c.biome(x, y, z),
+            Source::Shared(c, _) => c.biome(x, z),
+        }
+    }
+    fn min_y(&self) -> i32 {
+        match self {
+            Source::Live(c) => c.min_y(),
+            Source::Shared(c, _) => c.min_y,
+        }
+    }
+    fn x(&self) -> i32 {
+        match self {
+            Source::Live(c) => c.x,
+            Source::Shared(c, _) => c.x,
+        }
+    }
+    fn z(&self) -> i32 {
+        match self {
+            Source::Live(c) => c.z,
+            Source::Shared(c, _) => c.z,
+        }
+    }
+    /// The highest block worth scanning from.
+    fn top(&self, air: u32) -> i32 {
+        match self {
+            Source::Live(c) => top_of(c, air),
+            Source::Shared(c, _) => c.top(),
+        }
+    }
+}
+
 /// What a scan reads: the chunk, the block looks, the biome colours.
 struct Scan<'a> {
-    chunk: &'a horizon_client::chunk::Chunk,
+    chunk: Source<'a>,
     palette: &'a mut Palette,
     facts: &'a BlockFacts,
     render: &'a horizon_client::assets::RenderAssets,
@@ -272,7 +333,7 @@ impl Scan<'_> {
                 let b = self.biomes.get(id);
                 match other {
                     Tint::Grass => {
-                        let (wx, wz) = (self.chunk.x * 16 + x, self.chunk.z * 16 + z);
+                        let (wx, wz) = (self.chunk.x() * 16 + x, self.chunk.z() * 16 + z);
                         self.biomes.grass(id, f64::from(wx), f64::from(wz))
                     }
                     Tint::Foliage => b.foliage,
@@ -369,7 +430,7 @@ fn top_of(chunk: &horizon_client::chunk::Chunk, air: u32) -> i32 {
 }
 
 fn scan_tile(scan: &mut Scan<'_>, air: u32, cut: m::Cut) -> m::Tile {
-    let top = top_of(scan.chunk, air);
+    let top = scan.chunk.top(air);
     let mut tile = m::Tile::blank(scan.chunk.min_y() as i16);
     for z in 0..16 {
         for x in 0..16 {
@@ -381,7 +442,7 @@ fn scan_tile(scan: &mut Scan<'_>, air: u32, cut: m::Cut) -> m::Tile {
             // What lights the top of it: the block over it (over the water),
             // or its own where it gives light, as lava does.
             if c & m::WALL == 0 && c & m::KIND != 0 {
-                let (wx, wz) = (scan.chunk.x * 16 + x, scan.chunk.z * 16 + z);
+                let (wx, wz) = (scan.chunk.x() * 16 + x, scan.chunk.z() * 16 + z);
                 let at = |y: i32| (scan.light)(wx, y, wz);
                 tile.light[i] = at(i32::from(h) + 1).max(at(i32::from(h)));
             }
@@ -543,6 +604,7 @@ pub(super) fn frame(game: &mut Game<'_>) {
     let view = game.remote.as_ref().map_or(game.settings.render_distance, |r| r.view_distance);
     m::with(|s| s.view_distance = Some(view));
     scan(game, cut, &settings);
+    share_client(game, &settings);
     if settings.new_chunks || settings.old_chunks {
         check_new_chunks(game);
     }
@@ -600,7 +662,7 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
                         continue;
                     }
                     let mut scan = Scan {
-                        chunk,
+                        chunk: Source::Live(chunk),
                         palette: &mut *palette,
                         facts,
                         render,
@@ -990,4 +1052,392 @@ pub(super) fn hud(
     };
     let draws = m::with(|s| s.minimap_hud(gui, [x, y], &here, &info, &dots, &measure));
     paint(game, batch, draws);
+}
+
+// ---- Map sharing -----------------------------------------------------------
+//
+// The server's side runs on the server's thread (a dedicated server's, or a
+// world of one's own opened to LAN), with state of its own; the client's in
+// the window's frame. See `Map sharing` in core.rs.
+
+/// How long the server's thread spends a level tick on looking at chunks.
+const SHARE_SCAN_BUDGET: Duration = Duration::from_micros(600);
+/// How often a loaded chunk is looked at again for changes.
+const SHARE_RESCAN: Duration = Duration::from_secs(30);
+/// How long the window spends a frame colouring shared chunks.
+const SHARE_APPLY_BUDGET: Duration = Duration::from_micros(1500);
+
+#[derive(Default)]
+struct ServerSide {
+    share: m::ShareServer,
+    dedicated: bool,
+    settings: Option<m::Settings>,
+    last_text: Option<String>,
+    read_at: Option<Instant>,
+    pumped_at: Option<Instant>,
+    /// Loaded chunks to look at, per dimension, each when it is due: those
+    /// just loaded, and those looked at before (each queue in due order).
+    queue: std::collections::HashMap<String, std::collections::VecDeque<((i32, i32), Instant)>>,
+    again: std::collections::HashMap<String, std::collections::VecDeque<((i32, i32), Instant)>>,
+    queued: std::collections::HashSet<(String, (i32, i32))>,
+    /// The flags of each block state, worked out once.
+    flags: Vec<Option<u16>>,
+    told_full: bool,
+    /// The longest a level tick's share work took, for the log at the stop.
+    slowest: Duration,
+}
+
+thread_local! {
+    static SERVER: RefCell<ServerSide> = RefCell::new(ServerSide::default());
+}
+
+/// Who the server shares with, from the setting: Auto is everyone on a
+/// dedicated server, nobody from a world of one's own.
+fn share_mode(settings: &m::Settings, dedicated: bool) -> usize {
+    match settings.share_map {
+        m::SHARE_AUTO if dedicated => m::SHARE_ALL,
+        m::SHARE_AUTO => m::SHARE_OFF,
+        mode => mode,
+    }
+}
+
+/// The server is starting: whether it is a dedicated one.
+pub(super) fn share_server_start(dedicated: bool) {
+    SERVER.with(|cell| cell.borrow_mut().dedicated = dedicated);
+}
+
+/// The server is stopping: everything is written, then the disk thread stops.
+pub(super) fn share_server_stop() {
+    SERVER.with(|cell| {
+        let mut sv = cell.borrow_mut();
+        if sv.share.dir.is_some() {
+            eprintln!("Atlas: map sharing took at most {:.2} ms a tick", sv.slowest.as_secs_f64() * 1000.0);
+        }
+        sv.share.close();
+        sv.queue.clear();
+        sv.again.clear();
+        sv.queued.clear();
+    });
+}
+
+/// A chunk of `dimension` loaded on the server: looked at soon, once its
+/// light is there.
+pub(super) fn share_chunk_loaded(dimension: &str, chunk: [i32; 2]) {
+    SERVER.with(|cell| {
+        let mut sv = cell.borrow_mut();
+        if sv.share.dir.is_none() {
+            return;
+        }
+        let key = (chunk[0], chunk[1]);
+        if sv.queued.insert((dimension.to_owned(), key)) {
+            let due = Instant::now() + Duration::from_secs(2);
+            sv.queue.entry(dimension.to_owned()).or_default().push_back((key, due));
+        }
+    });
+}
+
+/// A level closed: have its share written.
+pub(super) fn share_level_unload() {
+    SERVER.with(|cell| cell.borrow().share.flush());
+}
+
+/// A player left.
+pub(super) fn share_player_left(player: u128) {
+    SERVER.with(|cell| cell.borrow_mut().share.leave(player));
+}
+
+/// A message from a player's client.
+pub(super) fn share_from_client(game: &Game<'_>, player: u128, channel: &str, data: &[u8]) {
+    if channel != m::SHARE_CHANNEL {
+        return;
+    }
+    let Some((dimension, since)) = m::decode_hello(data) else {
+        return;
+    };
+    let Some(p) = game.native_server_players().into_iter().find(|p| p.uuid == player) else {
+        return;
+    };
+    // Where they are, or where they are going: the catch-up waits till the
+    // server has them in that dimension.
+    let at = ((p.position[0].floor() as i32) >> 4, (p.position[2].floor() as i32) >> 4);
+    SERVER.with(|cell| cell.borrow_mut().share.hello(player, &dimension, since, at));
+}
+
+/// What the share keeps of chunk `key` of the level in place, or None when
+/// it isn't loaded.
+fn share_extract(game: &Game<'_>, flags: &mut Vec<Option<u16>>, key: (i32, i32)) -> Option<m::SharedChunk> {
+    let chunk = game.world.chunks.get(&key)?;
+    let facts = game.res.facts();
+    if flags.len() != facts.states.len() {
+        *flags = vec![None; facts.states.len()];
+    }
+    let air = game.world.air.0;
+    let top = top_of(chunk, air);
+    let bottom = chunk.min_y();
+    let mut flag = |id: u32| -> u16 {
+        match flags.get_mut(id as usize) {
+            Some(Some(f)) => *f,
+            Some(slot) => *slot.insert(state_flags(id, facts)),
+            None => AIR,
+        }
+    };
+    let mut columns = Vec::with_capacity(256);
+    for z in 0..16 {
+        for x in 0..16 {
+            let mut cache: Vec<(u32, u16)> = Vec::new();
+            let mut part_of = |s: u32| -> m::Part {
+                let f = match cache.iter().find(|c| c.0 == s) {
+                    Some(c) => c.1,
+                    None => {
+                        let f = flag(s);
+                        cache.push((s, f));
+                        f
+                    }
+                };
+                if f & MAPPED == 0 {
+                    m::Part::Skip
+                } else if f & FLUID != 0 && f & STURDY_TOP == 0 {
+                    m::Part::Fluid
+                } else if f & (FLOWER | GLASS | PLANT | LEAVES) != 0 {
+                    m::Part::Through
+                } else {
+                    m::Part::Ground
+                }
+            };
+            let runs = m::share_column(top, bottom, |y| chunk.get(x, y, z), &mut part_of);
+            let surface = runs.first().map_or(bottom, |r| r.top);
+            let (wx, wz) = (key.0 * 16 + x, key.1 * 16 + z);
+            let light = (game.world.light(wx, surface + 1, wz) & 15).max(game.world.light(wx, surface, wz) & 15);
+            columns.push(m::SharedColumn { biome: chunk.biome(x, surface, z), light, runs });
+        }
+    }
+    Some(m::SharedChunk { x: key.0, z: key.1, min_y: bottom, columns })
+}
+
+/// After each level's tick on the server: reads the settings now and then,
+/// opens or closes the share, looks at due chunks of this level within a
+/// budget, and once a tick sends what is due.
+pub(super) fn share_level_tick(game: &mut Game<'_>, dimension: &str) {
+    if game.remote.is_some() {
+        return;
+    }
+    let tick_started = Instant::now();
+    let world_dir = game.native_world_dir();
+    let players = game.native_server_players();
+    let sends = SERVER.with(|cell| {
+        let mut sv = cell.borrow_mut();
+        let sv = &mut *sv;
+        if sv.read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            // The window may be writing the file: a read is taken when it is
+            // whole, when it is the first, or when it is as it was last time
+            // (a file left by hand, or from an older Atlas, short of some
+            // lines); a half-written one waits for the next. No file: the
+            // defaults.
+            let text = game.native_setting(m::ID, m::SETTINGS_FILE);
+            match &text {
+                None => sv.settings = Some(m::Settings::default()),
+                Some(t) => {
+                    if let Some(read) = m::Settings::read_whole(t) {
+                        sv.settings = Some(read);
+                    } else if sv.settings.is_none() || sv.last_text.as_ref() == Some(t) {
+                        sv.settings = Some(m::Settings::read(|k| (k == m::SETTINGS_FILE).then(|| t.clone())));
+                    }
+                }
+            }
+            sv.last_text = text;
+            sv.read_at = Some(Instant::now());
+        }
+        let settings = sv.settings.unwrap_or_default();
+        let mode = share_mode(&settings, sv.dedicated);
+        if mode == m::SHARE_OFF || world_dir.is_none() {
+            if sv.share.dir.is_some() {
+                sv.share.close();
+                sv.queue.clear();
+                sv.again.clear();
+                sv.queued.clear();
+            }
+            return Vec::new();
+        }
+        if let Some(dir) = world_dir {
+            if sv.share.dir.is_none() {
+                // Every chunk loaded now is looked at too.
+                let now = Instant::now();
+                let q = sv.queue.entry(dimension.to_owned()).or_default();
+                for &key in game.world.chunks.keys() {
+                    if sv.queued.insert((dimension.to_owned(), key)) {
+                        q.push_back((key, now));
+                    }
+                }
+            }
+            if sv.share.dir.is_none() {
+                eprintln!("Atlas: sharing the map with {}", if mode == m::SHARE_OPS { "operators" } else { "everyone" });
+            }
+            sv.share.open(dir.join("atlas-share"));
+        }
+        // Chunks of this level that are due, within the budget.
+        if sv.share.ready() {
+            let started = Instant::now();
+            let now = Instant::now();
+            // The new ones first, then the ones due again; each queue is in
+            // due order, so the first not due ends it.
+            for again in [false, true] {
+                loop {
+                    if started.elapsed() >= SHARE_SCAN_BUDGET {
+                        break;
+                    }
+                    let q = if again { sv.again.get_mut(dimension) } else { sv.queue.get_mut(dimension) };
+                    let Some(q) = q else {
+                        break;
+                    };
+                    match q.front() {
+                        Some(&(_, due)) if due <= now => {}
+                        _ => break,
+                    }
+                    let Some((key, _)) = q.pop_front() else {
+                        break;
+                    };
+                    let Some(chunk) = share_extract(game, &mut sv.flags, key) else {
+                        // Unloaded: forgotten till it loads again.
+                        sv.queued.remove(&(dimension.to_owned(), key));
+                        continue;
+                    };
+                    sv.share.observe(dimension, &chunk);
+                    sv.again.entry(dimension.to_owned()).or_default().push_back((key, now + SHARE_RESCAN));
+                }
+            }
+            if sv.share.full && !sv.told_full {
+                sv.told_full = true;
+                eprintln!("Atlas: the shared map is full ({} chunks); new chunks aren't shared", m::MAX_SHARED_CHUNKS);
+            }
+        }
+        // Once a tick, whichever level ticks first.
+        if sv.pumped_at.is_some_and(|t| t.elapsed() < Duration::from_millis(45)) {
+            return Vec::new();
+        }
+        sv.pumped_at = Some(Instant::now());
+        let allowed: Vec<u128> = players
+            .iter()
+            .filter(|p| mode == m::SHARE_ALL || p.permission >= 2)
+            .map(|p| p.uuid)
+            .collect();
+        let here: std::collections::HashMap<u128, String> =
+            players.iter().map(|p| (p.uuid, p.dimension.clone())).collect();
+        let mut sends = sv.share.offers(&allowed);
+        sends.extend(sv.share.tick(settings.share_rate.max(1) as usize * 1024, &here));
+        sends
+    });
+    for (player, data) in sends {
+        // A full tick's worth was already sent: the rest waits (the share
+        // sends at most a few a tick).
+        let _ = game.native_net_send_to_player(player, m::SHARE_CHANNEL, &data);
+    }
+    let took = tick_started.elapsed();
+    SERVER.with(|cell| {
+        let mut sv = cell.borrow_mut();
+        sv.slowest = sv.slowest.max(took);
+    });
+}
+
+/// A message from the server, on the window.
+pub(super) fn share_from_server(channel: &str, data: &[u8]) {
+    if channel != m::SHARE_CHANNEL {
+        return;
+    }
+    m::with(|s| {
+        if m::FromServer::decode(data) == Some(m::FromServer::Offer) {
+            // Offered (again): say hello for the map in place.
+            s.share_link.offered = true;
+            s.share_link.from = s.world.clone();
+            s.maps.shared.hello_for = None;
+            return;
+        }
+        if !s.settings().server_map {
+            return;
+        }
+        if let Some(dimension) = s.map_dimension.clone() {
+            s.maps.shared.receive(&dimension, data);
+        }
+    });
+}
+
+/// The window's side, each frame: the hello once the server offered its map
+/// (again for each dimension), and the shared chunks coloured within a
+/// budget. The player's own scan of a loaded chunk wins over the server's.
+fn share_client(game: &mut Game<'_>, settings: &m::Settings) {
+    if game.remote.is_none() {
+        // Not on a server: an offer is of the next one only.
+        m::with(|s| s.share_link = m::ShareLink::default());
+        return;
+    }
+    if !settings.server_map {
+        return;
+    }
+    let (offered, dir, hello_for, since, dimension) = m::with(|s| {
+        (s.share_link.offered, s.maps.dir.clone(), s.maps.shared.hello_for.clone(), s.maps.shared.since, s.map_dimension.clone())
+    });
+    if offered
+        && dir.is_some()
+        && hello_for != dir
+        && let Some(dimension) = dimension
+    {
+        // Until the player has joined this fails; it is tried next frame.
+        if game.native_net_send_to_server(m::SHARE_CHANNEL, &m::encode_hello(&dimension, since)).is_ok() {
+            m::with(|s| s.maps.shared.hello_for = dir);
+        }
+    }
+    if m::with(|s| s.maps.shared.inbox.is_empty()) {
+        return;
+    }
+    let facts = game.res.facts();
+    let air = game.world.air.0;
+    let context = game.worker_context();
+    let render = &*context.render;
+    let started = Instant::now();
+    PALETTE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let stale = slot
+            .as_ref()
+            .is_none_or(|p| p.states != facts.states.len() || p.texture_layers != render.texture_layers);
+        if stale {
+            *slot = Some(Palette::new(facts, render));
+        }
+        let Some(palette) = slot.as_mut() else {
+            return;
+        };
+        while started.elapsed() < SHARE_APPLY_BUDGET {
+            let Some(item) = m::with(|s| s.maps.shared.inbox.pop_front()) else {
+                return;
+            };
+            let chunk = match item {
+                m::Shared::Done(upto) => {
+                    m::with(|s| s.maps.shared.since = s.maps.shared.since.max(upto));
+                    continue;
+                }
+                m::Shared::Chunk(c) => c,
+            };
+            let key = (chunk.x, chunk.z);
+            // The player's own scan of it wins.
+            if m::with(|s| s.scans.contains_key(&(m::Cut::Surface, key))) {
+                continue;
+            }
+            let light = |x: i32, _y: i32, z: i32| chunk.light(x - chunk.x * 16, z - chunk.z * 16);
+            let mut scan = Scan {
+                chunk: Source::Shared(&chunk, air),
+                palette: &mut *palette,
+                facts,
+                render,
+                biomes: &context.biomes,
+                vanilla: settings.color_mode == 1,
+                hide: u16::from(!settings.flowers) * FLOWER
+                    | u16::from(!settings.stained_glass) * GLASS
+                    | u16::from(!settings.plants) * PLANT
+                    | u16::from(!settings.leaves) * LEAVES,
+                cave_depth: settings.cave_depth,
+                transparency: settings.transparency,
+                light: &light,
+            };
+            let tile = scan_tile(&mut scan, air, m::Cut::Surface);
+            m::with(|s| s.put_shared(key, tile));
+        }
+    });
 }
