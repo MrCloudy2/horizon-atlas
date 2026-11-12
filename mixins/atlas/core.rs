@@ -1359,6 +1359,9 @@ settings! {
     toggle_enlarged: bool = false, "toggle_enlarged", "Toggled Enlarged Minimap", View, Kind::Toggle;
     hide_under_screen: bool = true, "hide_under_screen", "Hide When Under Screen", View, Kind::Toggle;
     hide_under_f3: bool = true, "hide_under_f3", "Hide When Under F3", View, Kind::Toggle;
+    fps_limiter: bool = false, "fps_limiter", "Minimap FPS Limiter", View, Kind::Toggle;
+    fps_limit: i32 = 60, "fps_limit", "Minimap FPS Limit", View,
+        Kind::Slider { min: 5, max: 240, div: 1, unit: "", zero: None };
 
     mode: MapMode = MapMode::Auto, "mode", "Cave Mode", BlockMap, Kind::Choice(MODES);
     layer_y: i32 = 64, "layer", "Layer Mode Height", BlockMap,
@@ -2512,6 +2515,8 @@ pub struct State {
     /// The image has been uploaded.
     pub mini_ready: bool,
     pub mini_uploaded: Option<Instant>,
+    /// When the minimap's image was last composed (the FPS limiter).
+    pub mini_composed: Option<Instant>,
     /// Shaded chunks of `shade_cut`, for composing the image every frame.
     pub shade_cache: HashMap<(i32, i32), Rc<ShadedChunk>>,
     pub shade_cut: Option<Cut>,
@@ -2578,6 +2583,7 @@ impl Default for State {
             gui_scale: 2.0,
             mini_ready: false,
             mini_uploaded: None,
+            mini_composed: None,
             shade_cache: HashMap::new(),
             shade_cut: None,
             sky: 15.0,
@@ -3283,7 +3289,6 @@ impl State {
         let turning = self.turning();
         let n = self.mini_n;
         let grid = mini_grid(x, z, yaw, turning, bpp, n);
-        self.mini_grid = Some(grid);
         let slime = seed.filter(|_| st.slime);
         // The blocks the image can reach.
         let reach = (n as f64 * grid.bpp * std::f64::consts::SQRT_2 / 2.0).ceil() as i32 + 2;
@@ -3308,8 +3313,20 @@ impl State {
             square: self.view_distance.filter(|_| st.view_square).map(|vd| (bx >> 4, bz >> 4, vd)),
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
+            self.mini_grid = Some(grid);
             return false;
         }
+        // XaeroPlus's limiter: a new image at most `fps_limit` times a
+        // second; till then the last one stays where it was drawn.
+        if st.fps_limiter
+            && !self.mini_image.is_empty()
+            && self.mini_grid.is_some_and(|g| g.n == n)
+            && self.mini_composed.is_some_and(|t| t.elapsed().as_secs_f64() < 1.0 / f64::from(st.fps_limit.max(1)))
+        {
+            return false;
+        }
+        self.mini_grid = Some(grid);
+        self.mini_composed = Some(Instant::now());
         if self.shade_cut != Some(cut) || self.shade_cache.len() > 8192 {
             self.shade_cache.clear();
             self.shade_cut = Some(cut);
@@ -5943,6 +5960,25 @@ mod tests {
     }
 
     #[test]
+    fn the_fps_limiter_holds_the_minimap_image() {
+        let mut s = State::default();
+        s.maps.store(Cut::Surface).put(0, 0, grass(64));
+        s.settings = Some(Settings { fps_limiter: true, fps_limit: 5, ..Settings::default() });
+        assert!(s.update_minimap(0.5, 0.5, 0.0));
+        let held = s.mini_grid;
+        // A block on, within a fifth of a second: the old image and grid stay.
+        assert!(!s.update_minimap(1.5, 0.5, 0.0));
+        assert_eq!(s.mini_grid, held);
+        // Once the fifth is up, a new one.
+        s.mini_composed = Some(Instant::now() - std::time::Duration::from_millis(250));
+        assert!(s.update_minimap(1.5, 0.5, 0.0));
+        assert_ne!(s.mini_grid, held);
+        // Off: every change makes a new image.
+        s.settings = Some(Settings::default());
+        assert!(s.update_minimap(2.5, 0.5, 0.0));
+    }
+
+    #[test]
     fn the_minimap_image_shades_like_a_map_and_rounds() {
         let mut live = Store::default();
         live.put(0, 0, grass(64));
@@ -6498,6 +6534,8 @@ mod tests {
             "delete_reached",
             "new_to_bottom",
             "cross_dim_tp",
+            "fps_limiter",
+            "fps_limit",
             // Only in the Nether: its own test.
             "ow_in_nether",
         ];
