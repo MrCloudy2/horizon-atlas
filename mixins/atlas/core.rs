@@ -474,6 +474,12 @@ pub enum Action {
     ToggleAll,
     /// The Layer mode's height up or down a block (16 with Shift).
     LayerStep(i32),
+    /// The drawing tool on or off.
+    ToggleDraw,
+    /// The drawing tool's next pen.
+    DrawColor,
+    /// The last line drawn here off again.
+    UndoStroke,
 }
 
 /// A clickable rectangle `[x, y, w, h]` of the screen drawn this frame.
@@ -2512,6 +2518,90 @@ impl Maps {
     }
 }
 
+// ---- Drawings ---------------------------------------------------------------------
+
+/// The pens of the world map's drawing tool (as XaeroPlus's), ARGB.
+pub const DRAW_COLORS: [(u32, &str); 8] = [
+    (0xFFFF_FFFF, "White"),
+    (0xFFE8_3030, "Red"),
+    (0xFFF0_D020, "Yellow"),
+    (0xFF40_D040, "Green"),
+    (0xFF40_D8E8, "Aqua"),
+    (0xFF38_68F8, "Blue"),
+    (0xFFC8_48E8, "Purple"),
+    (0xFF10_1010, "Black"),
+];
+/// Beside a dimension's map.
+pub const DRAWINGS_FILE: &str = "drawings.txt";
+/// A line's points, and a dimension's lines, at most: what one drag or a
+/// file can hold stays small to keep and to draw.
+const STROKE_POINTS: usize = 4096;
+const STROKES_MAX: usize = 2000;
+/// How far apart (GUI pixels) a line's points are taken, how thick it
+/// draws, and how near the eraser takes a line.
+const POINT_STEP: f32 = 2.0;
+const LINE_WIDTH: f32 = 2.0;
+const ERASE_REACH: f32 = 5.0;
+
+/// A line drawn on the world map, its points the blocks it went through.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stroke {
+    pub color: u32,
+    pub points: Vec<[i32; 2]>,
+}
+
+/// A dimension's lines as text: a line each, its colour then its points.
+pub fn encode_drawings(strokes: &[Stroke]) -> String {
+    let mut out = String::new();
+    for s in strokes {
+        out += &format!("{:08x}", s.color);
+        for [x, z] in &s.points {
+            out += &format!(" {x},{z}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// [`encode_drawings`]'s lines back, those it can read, as many as are kept.
+pub fn decode_drawings(text: &str) -> Vec<Stroke> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let color = u32::from_str_radix(words.next()?, 16).ok()?;
+            let points: Vec<[i32; 2]> = words
+                .take(STROKE_POINTS)
+                .filter_map(|w| {
+                    let (x, z) = w.split_once(',')?;
+                    Some([x.parse().ok()?, z.parse().ok()?])
+                })
+                .collect();
+            (!points.is_empty()).then_some(Stroke { color, points })
+        })
+        .take(STROKES_MAX)
+        .collect()
+}
+
+/// GUI distance from `p` to the segment `a`-`b`.
+fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx * dx + dy * dy;
+    let t = if len > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len).clamp(0.0, 1.0) } else { 0.0 };
+    let (cx, cy) = (a[0] + t * dx - p[0], a[1] + t * dy - p[1]);
+    (cx * cx + cy * cy).sqrt()
+}
+
+/// The drawing tool: on or off, its pen, the line being drawn, and each
+/// dimension's lines by their map folder (read once, written on a change).
+#[derive(Debug, Default)]
+pub struct Drawing {
+    pub on: bool,
+    pub color: usize,
+    pub stroke: Option<Stroke>,
+    pub erasing: bool,
+    pub sheets: HashMap<PathBuf, Vec<Stroke>>,
+}
+
 // ---- State -----------------------------------------------------------------------
 
 /// Everything the mod keeps, on the window's thread.
@@ -2609,6 +2699,7 @@ pub struct State {
     pub other_cut: Cut,
     /// The server's view distance in chunks, as it last said.
     pub view_distance: Option<i32>,
+    pub draw: Drawing,
 }
 
 impl Default for State {
@@ -2667,6 +2758,7 @@ impl Default for State {
             other_maps: Maps::default(),
             other_cut: Cut::Surface,
             view_distance: None,
+            draw: Drawing::default(),
         }
     }
 }
@@ -3186,6 +3278,9 @@ impl State {
         self.confirm_delete = None;
         self.skip_char = None;
         self.map.dragging = false;
+        self.end_stroke();
+        self.draw.on = false;
+        self.draw.erasing = false;
     }
 
     /// Switches to world `key`'s waypoints, read from `dir`, when it changed.
@@ -4008,6 +4103,133 @@ impl State {
                     self.centre_on(h);
                 }
             }
+            Action::ToggleDraw => {
+                self.end_stroke();
+                self.draw.on = !self.draw.on;
+            }
+            Action::DrawColor => self.draw.color = (self.draw.color + 1) % DRAW_COLORS.len(),
+            Action::UndoStroke => {
+                if self.sheet().and_then(Vec::pop).is_some() {
+                    self.save_sheet();
+                }
+            }
+        }
+    }
+
+    /// The map folder of the dimension the world map shows.
+    fn shown_dir(&self) -> Option<PathBuf> {
+        Some(map_dir(self.dir.as_ref()?, self.world.as_ref()?, &self.shown_dimension()))
+    }
+
+    /// The lines of the dimension the world map shows, read the first time.
+    fn sheet(&mut self) -> Option<&mut Vec<Stroke>> {
+        let dir = self.shown_dir()?;
+        let sheet = self.draw.sheets.entry(dir).or_insert_with_key(|dir| {
+            std::fs::read_to_string(dir.join(DRAWINGS_FILE)).map(|t| decode_drawings(&t)).unwrap_or_default()
+        });
+        Some(sheet)
+    }
+
+    /// The shown dimension's lines written whole (none left: no file).
+    fn save_sheet(&mut self) {
+        let Some(dir) = self.shown_dir() else {
+            return;
+        };
+        let Some(sheet) = self.draw.sheets.get(&dir) else {
+            return;
+        };
+        let file = dir.join(DRAWINGS_FILE);
+        if sheet.is_empty() {
+            let _ = std::fs::remove_file(file);
+        } else if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = write_whole(&file, encode_drawings(sheet).as_bytes());
+        }
+    }
+
+    /// The block under the pointer goes on the line being drawn, when it's
+    /// far enough on from the last.
+    fn extend_stroke(&mut self) {
+        let size = self.screen_size;
+        let [x, z] = self.map.world(self.mouse, size);
+        let block = [x.floor() as i32, z.floor() as i32];
+        let Some(stroke) = &mut self.draw.stroke else {
+            return;
+        };
+        if let Some(&[lx, lz]) = stroke.points.last() {
+            let last = self.map.screen(f64::from(lx) + 0.5, f64::from(lz) + 0.5, size);
+            let far = (last[0] - self.mouse[0]).hypot(last[1] - self.mouse[1]);
+            if [lx, lz] == block || far < POINT_STEP || stroke.points.len() >= STROKE_POINTS {
+                return;
+            }
+        }
+        stroke.points.push(block);
+    }
+
+    /// The line being drawn is done: kept with the rest and written.
+    fn end_stroke(&mut self) {
+        let Some(stroke) = self.draw.stroke.take() else {
+            return;
+        };
+        let Some(sheet) = self.sheet() else {
+            return;
+        };
+        if sheet.len() >= STROKES_MAX {
+            sheet.remove(0);
+        }
+        sheet.push(stroke);
+        self.save_sheet();
+    }
+
+    /// The lines under the pointer off.
+    fn erase_at_pointer(&mut self) {
+        let (size, mouse, map) = (self.screen_size, self.mouse, self.map.clone());
+        let Some(sheet) = self.sheet() else {
+            return;
+        };
+        let before = sheet.len();
+        let at = |p: &[i32; 2]| map.screen(f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, size);
+        sheet.retain(|s| {
+            let first = at(&s.points[0]);
+            let near = s.points.len() == 1 && (first[0] - mouse[0]).hypot(first[1] - mouse[1]) <= ERASE_REACH;
+            !(near || s.points.windows(2).any(|w| segment_distance(mouse, at(&w[0]), at(&w[1])) <= ERASE_REACH))
+        });
+        if sheet.len() != before {
+            self.save_sheet();
+        }
+    }
+
+    /// The shown dimension's lines and the one being drawn, over the map.
+    fn draw_lines(&mut self, out: &mut Out<'_>, size: [f32; 2]) {
+        let map = self.map.clone();
+        let current = self.draw.stroke.clone();
+        let Some(sheet) = self.sheet() else {
+            return;
+        };
+        let half = LINE_WIDTH / 2.0;
+        for stroke in sheet.iter().chain(current.as_ref()) {
+            let mut last: Option<[f32; 2]> = None;
+            for p in &stroke.points {
+                let at = map.screen(f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, size);
+                match last {
+                    // Points closer than a pixel are drawn as one.
+                    Some(l) if (at[0] - l[0]).abs() + (at[1] - l[1]).abs() < 1.0 => continue,
+                    Some(l) => {
+                        let off = |q: [f32; 2]| q[0] < -8.0 || q[1] < -8.0 || q[0] > size[0] + 8.0 || q[1] > size[1] + 8.0;
+                        if !(off(l) && off(at)) {
+                            let len = (at[0] - l[0]).hypot(at[1] - l[1]);
+                            let n = [-(at[1] - l[1]) / len * half, (at[0] - l[0]) / len * half];
+                            out.draws.push(Draw::Quad(
+                                [[l[0] + n[0], l[1] + n[1]], [at[0] + n[0], at[1] + n[1]], [at[0] - n[0], at[1] - n[1]], [l[0] - n[0], l[1] - n[1]]],
+                                stroke.color,
+                            ));
+                            // The joint, so turns have no gaps.
+                            out.fill([at[0] - half, at[1] - half, LINE_WIDTH, LINE_WIDTH], stroke.color);
+                        }
+                    }
+                    None => out.fill([at[0] - half, at[1] - half, LINE_WIDTH, LINE_WIDTH], stroke.color),
+                }
+                last = Some(at);
+            }
         }
     }
 
@@ -4074,6 +4296,8 @@ impl State {
                         let mouse = self.mouse;
                         self.create_at_pointer(mouse, here, key_char(k));
                     }
+                    "key.keyboard.d" => self.act(Action::ToggleDraw, here),
+                    "key.keyboard.z" if self.draw.on => self.act(Action::UndoStroke, here),
                     _ => {}
                 }
             }
@@ -4170,13 +4394,30 @@ impl State {
     /// `widgets` (this frame's).
     pub fn press(&mut self, button: i32, mouse: [f32; 2], widgets: &[Widget], here: Option<&Here>) {
         self.mouse = mouse;
-        if let Some(action) = hit(widgets, mouse) {
+        // Drawing goes over waypoints' markers.
+        let hit = hit(widgets, mouse).filter(|a| !(self.draw.on && matches!(a, Action::MapWaypoint(_))));
+        if let Some(action) = hit {
             if button == 0 {
                 self.act(action, here);
             }
             return;
         }
         if self.mode != Mode::Map {
+            return;
+        }
+        if self.draw.on {
+            match button {
+                0 => {
+                    let color = DRAW_COLORS[self.draw.color % DRAW_COLORS.len()].0;
+                    self.draw.stroke = Some(Stroke { color, points: Vec::new() });
+                    self.extend_stroke();
+                }
+                1 => {
+                    self.draw.erasing = true;
+                    self.erase_at_pointer();
+                }
+                _ => {}
+            }
             return;
         }
         match button {
@@ -4376,15 +4617,28 @@ impl State {
         if button == 0 {
             self.map.dragging = false;
             self.slider = None;
+            self.end_stroke();
+        }
+        if button == 1 {
+            self.draw.erasing = false;
         }
     }
 
-    /// The pointer moved `delta` with a button held.
-    pub fn drag(&mut self, button: i32, delta: [f32; 2]) -> bool {
+    /// The pointer moved `delta` with a button held, to `mouse`.
+    pub fn drag(&mut self, button: i32, delta: [f32; 2], mouse: [f32; 2]) -> bool {
         if button == 0 && self.slider.is_some() {
             self.mouse[0] += delta[0];
             self.mouse[1] += delta[1];
             self.slide();
+            return true;
+        }
+        if self.mode == Mode::Map && ((button == 0 && self.draw.stroke.is_some()) || (button == 1 && self.draw.erasing)) {
+            self.mouse = mouse;
+            if button == 0 {
+                self.extend_stroke();
+            } else {
+                self.erase_at_pointer();
+            }
             return true;
         }
         if self.mode != Mode::Map || button != 0 || !self.map.dragging {
@@ -4990,6 +5244,7 @@ impl State {
         // The player, where they would be in the dimension shown.
         let player = here.and_then(|h| Some((convert(h.pos, &h.dimension, &dimension)?, h.yaw)));
         self.draw_map_overlays(out, size, player.map(|p| p.0));
+        self.draw_lines(out, size);
 
         // Waypoints: their letter, and their name over it.
         let mut hot = None;
@@ -5070,7 +5325,13 @@ impl State {
         let mut buttons: Vec<(String, Action)> = vec![
             ("Waypoints".into(), Action::OpenList),
             ("Centre".into(), Action::Centre),
+            ("Draw".into(), Action::ToggleDraw),
         ];
+        if self.draw.on {
+            buttons.push(("Undo".into(), Action::UndoStroke));
+            // Room on its right for the pen's colour.
+            buttons.push((format!("{}  ", DRAW_COLORS[self.draw.color % DRAW_COLORS.len()].1), Action::DrawColor));
+        }
         if st.mode == MapMode::Layer {
             buttons.push(("+".into(), Action::LayerStep(1)));
             buttons.push((format!("Y {}", st.layer_y), Action::LayerStep(0)));
@@ -5085,14 +5346,19 @@ impl State {
             let w = out.width(&label) + 10.0;
             x -= w;
             if live {
-                let on = action == Action::Centre && self.map.follow;
+                let on = (action == Action::Centre && self.map.follow) || (action == Action::ToggleDraw && self.draw.on);
+                let pen = (action == Action::DrawColor).then(|| DRAW_COLORS[self.draw.color % DRAW_COLORS.len()].0);
                 out.button([x, by, w, 14.0], &label, action, on);
+                if let Some(pen) = pen {
+                    out.fill([x + w - 6.0, by + 3.0, 3.0, 8.0], pen);
+                }
             }
             x -= 3.0;
         }
         let hint = match hot {
             Some(i) => format!("Click to edit {}", self.waypoints[i].name),
-            None => "Drag to move, wheel to zoom, B for a waypoint here, Space to centre".into(),
+            None if self.draw.on => "Drag to draw, right drag to erase, Z to undo, D to stop drawing".into(),
+            None => "Drag to move, wheel to zoom, B for a waypoint here, Space to centre, D to draw".into(),
         };
         let hint = out.fit(&hint, x - 8.0);
         out.text(&hint, [4.0, size[1] - 14.0], MUTED);
@@ -6653,6 +6919,80 @@ mod tests {
         assert_eq!(key(FOLDER_DOMAIN, "example.net."), "server-example.net");
         // Whatever the name, the folder is a plain name.
         assert_eq!(safe_name(&key(FOLDER_NAME, "connect.2b2t.org")), "server-name-Anarchy");
+    }
+
+    #[test]
+    fn lines_drawn_on_the_world_map_are_kept_undone_and_erased() {
+        let dir = std::env::temp_dir().join(format!("atlas-draw-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = map_dir(&dir, "world-draw", OVERWORLD).join(DRAWINGS_FILE);
+        let measure = |t: &str| t.len() as f32 * 6.0;
+        let size = [480.0, 270.0];
+        let h = here(OVERWORLD);
+        let mut s = State::default();
+        s.load_world(Some("world-draw".into()), dir.clone());
+        s.open_map(Some(&h), None);
+        s.screen(size, [100.0, 100.0], Some(&h), &measure);
+        let centre = s.map.centre;
+
+        s.key("key.keyboard.d", false, Some(&h), KEYS);
+        assert!(s.draw.on);
+        // A line across: drawn, not a drag of the map, and written.
+        s.press(0, [100.0, 100.0], &[], Some(&h));
+        for i in 1..=20 {
+            assert!(s.drag(0, [5.0, 0.0], [100.0 + 5.0 * i as f32, 100.0]));
+        }
+        s.release(0);
+        assert_eq!(s.map.centre, centre);
+        let saved = decode_drawings(&std::fs::read_to_string(&file).unwrap());
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].points.len() >= 20, "{}", saved[0].points.len());
+        assert_eq!(saved[0].color, DRAW_COLORS[0].0);
+        let (draws, _) = s.screen(size, [0.0, 0.0], Some(&h), &measure);
+        assert!(draws.iter().any(|d| matches!(d, Draw::Quad(_, c) if *c == DRAW_COLORS[0].0)));
+
+        // Another, red, then undone.
+        s.act(Action::DrawColor, Some(&h));
+        s.press(0, [100.0, 200.0], &[], Some(&h));
+        s.drag(0, [0.0, -20.0], [100.0, 180.0]);
+        s.release(0);
+        assert_eq!(decode_drawings(&std::fs::read_to_string(&file).unwrap()).len(), 2);
+        s.key("key.keyboard.z", false, Some(&h), KEYS);
+        assert_eq!(decode_drawings(&std::fs::read_to_string(&file).unwrap()), saved);
+
+        // Kept: a new start reads it back.
+        let mut again = State::default();
+        again.load_world(Some("world-draw".into()), dir.clone());
+        again.open_map(Some(&h), None);
+        let (draws, _) = again.screen(size, [0.0, 0.0], Some(&h), &measure);
+        assert!(draws.iter().any(|d| matches!(d, Draw::Quad(_, c) if *c == DRAW_COLORS[0].0)));
+
+        // The eraser: a miss leaves it, a right drag over it takes it.
+        again.key("key.keyboard.d", false, Some(&h), KEYS);
+        again.press(1, [150.0, 150.0], &[], Some(&h));
+        again.release(1);
+        assert!(file.exists());
+        again.press(1, [150.0, 80.0], &[], Some(&h));
+        again.drag(1, [0.0, 20.0], [150.0, 100.0]);
+        again.release(1);
+        assert!(!file.exists());
+        // Off again, the map drags as before.
+        again.key("key.keyboard.d", false, Some(&h), KEYS);
+        again.press(0, [100.0, 100.0], &[], Some(&h));
+        again.drag(0, [10.0, 0.0], [110.0, 100.0]);
+        assert_ne!(again.map.centre, centre);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drawings_read_back_what_they_wrote_and_skip_the_rest() {
+        let lines = vec![
+            Stroke { color: 0xFFE8_3030, points: vec![[1, -2], [-30000000, 30000000]] },
+            Stroke { color: 0xFF10_1010, points: vec![[5, 5]] },
+        ];
+        assert_eq!(decode_drawings(&encode_drawings(&lines)), lines);
+        let text = "zz 1,2\nffffffff\nffffffff 1,2 x,3 4,y 5,6\n\nffffffff 7\n";
+        assert_eq!(decode_drawings(text), vec![Stroke { color: 0xFFFF_FFFF, points: vec![[1, 2], [5, 6]] }]);
     }
 
     #[test]
@@ -8249,7 +8589,7 @@ mod tests {
         let slider = w.iter().find(|x| matches!(x.action, Action::Slide(i, _) if i == size_opt)).unwrap().rect;
         s.press(0, [slider[0] + slider[2] - 4.0, slider[1] + 5.0], &w, None);
         assert_eq!(s.settings().size, 60);
-        assert!(s.drag(0, [-(slider[2] - 8.0), 0.0]));
+        assert!(s.drag(0, [-(slider[2] - 8.0), 0.0], [0.0; 2]));
         assert_eq!(s.settings().size, 10);
         s.release(0);
         assert!(s.take_changed_settings().is_some());
@@ -8286,10 +8626,10 @@ mod tests {
         assert!(s.map.bpp < 1.0);
         // Dragging moves it and stops following.
         s.press(0, [200.0, 100.0], &[], Some(&h));
-        assert!(s.drag(0, [10.0, 0.0]));
+        assert!(s.drag(0, [10.0, 0.0], [0.0; 2]));
         assert!(!s.map.follow);
         s.release(0);
-        assert!(!s.drag(0, [10.0, 0.0]));
+        assert!(!s.drag(0, [10.0, 0.0], [0.0; 2]));
         // A right click opens the form there, and Save goes back to the map.
         s.map = MapView {
             centre: [0.0, 0.0],

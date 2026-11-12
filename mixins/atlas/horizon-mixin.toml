@@ -127,6 +127,7 @@ bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
   { name = "button", ty = "i32", value = "button" },
   { name = "delta", ty = "[f32; 2]", value = "delta" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
   { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
 ]
 

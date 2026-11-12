@@ -23,6 +23,10 @@ zoom, and press **B** over any spot to make a waypoint there. The dimension butt
 from wherever you are (the Nether's centred where you would be there), and the pointer's line gives the same spot's
 Nether or Overworld coordinates.
 
+Press **D** (or the Draw button) to draw on the map: drag to draw a line, right-drag over a line to erase it, **Z**
+to undo the last one, and the pen button for another colour. Lines are kept with that dimension's map; press **D**
+again to go back to moving the map.
+
 ![The world map](docs/images/world-map.jpg)
 
 ### Map modes
@@ -126,7 +130,7 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 - The map columns follow Horizon's minimap (MIT)
 - Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
   switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons, the minimap
-  FPS limiter, the minimap's dimension switching, the see-through obsidian roof and the server folder modes come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+  FPS limiter, the minimap's dimension switching, the see-through obsidian roof, the server folder modes and drawing on the world map come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 
