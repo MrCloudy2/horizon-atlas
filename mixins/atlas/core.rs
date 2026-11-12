@@ -2701,6 +2701,19 @@ pub fn decode(text: &str) -> Vec<Waypoint> {
         .collect()
 }
 
+/// Writes `path` whole: a new file beside it, renamed over it, so a crash
+/// or a full disk half way leaves the old one as it was.
+pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let done = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
 /// A key or id as a plain file name.
 pub fn safe_name(key: &str) -> String {
     key.chars()
@@ -3165,7 +3178,7 @@ impl State {
             return "Atlas: /atlas seed <seed>".into();
         };
         self.seed = Some(seed);
-        let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(path, seed.to_string()));
+        let _ = std::fs::create_dir_all(&dir).and_then(|()| write_whole(&path, seed.to_string().as_bytes()));
         let hint = if self.settings().slime { "" } else { " (turn on with /atlas slime on)" };
         format!("Atlas: seed {seed} for slime chunks{hint}")
     }
@@ -3398,8 +3411,7 @@ impl State {
         let (Some(dir), Some(key)) = (&self.dir, &self.world) else {
             return;
         };
-        let _ = std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(dir.join(world_file(key)), encode(&self.waypoints)));
+        let _ = std::fs::create_dir_all(dir).and_then(|()| write_whole(&dir.join(world_file(key)), encode(&self.waypoints).as_bytes()));
     }
 
     fn default_name(&self) -> String {
