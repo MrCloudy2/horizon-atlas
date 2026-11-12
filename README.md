@@ -101,6 +101,7 @@ player who runs Atlas, nearest first, and changes follow as the server sees them
 | **Z** | Enlarged minimap |
 | **[** and **]** | Zoom the minimap |
 | **Tab** | Faces and icons on the minimap |
+| (unbound) | Both maps show the next dimension's map (also `/atlas dimension`) |
 
 All but Tab can be changed in Options > Mods > Atlas.
 
@@ -122,8 +123,8 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 - Based on [Waypoints](https://github.com/Nirokx/horizon-waypoints) by Nirokx (MIT)
 - The map columns follow Horizon's minimap (MIT)
 - Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
-  switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons and the minimap
-  FPS limiter come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+  switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons, the minimap
+  FPS limiter and the minimap's dimension switching come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

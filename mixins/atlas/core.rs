@@ -42,6 +42,10 @@ pub const KEY_ZOOM_IN: &str = "zoom_in";
 pub const DEFAULT_ZOOM_IN: &str = "key.keyboard.right.bracket";
 pub const KEY_ZOOM_OUT: &str = "zoom_out";
 pub const DEFAULT_ZOOM_OUT: &str = "key.keyboard.left.bracket";
+/// XaeroPlus's dimension switching from the game: the maps show the next
+/// dimension's map (unbound until the player picks a key).
+pub const KEY_DIMENSION: &str = "dimension";
+pub const DEFAULT_DIMENSION: &str = "key.keyboard.unknown";
 pub const KEY_TEMP: &str = "temporary";
 pub const DEFAULT_TEMP: &str = "key.keyboard.h";
 pub const KEY_MAP: &str = "map";
@@ -1370,6 +1374,7 @@ settings! {
     hide_under_screen: bool = true, "hide_under_screen", "Hide When Under Screen", View, Kind::Toggle;
     hide_under_f3: bool = true, "hide_under_f3", "Hide When Under F3", View, Kind::Toggle;
     fps_limiter: bool = false, "fps_limiter", "Minimap FPS Limiter", View, Kind::Toggle;
+    mini_follows: bool = true, "mini_dimension", "Minimap Shows the Map's Dimension", View, Kind::Toggle;
     fps_limit: i32 = 60, "fps_limit", "Minimap FPS Limit", View,
         Kind::Slider { min: 5, max: 240, div: 1, unit: "", zero: None };
 
@@ -1977,6 +1982,8 @@ pub fn tint_grid(grid: &MiniGrid, color: usize, width: i32, image: &mut [u8]) {
 /// What the minimap's image was composed for, to skip composing it again.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MiniKey {
+    /// Of another dimension's maps.
+    pub other: bool,
     pub origin: [i64; 2],
     pub yaw_bits: u32,
     pub bpp_bits: u32,
@@ -2565,7 +2572,8 @@ pub struct State {
     pub mini_composed: Option<Instant>,
     /// Shaded chunks of `shade_cut`, for composing the image every frame.
     pub shade_cache: HashMap<(i32, i32), Rc<ShadedChunk>>,
-    pub shade_cut: Option<Cut>,
+    /// With whether it is of the other dimension's maps.
+    pub shade_cut: Option<(Cut, bool)>,
     /// The sky's light the maps are shaded for (`sky_light`).
     pub sky: f32,
     /// The enlarge key is held, or toggled on.
@@ -3287,7 +3295,7 @@ impl State {
     /// Chunk `chunk` was scanned for `cut` at world revision `revision`.
     pub fn put_scan(&mut self, cut: Cut, chunk: (i32, i32), revision: u64, tile: Tile) {
         self.scans.insert((cut, chunk), (revision, Instant::now()));
-        if self.maps.store(cut).put(chunk.0, chunk.1, tile) && self.shade_cut == Some(cut) {
+        if self.maps.store(cut).put(chunk.0, chunk.1, tile) && self.shade_cut == Some((cut, false)) {
             // Its columns, and those shaded against them to the south and east.
             for c in [chunk, (chunk.0 + 1, chunk.1), (chunk.0, chunk.1 + 1)] {
                 self.shade_cache.remove(&c);
@@ -3298,7 +3306,7 @@ impl State {
     /// A chunk the server shared, coloured: kept unless the player's own
     /// scan has it now (the bridge checks it isn't loaded).
     pub fn put_shared(&mut self, chunk: (i32, i32), tile: Tile) {
-        if self.maps.store(Cut::Surface).put(chunk.0, chunk.1, tile) && self.shade_cut == Some(Cut::Surface) {
+        if self.maps.store(Cut::Surface).put(chunk.0, chunk.1, tile) && self.shade_cut == Some((Cut::Surface, false)) {
             for c in [chunk, (chunk.0 + 1, chunk.1), (chunk.0, chunk.1 + 1)] {
                 self.shade_cache.remove(&c);
             }
@@ -3355,6 +3363,14 @@ impl State {
     pub fn update_minimap_lit(&mut self, x: f64, z: f64, yaw: f32, light: &dyn Fn(i32, i32, i32) -> u8) -> bool {
         let seed = self.seed;
         let st = self.settings();
+        // Another dimension's map (switched on the world map): where the
+        // player would be there, of its fullest cut, without what only the
+        // player's own dimension has (light, the server's view square).
+        let own = self.map_dimension.clone().unwrap_or_else(|| OVERWORLD.to_owned());
+        let other = self.mini_here(&Here { pos: [x, 64.0, z], dimension: own, yaw });
+        let (x, z) = other.as_ref().map_or((x, z), |h| (h.pos[0], h.pos[2]));
+        let is_other = other.is_some();
+        let seed = seed.filter(|_| other.as_ref().is_none_or(|h| h.dimension == OVERWORLD));
         let bpp = self.mini_zoom() / PIXELS_PER_BLOCK;
         let turning = self.turning();
         let n = self.mini_n;
@@ -3363,9 +3379,13 @@ impl State {
         // The blocks the image can reach.
         let reach = (n as f64 * grid.bpp * std::f64::consts::SQRT_2 / 2.0).ceil() as i32 + 2;
         let (bx, bz) = (x.floor() as i32, z.floor() as i32);
-        let cut = self.cut;
-        let stamp = self.maps.store(cut).stamp(bx - reach, bz - reach, bx + reach, bz + reach);
+        let cut = if is_other { self.other_cut } else { self.cut };
+        let how = self.shading(cut);
+        let view_square = self.view_distance.filter(|_| st.view_square && !is_other);
+        let maps = if is_other { &mut self.other_maps } else { &mut self.maps };
+        let stamp = maps.store(cut).stamp(bx - reach, bz - reach, bx + reach, bz + reach);
         let key = MiniKey {
+            other: is_other,
             origin: grid.origin,
             yaw_bits: if turning { yaw.to_bits() } else { 0 },
             bpp_bits: (bpp).to_bits(),
@@ -3378,9 +3398,9 @@ impl State {
             undiscovered: st.undiscovered,
             grid: (st.chunk_grid, st.grid_width),
             light: st.light_overlay.then_some(st.light_level),
-            portals: st.portals.then_some(self.maps.portals.revision),
-            new_chunks: (st.new_chunks || st.old_chunks).then_some((self.maps.new_chunks.revision, st.new_chunks, st.old_chunks)),
-            square: self.view_distance.filter(|_| st.view_square).map(|vd| (bx >> 4, bz >> 4, vd)),
+            portals: st.portals.then_some(maps.portals.revision),
+            new_chunks: (st.new_chunks || st.old_chunks).then_some((maps.new_chunks.revision, st.new_chunks, st.old_chunks)),
+            square: view_square.map(|vd| (bx >> 4, bz >> 4, vd)),
         };
         if self.mini_key == Some(key) && !self.mini_image.is_empty() {
             self.mini_grid = Some(grid);
@@ -3397,14 +3417,14 @@ impl State {
         }
         self.mini_grid = Some(grid);
         self.mini_composed = Some(Instant::now());
-        if self.shade_cut != Some(cut) || self.shade_cache.len() > 8192 {
+        if self.shade_cut != Some((cut, is_other)) || self.shade_cache.len() > 8192 {
             self.shade_cache.clear();
-            self.shade_cut = Some(cut);
+            self.shade_cut = Some((cut, is_other));
         }
         // Xaero's minimap is coloured as its world map, block for block
         // (measured at noon and at midnight).
-        let how = self.shading(cut);
-        let store = self.maps.store(cut);
+        let maps = if is_other { &mut self.other_maps } else { &mut self.maps };
+        let store = maps.store(cut);
         let cache = &mut self.shade_cache;
         // Rows of texels stay in one chunk for a while: remember the last.
         let mut last: Option<((i32, i32), Rc<ShadedChunk>)> = None;
@@ -3426,15 +3446,17 @@ impl State {
         }
         if st.new_chunks || st.old_chunks {
             let shown = |m: u8| (m == NEW_CHUNK && st.new_chunks) || (m == OLD_CHUNK && st.old_chunks);
-            tint_chunks(&grid, &mut self.mini_image, |c| self.maps.new_chunks.chunks.get(&c).copied().filter(|m| shown(*m)).map(new_chunk_rgb));
+            let marks = if is_other { &self.other_maps.new_chunks } else { &self.maps.new_chunks };
+            tint_chunks(&grid, &mut self.mini_image, |c| marks.chunks.get(&c).copied().filter(|m| shown(*m)).map(new_chunk_rgb));
         }
         if st.portals {
-            tint_portals(&grid, &self.maps.portals.chunks, &mut self.mini_image);
+            let portals = if is_other { &self.other_maps.portals } else { &self.maps.portals };
+            tint_portals(&grid, &portals.chunks, &mut self.mini_image);
         }
         if let Some((cx, cz, vd)) = key.square {
             tint_square(&grid, (cx, cz), vd, &mut self.mini_image);
         }
-        if st.light_overlay {
+        if st.light_overlay && !is_other {
             let store = self.maps.store(cut);
             for j in 0..n {
                 for i in 0..n {
@@ -4168,6 +4190,25 @@ impl State {
         }
     }
 
+    /// Where the minimap is: the player, or where they would be in the
+    /// other dimension the world map shows (XaeroPlus's switching), when it
+    /// follows the map.
+    pub fn mini_here(&self, here: &Here) -> Option<Here> {
+        let to = self.map_shown.as_ref().filter(|_| self.settings().mini_follows)?;
+        // The End and the rest aren't scaled: the same place.
+        let pos = convert(here.pos, &here.dimension, to).unwrap_or(here.pos);
+        Some(Here { pos, dimension: to.clone(), yaw: here.yaw })
+    }
+
+    /// The dimension key: both maps go on to the next dimension's map (the
+    /// player's own follows them again). What to say.
+    pub fn switch_dimension(&mut self, here: &Here) -> String {
+        let to = next_dimension(&self.shown_dimension());
+        self.show_dimension(to, Some(here));
+        self.mini_key = None;
+        format!("Atlas: the maps show {}", dimension_label(&self.shown_dimension()))
+    }
+
     /// The dimension the world map shows.
     pub fn shown_dimension(&self) -> String {
         self.map_shown.clone().or_else(|| self.map_dimension.clone()).unwrap_or_else(|| OVERWORLD.to_owned())
@@ -4505,6 +4546,10 @@ impl State {
         if self.cut != Cut::Surface {
             lines.push(self.cut.label());
         }
+        // The minimap shows another dimension's map: say which.
+        if let Some(h) = self.mini_here(here) {
+            lines.push(format!("Map: {}", dimension_label(&h.dimension)));
+        }
         lines
     }
 
@@ -4617,17 +4662,22 @@ impl State {
         &self,
         gui: [f32; 2],
         at: [f32; 2],
-        here: &Here,
+        real: &Here,
         info: &MiniInfo,
         dots: &[Dot],
         measure: &dyn Fn(&str) -> f32,
     ) -> Vec<Draw> {
         let st = self.settings();
+        // Another dimension's map: placed where the player would be there,
+        // with its waypoints and none of this dimension's entities.
+        let shown = self.mini_here(real);
+        let here = shown.as_ref().unwrap_or(real);
+        let dots = if shown.is_some() { &[][..] } else { dots };
         let mut draws = Vec::new();
         let Some(grid) = self.mini_grid.filter(|_| self.mini_ready) else {
             return draws;
         };
-        let [bw, _] = self.minimap_box(gui, here, info, measure);
+        let [bw, _] = self.minimap_box(gui, real, info, measure);
         let side = self.mini_side(gui);
         let fw = self.frame_width();
         let x = (at[0] + (bw - side) / 2.0).round();
@@ -4801,7 +4851,7 @@ impl State {
         }
 
         // The lines under it.
-        let lines = self.info_lines(here, info);
+        let lines = self.info_lines(real, info);
         let top = y + side + fw + 2.0;
         let scale = self.info_scale();
         let row = LINE * scale;
@@ -7290,6 +7340,56 @@ mod tests {
     }
 
     #[test]
+    fn the_minimap_follows_the_dimension_the_maps_show() {
+        let data = std::env::temp_dir().join(format!("atlas-test-minidim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        // The Nether's map has chunk (1, 1); the Overworld's chunk (10, 10),
+        // eight times further out.
+        let mut nether = Maps::default();
+        nether.open(Some(map_dir(&data, "world-x", NETHER)));
+        nether.store(Cut::Surface).put(1, 1, grass(30));
+        assert!(nether.save());
+        let mut s = State::default();
+        s.load_world(Some("world-x".into()), data.clone());
+        s.load_map(Some(OVERWORLD.into()), Some(map_dir(&data, "world-x", OVERWORLD)));
+        s.maps.store(Cut::Surface).put(10, 10, grass(70));
+        let h = Here { pos: [168.0, 70.0, 168.0], dimension: OVERWORLD.into(), yaw: 0.0 };
+        let mid = |s: &State| {
+            let n = s.mini_n;
+            (n / 2 * n + n / 2) * 4
+        };
+        assert!(s.update_minimap(h.pos[0], h.pos[2], 0.0));
+        let own = s.mini_image[mid(&s)..mid(&s) + 4].to_vec();
+        // The key: the Nether's map, where the player would be there (21, 21).
+        assert_eq!(s.switch_dimension(&h), "Atlas: the maps show Nether");
+        assert_eq!(s.mini_here(&h).map(|m| m.pos), Some([21.0, 70.0, 21.0]));
+        assert!(s.update_minimap(h.pos[0], h.pos[2], 0.0));
+        let there = s.mini_image[mid(&s)..mid(&s) + 4].to_vec();
+        assert_ne!(there[3], 0, "the Nether's chunk (1, 1) is under the player");
+        assert_ne!(own, there);
+        // No entities of this dimension on it, and a line saying which.
+        let info = MiniInfo::default();
+        s.mini_ready = true;
+        let dot = Dot { pos: [168.0, 70.0, 170.0], kind: DotKind::Mob, ..Dot::default() };
+        let draws = s.minimap_hud([480.0, 270.0], [0.0, 0.0], &h, &info, &[dot], &measure);
+        let texts: Vec<&str> = draws.iter().filter_map(|d| match d {
+            Draw::Text(t, ..) | Draw::Label(t, ..) => Some(t.as_str()),
+            _ => None,
+        }).collect();
+        assert!(texts.contains(&"Map: Nether"), "{texts:?}");
+        // Not following: its own again.
+        s.settings = Some(Settings { mini_follows: false, ..Settings::default() });
+        assert!(s.mini_here(&h).is_none());
+        s.settings = None;
+        // The End: the same place, unscaled.
+        assert_eq!(s.switch_dimension(&h), "Atlas: the maps show The End");
+        assert_eq!(s.mini_here(&h).map(|m| m.pos), Some(h.pos));
+        assert_eq!(s.switch_dimension(&h), "Atlas: the maps show Overworld");
+        assert!(s.map_shown.is_none());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
     fn the_world_map_shows_another_dimensions_map() {
         let data = std::env::temp_dir().join(format!("atlas-test-dims-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
@@ -7995,6 +8095,8 @@ mod tests {
             "fps_limit",
             // Only in the Nether: its own test.
             "ow_in_nether",
+            // Only while the maps show another dimension: its own test.
+            "mini_dimension",
         ];
         // All the rest must change what is drawn.
         let base = Settings {

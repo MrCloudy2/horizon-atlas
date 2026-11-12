@@ -5,6 +5,14 @@ fn atlas_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool
         return;
     };
     *ran = true;
+    // The maps show the next dimension's map (the dimension key's job).
+    if args.trim() == "dimension" {
+        if let Some(here) = crate::game::atlas_bridge::here(game) {
+            let said = m::with(|s| s.switch_dimension(&here));
+            game.native_chat(&said);
+        }
+        return;
+    }
     let said = m::with(|s| s.command(args));
     game.native_chat(&said);
 }

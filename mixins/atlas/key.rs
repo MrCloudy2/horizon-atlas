@@ -30,6 +30,13 @@ fn atlas_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         m::with(|s| s.zoom_key(true));
         return;
     }
+    if key != m::DEFAULT_DIMENSION && key == game.native_mod_key(m::ID, m::KEY_DIMENSION, m::DEFAULT_DIMENSION) {
+        if let Some(here) = crate::game::atlas_bridge::here(game) {
+            let said = m::with(|s| s.switch_dimension(&here));
+            game.native_chat(&said);
+        }
+        return;
+    }
     if key == game.native_mod_key(m::ID, m::KEY_ZOOM_OUT, m::DEFAULT_ZOOM_OUT) {
         m::with(|s| s.zoom_key(false));
         return;

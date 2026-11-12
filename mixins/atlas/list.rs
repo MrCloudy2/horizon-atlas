@@ -14,6 +14,7 @@ fn atlas_listed(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
             [m::KEY_ENLARGE.into(), "Enlarge minimap".into(), m::DEFAULT_ENLARGE.into()],
             [m::KEY_ZOOM_IN.into(), "Zoom in".into(), m::DEFAULT_ZOOM_IN.into()],
             [m::KEY_ZOOM_OUT.into(), "Zoom out".into(), m::DEFAULT_ZOOM_OUT.into()],
+            [m::KEY_DIMENSION.into(), "Next dimension's map".into(), m::DEFAULT_DIMENSION.into()],
         ],
     });
 }
