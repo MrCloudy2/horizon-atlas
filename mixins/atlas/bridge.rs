@@ -1080,9 +1080,13 @@ struct ServerSide {
     queue: std::collections::HashMap<String, std::collections::VecDeque<((i32, i32), Instant)>>,
     again: std::collections::HashMap<String, std::collections::VecDeque<((i32, i32), Instant)>>,
     queued: std::collections::HashSet<(String, (i32, i32))>,
+    /// The dimensions whose loaded chunks were queued when sharing began.
+    seeded: std::collections::HashSet<String>,
     /// The flags of each block state, worked out once.
     flags: Vec<Option<u16>>,
     told_full: bool,
+    /// A share closed without waiting, still writing.
+    closing: Option<std::thread::JoinHandle<()>>,
     /// The longest a level tick's share work took, for the log at the stop.
     slowest: Duration,
 }
@@ -1114,9 +1118,13 @@ pub(super) fn share_server_stop() {
             eprintln!("Atlas: map sharing took at most {:.2} ms a tick", sv.slowest.as_secs_f64() * 1000.0);
         }
         sv.share.close();
+        if let Some(old) = sv.closing.take() {
+            let _ = old.join();
+        }
         sv.queue.clear();
         sv.again.clear();
         sv.queued.clear();
+        sv.seeded.clear();
     });
 }
 
@@ -1251,28 +1259,35 @@ pub(super) fn share_level_tick(game: &mut Game<'_>, dimension: &str) {
         let mode = share_mode(&settings, sv.dedicated);
         if mode == m::SHARE_OFF || world_dir.is_none() {
             if sv.share.dir.is_some() {
-                sv.share.close();
+                // Turned off while running: no wait on this thread.
+                sv.closing = sv.share.detach();
                 sv.queue.clear();
                 sv.again.clear();
                 sv.queued.clear();
+                sv.seeded.clear();
             }
             return Vec::new();
         }
         if let Some(dir) = world_dir {
             if sv.share.dir.is_none() {
-                // Every chunk loaded now is looked at too.
-                let now = Instant::now();
-                let q = sv.queue.entry(dimension.to_owned()).or_default();
-                for &key in game.world.chunks.keys() {
-                    if sv.queued.insert((dimension.to_owned(), key)) {
-                        q.push_back((key, now));
-                    }
+                // One closed a moment ago may still be writing the folder.
+                if let Some(old) = sv.closing.take() {
+                    let _ = old.join();
                 }
-            }
-            if sv.share.dir.is_none() {
                 eprintln!("Atlas: sharing the map with {}", if mode == m::SHARE_OPS { "operators" } else { "everyone" });
             }
             sv.share.open(dir.join("atlas-share"));
+        }
+        // The chunks each level had loaded before sharing began, at its
+        // first tick since (the level in place is this one).
+        if sv.seeded.insert(dimension.to_owned()) {
+            let now = Instant::now();
+            let q = sv.queue.entry(dimension.to_owned()).or_default();
+            for &key in game.world.chunks.keys() {
+                if sv.queued.insert((dimension.to_owned(), key)) {
+                    q.push_back((key, now));
+                }
+            }
         }
         // Chunks of this level that are due, within the budget.
         if sv.share.ready() {

@@ -6156,6 +6156,15 @@ impl ShareServer {
         *self = Self::default();
     }
 
+    /// Closes without waiting: the disk thread writes what changed and
+    /// stops on its own. Join the handle before the folder is opened again.
+    pub fn detach(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.jobs = None;
+        let thread = self.thread.take();
+        *self = Self::default();
+        thread
+    }
+
     pub fn ready(&self) -> bool {
         self.indexed
     }
