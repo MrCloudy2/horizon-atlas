@@ -56,7 +56,8 @@ and ones made in the Nether are saved as the Overworld's.
 | ![The settings menu](docs/images/settings.jpg) | ![A settings page](docs/images/settings-page.jpg) |
 
 - **View**: size, shape, zoom, opacity, lighting, frame style and colour, enlarged minimap (hold **Z**)
-- **Block map**: colour mode, cave mode, slopes, transparency, grass, flowers, leaves
+- **Block map**: colour mode, cave mode, slopes, transparency, grass, flowers, leaves, a see-through obsidian roof (from a
+  height you set, for the Nether roof or a roofed base)
 - **Entity radar**: categories, dot size, icons, names, height limit, depth fade, player cross or arrow
 - **Overlays**: chunk grid, light overlay, slime chunks, portal highlights (chunks with Nether portals, End portals
   or gateways), the server's view distance, new chunks (red: generated as they came) and old chunks (green: loaded
@@ -124,7 +125,7 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 - The map columns follow Horizon's minimap (MIT)
 - Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
   switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons, the minimap
-  FPS limiter and the minimap's dimension switching come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+  FPS limiter, the minimap's dimension switching and the see-through obsidian roof come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

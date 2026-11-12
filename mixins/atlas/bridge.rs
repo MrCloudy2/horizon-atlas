@@ -44,6 +44,8 @@ const FLOWER: u16 = 32;
 const GLASS: u16 = 64;
 const PLANT: u16 = 128;
 const LEAVES: u16 = 256;
+/// Obsidian: XaeroPlus's see-through roof.
+const OBSIDIAN: u16 = 512;
 
 /// The block states' looks, worked out the first time each is met, and
 /// every texture's average colour.
@@ -241,6 +243,9 @@ fn state_flags(id: u32, facts: &BlockFacts) -> u16 {
     if name.ends_with("_leaves") {
         flags |= LEAVES;
     }
+    if name == "obsidian" || name == "crying_obsidian" {
+        flags |= OBSIDIAN;
+    }
     flags
 }
 
@@ -308,6 +313,8 @@ struct Scan<'a> {
     /// Blocks seen through (`FLOWER`, `GLASS`).
     hide: u16,
     cave_depth: i32,
+    /// XaeroPlus's roof: obsidian from this height up is seen through.
+    roof_y: Option<i32>,
     /// The bottom shows through water.
     transparency: bool,
     /// The block light at a world position, 0 to 15.
@@ -353,7 +360,8 @@ impl Scan<'_> {
         let bottom = self.chunk.min_y();
         while y > bottom {
             let look = self.look(x, y, z);
-            if look.flags & MAPPED == 0 || look.flags & self.hide != 0 {
+            let roof = look.flags & OBSIDIAN != 0 && self.roof_y.is_some_and(|r| y >= r);
+            if look.flags & MAPPED == 0 || look.flags & self.hide != 0 || roof {
                 y -= 1;
                 continue;
             }
@@ -673,6 +681,7 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
                             | u16::from(!settings.plants) * PLANT
                             | u16::from(!settings.leaves) * LEAVES,
                         cave_depth: settings.cave_depth,
+                        roof_y: settings.obsidian_roof.then_some(settings.roof_y),
                         transparency: settings.transparency,
                         light: &light,
                     };
@@ -1206,7 +1215,7 @@ fn share_extract(game: &Game<'_>, flags: &mut Vec<Option<u16>>, key: (i32, i32))
                     m::Part::Skip
                 } else if f & FLUID != 0 && f & STURDY_TOP == 0 {
                     m::Part::Fluid
-                } else if f & (FLOWER | GLASS | PLANT | LEAVES) != 0 {
+                } else if f & (FLOWER | GLASS | PLANT | LEAVES | OBSIDIAN) != 0 {
                     m::Part::Through
                 } else {
                     m::Part::Ground
@@ -1448,6 +1457,7 @@ fn share_client(game: &mut Game<'_>, settings: &m::Settings) {
                     | u16::from(!settings.plants) * PLANT
                     | u16::from(!settings.leaves) * LEAVES,
                 cave_depth: settings.cave_depth,
+                roof_y: settings.obsidian_roof.then_some(settings.roof_y),
                 transparency: settings.transparency,
                 light: &light,
             };

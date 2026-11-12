@@ -1395,6 +1395,9 @@ settings! {
     plants: bool = false, "plants", "Show Grass and Plants", BlockMap, Kind::Toggle;
     leaves: bool = true, "leaves", "Show Tree Leaves", BlockMap, Kind::Toggle;
     stained_glass: bool = true, "stained_glass", "Display Stained Glass", BlockMap, Kind::Toggle;
+    obsidian_roof: bool = false, "obsidian_roof", "Transparent Obsidian Roof", BlockMap, Kind::Toggle;
+    roof_y: i32 = 250, "roof_y", "Obsidian Roof Y", BlockMap,
+        Kind::Slider { min: -64, max: 320, div: 1, unit: "", zero: None };
 
     dots: bool = true, "dots", "Display Radar", Radar, Kind::Toggle;
     show_players: bool = true, "show_players", "Players", Radar, Kind::Toggle;
@@ -3234,7 +3237,10 @@ impl State {
         let old = self.settings();
         // What the scan reads: the loaded chunks are scanned again.
         let scan = |s: &Settings| {
-            (s.color_mode, s.flowers, s.plants, s.leaves, s.stained_glass, s.cave_depth, s.transparency)
+            (
+                (s.color_mode, s.flowers, s.plants, s.leaves, s.stained_glass, s.cave_depth, s.transparency),
+                (s.obsidian_roof, s.roof_y),
+            )
         };
         if scan(&old) != scan(&st) {
             self.scans.clear();
@@ -7551,13 +7557,15 @@ mod tests {
 
     #[test]
     fn the_minimap_draws_its_image_dots_waypoints_compass_and_lines() {
-        let mut s = State::default();
-        s.settings = Some(Settings {
-            lock_north: true,
-            biome: true,
-            time: true,
-            ..Settings::default()
-        });
+        let mut s = State {
+            settings: Some(Settings {
+                lock_north: true,
+                biome: true,
+                time: true,
+                ..Settings::default()
+            }),
+            ..State::default()
+        };
         s.waypoints.push(Waypoint {
             name: "far".into(),
             pos: [1000, 64, 0],
@@ -7796,8 +7804,10 @@ mod tests {
 
     #[test]
     fn dots_show_on_the_level_the_map_shows() {
-        let mut s = State::default();
-        s.settings = Some(Settings { height_limit: 0, ..Settings::default() });
+        let mut s = State {
+            settings: Some(Settings { height_limit: 0, ..Settings::default() }),
+            ..State::default()
+        };
         s.maps.store(Cut::Surface).put(0, 0, grass(64));
         let at = |y: f64| Dot { pos: [5.0, y, 5.0], kind: DotKind::Mob, ..Dot::default() };
         let kept = |s: &mut State, y: f64| !s.visible_dots(vec![at(y)], 65.0).is_empty();
@@ -7996,9 +8006,7 @@ mod tests {
             (true, Cut::Surface, true, Some(0)),
             (false, Cut::Below(31), true, Some(0)),
         ] {
-            let mut s = State::default();
-            s.settings = Some(st);
-            s.seed = Some(12345);
+            let mut s = State { settings: Some(st), seed: Some(12345), ..State::default() };
             // Night, for Lighting.
             s.set_day_time(Some(18000));
             s.enlarged = enlarged;
@@ -8050,7 +8058,9 @@ mod tests {
     fn every_setting_does_something() {
         // Those the game side reads: it must read them.
         let bridge = std::fs::read_to_string("mixins/atlas/bridge.rs").unwrap();
-        const GAME_SIDE: [(&str, &str); 17] = [
+        const GAME_SIDE: [(&str, &str); 19] = [
+            ("obsidian_roof", "settings.obsidian_roof"),
+            ("roof_y", "settings.roof_y"),
             ("share_map", "settings.share_map"),
             ("share_rate", "settings.share_rate"),
             ("server_map", "settings.server_map"),
