@@ -1457,6 +1457,9 @@ settings! {
     hide_coords: bool = false, "hide_coords", "Hide Waypoint Coordinates", Waypoints, Kind::Toggle;
     max_render: i32 = 0, "max_render", "Max WP Render Dist.", Waypoints,
         Kind::Slider { min: 0, max: 10000, div: 1, unit: "m", zero: Some((0, "Unlimited")) };
+    beacons: bool = false, "beacons", "Waypoint Beacons", Waypoints, Kind::Toggle;
+    beacon_min: i32 = 0, "beacon_min", "Waypoint Beacon Distance Min", Waypoints,
+        Kind::Slider { min: 0, max: 512, div: 1, unit: "", zero: Some((0, "OFF")) };
     min_render: i32 = 0, "min_render", "Min WP Render Dist.", Waypoints,
         Kind::Slider { min: 0, max: 500, div: 1, unit: "m", zero: Some((0, "OFF")) };
     km_at: i32 = 10000, "km_at", "Convert Distance to KM at", Waypoints,
@@ -2801,6 +2804,16 @@ pub fn distance_text(d: f64, km_at: i32, precision: i32) -> String {
         format!("{:.p$}km", d / 1000.0)
     } else {
         format!("{d:.p$}m")
+    }
+}
+
+/// The top of a dimension's world, where a beacon beam ends: the Nether's
+/// roof, the End's and the Overworld's build limits.
+fn world_top(dimension: &str) -> f64 {
+    match dimension {
+        NETHER => 128.0,
+        END => 256.0,
+        _ => 320.0,
     }
 }
 
@@ -4229,7 +4242,7 @@ impl State {
             })
             .collect();
         shown.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let mut draws = Vec::new();
+        let mut draws = self.beacons(camera, view, player, dimension, size);
         for (d, [x, y], w, spot) in shown {
             // As Xaero's: a see-through square of its colour with its
             // letter, its name small under it, and its distance while it is
@@ -4270,6 +4283,89 @@ impl State {
                 draws.push(Draw::Fill([x - tw / 2.0 - 2.0, top - 1.0, tw + 4.0, h], a(0x50)));
                 draws.push(Draw::Label(line, [x - tw / 2.0, top], a(0xF0) | 0xFF_FFFF, scale, false));
                 top += h + 0.5;
+            }
+        }
+        draws
+    }
+
+    /// XaeroPlus's waypoint beacons: a beam of each waypoint's colour from
+    /// it up to the top of the world, far ones first, seen through walls as
+    /// the labels are. They keep at least a pixel and a half across, so a
+    /// far one still shows.
+    fn beacons(
+        &self,
+        camera: Camera,
+        view: ([f64; 3], [f64; 3], [f64; 3]),
+        player: [f64; 3],
+        dimension: &str,
+        size: [f32; 2],
+    ) -> Vec<Draw> {
+        let st = self.settings();
+        let mut draws = Vec::new();
+        if !st.beacons || size[1] <= 0.0 {
+            return draws;
+        }
+        let top = world_top(dimension);
+        let mut beams: Vec<(f64, [f64; 3], u32)> = self
+            .waypoints
+            .iter()
+            .filter(|w| self.shows(w))
+            .filter_map(|w| {
+                let spot = self.spot(w, dimension)?;
+                let flat = ((spot[0] - player[0]).powi(2) + (spot[2] - player[2]).powi(2)).sqrt();
+                let far = distance(player, spot);
+                let shown = far >= f64::from(st.beacon_min)
+                    && far >= f64::from(st.min_render)
+                    && (st.max_render == 0 || far <= f64::from(st.max_render));
+                (shown && spot[1] < top).then_some((flat, spot, w.color & RGB))
+            })
+            .collect();
+        beams.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let (f, _, _) = view;
+        let px_per = f64::from(size[1]) / 2.0 / (f64::from(camera.fov).to_radians() / 2.0).tan();
+        let alpha = st.world_opacity.clamp(0, 100) as u32;
+        for (_, spot, color) in beams {
+            // The beam's middle line, clipped to what is in front of the camera.
+            let mut a = [spot[0], spot[1], spot[2]];
+            let mut b = [spot[0], top, spot[2]];
+            let (za, zb) = (dot(sub(a, camera.pos), f), dot(sub(b, camera.pos), f));
+            const NEAR: f64 = 0.1;
+            if za < NEAR && zb < NEAR {
+                continue;
+            }
+            let cut = |p: [f64; 3], q: [f64; 3], zp: f64, zq: f64| {
+                let t = (NEAR - zp) / (zq - zp);
+                [p[0], p[1] + (q[1] - p[1]) * t, p[2]]
+            };
+            if za < NEAR {
+                a = cut(a, b, za, zb);
+            } else if zb < NEAR {
+                b = cut(b, a, zb, za);
+            }
+            let (Some(pa), Some(pb)) = (project(camera.pos, view, camera.fov, a, size), project(camera.pos, view, camera.fov, b, size))
+            else {
+                continue;
+            };
+            let along = [pb[0] - pa[0], pb[1] - pa[1]];
+            let len = (along[0] * along[0] + along[1] * along[1]).sqrt();
+            if len < 0.5 {
+                continue;
+            }
+            let side = [-along[1] / len, along[0] / len];
+            let width = |p: [f64; 3]| (0.2 * px_per / dot(sub(p, camera.pos), f).max(NEAR)) as f32;
+            for (k, opacity) in [(1.0, 0x40), (0.4, 0x90)] {
+                let wa = (width(a) * k).max(0.75 * k + 0.25);
+                let wb = (width(b) * k).max(0.75 * k + 0.25);
+                let argb = (opacity * alpha / 100) << 24 | color;
+                draws.push(Draw::Quad(
+                    [
+                        [pa[0] - side[0] * wa, pa[1] - side[1] * wa],
+                        [pa[0] + side[0] * wa, pa[1] + side[1] * wa],
+                        [pb[0] + side[0] * wb, pb[1] + side[1] * wb],
+                        [pb[0] - side[0] * wb, pb[1] - side[1] * wb],
+                    ],
+                    argb,
+                ));
             }
         }
         draws
@@ -5442,6 +5538,45 @@ mod tests {
     }
 
     #[test]
+    fn beacons_rise_from_waypoints_in_view() {
+        let mut s = State::default();
+        let camera = Camera { pos: [0.5, 65.62, 0.5], yaw: 0.0, pitch: 0.0, fov: 70.0 };
+        let at = |z: i32| Waypoint {
+            name: "A".into(),
+            pos: [0, 65, z],
+            dimension: OVERWORLD.into(),
+            color: 0x55FFFF,
+            ..Waypoint::default()
+        };
+        // Ahead (south, yaw 0) and behind.
+        s.waypoints = vec![at(40), at(-40)];
+        let quads = |s: &State, size: [f32; 2]| -> Vec<[[f32; 2]; 4]> {
+            s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, size, &measure)
+                .into_iter()
+                .filter_map(|d| match d {
+                    Draw::Quad(q, c) => {
+                        assert_eq!(c & RGB, 0x55FFFF);
+                        Some(q)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(quads(&s, [480.0, 270.0]).is_empty(), "off by default");
+        s.settings = Some(Settings { beacons: true, ..Settings::default() });
+        let q = quads(&s, [480.0, 270.0]);
+        // One beam (a glow and a core), only the one ahead: centred, from
+        // the waypoint up past the top of the screen.
+        assert_eq!(q.len(), 2);
+        let mid = (q[0][0][0] + q[0][1][0]) / 2.0;
+        assert!((mid - 240.0).abs() < 2.0, "{q:?}");
+        assert!(q[0][0][1] > 135.0 && q[0][2][1] < 0.0, "{q:?}");
+        // Nearer than the minimum distance: none.
+        s.settings = Some(Settings { beacons: true, beacon_min: 100, ..Settings::default() });
+        assert!(quads(&s, [480.0, 270.0]).is_empty());
+    }
+
+    #[test]
     fn packbits_round_trips() {
         let mut data = vec![7u8; 300];
         data.extend(0..=255u8);
@@ -6388,6 +6523,7 @@ mod tests {
             let base = match o.key {
                 "distance_scale" | "name_above" => Settings { distance_mode: 2, ..base },
                 "angle_v" => Settings { angle_h: 180, ..base },
+                "beacon_min" => Settings { beacons: true, ..base },
                 _ => base,
             };
             let plain = everything(base);
