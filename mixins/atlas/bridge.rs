@@ -525,11 +525,44 @@ fn current_cut(game: &Game<'_>, settings: &m::Settings) -> Option<m::Cut> {
     Some(m::cut_for(settings.mode, settings.layer_y, head, covered, ceiling))
 }
 
+thread_local! {
+    /// The server key worked out for (address, folder mode): the server
+    /// list is read once a connection, not each frame.
+    static SERVER_KEY: RefCell<Option<(String, usize, String)>> = const { RefCell::new(None) };
+}
+
+/// A server's key by the folder mode chosen (`m::server_key`), the server
+/// list read only when the address or the mode changes.
+fn server_key(address: &str, mode: usize) -> String {
+    SERVER_KEY.with(|k| {
+        let mut k = k.borrow_mut();
+        if let Some((a, was, key)) = k.as_ref()
+            && a == address
+            && *was == mode
+        {
+            return key.clone();
+        }
+        let list: Vec<(String, String)> = if mode == m::FOLDER_NAME {
+            std::env::current_dir()
+                .map(|dir| horizon_protocol::servers::load(&horizon_client::multiplayer::servers_file(&dir.join("saves"))))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| (e.name, e.ip))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let key = m::server_key(mode, address, &list);
+        *k = Some((address.to_owned(), mode, key.clone()));
+        key
+    })
+}
+
 /// The world or server being played, naming its waypoints and maps.
-fn world_key(game: &Game<'_>) -> Option<String> {
+fn world_key(game: &Game<'_>, folder: usize) -> Option<String> {
     game.native_player()?;
     if let (None, Some(remote)) = (&game.integrated, &game.remote) {
-        return Some(format!("server-{}", remote.session.address.trim().to_lowercase()));
+        return Some(server_key(&remote.session.address, folder));
     }
     if let Some(folder) = game
         .world_icon
@@ -557,7 +590,7 @@ pub(super) fn frame(game: &mut Game<'_>) {
     if let Some(changed) = m::with(|s| s.take_changed_settings()) {
         game.native_set_setting(m::ID, m::SETTINGS_FILE, &changed.to_text());
     }
-    let key = world_key(game);
+    let key = world_key(game, settings.server_folder);
     let dimension = game.native_player().map(|p| p.dimension.to_owned());
     m::with(|s| {
         s.load_world(key.clone(), dir.clone());

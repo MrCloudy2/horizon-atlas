@@ -64,7 +64,8 @@ and ones made in the Nether are saved as the Overworld's.
   from the server's saves), from each chunk's block palettes as the server sent them; on servers only
 - **Information**: coordinates, biome, time, facing, dimension, chunk, light and weather lines
 - **Waypoints**: scales, opacity, render distance, deathpoints, compass, beacons (a beam over each waypoint)
-- **Miscellaneous**: minimap FPS limit, map sharing
+- **Miscellaneous**: minimap FPS limit, map sharing, Server Map Folder (keep a server's maps and waypoints under its
+  address, its name in your server list, or its base domain, so `connect.example.net` and `example.net` share one)
 
 `/atlas <setting> <value>` in chat sets any of them exactly, and `/atlas help` lists them:
 
@@ -125,7 +126,7 @@ seeds per world and server, and the maps in `maps/<world>/<dimension>/<layer>/`.
 - The map columns follow Horizon's minimap (MIT)
 - Portal highlights, new and old chunks (the palette check, first published by etianl's Trouser-Streak), dimension
   switching, the view distance square, Overworld waypoints in the Nether, Disable All, waypoint beacons, the minimap
-  FPS limiter, the minimap's dimension switching and the see-through obsidian roof come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
+  FPS limiter, the minimap's dimension switching, the see-through obsidian roof and the server folder modes come from [XaeroPlus](https://github.com/rfresh2/XaeroPlus) by rfresh2 (MIT), written anew for Atlas
 - The look follows Xaero's Minimap and World Map. Atlas is its own code, with no code or art from them, and isn't
   affiliated with them.
 

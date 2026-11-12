@@ -1336,6 +1336,13 @@ pub const SHARE_AUTO: usize = 0;
 pub const SHARE_OFF: usize = 1;
 pub const SHARE_OPS: usize = 2;
 pub const SHARE_ALL: usize = 3;
+/// What a server's maps and waypoints are kept under, as XaeroPlus's
+/// data folder modes: the address typed, the name in the server list, or
+/// the address's base domain (so `connect.example.net` and
+/// `example.net` keep one map).
+const SERVER_FOLDERS: &[(&str, &str)] = &[("address", "Address"), ("name", "Server Name"), ("domain", "Base Domain")];
+pub const FOLDER_NAME: usize = 1;
+pub const FOLDER_DOMAIN: usize = 2;
 const ALIGNMENTS: &[(&str, &str)] = &[("center", "Center"), ("left", "Left"), ("right", "Right")];
 const NORTH_COLORS: &[(&str, &str)] = &[("default", "Default"), ("red", "Red"), ("yellow", "Yellow"), ("blue", "Blue")];
 const NORTH_RGB: [u32; 4] = [INK, 0xFF5555, 0xFFFF55, 0x5599FF];
@@ -1454,6 +1461,7 @@ settings! {
     share_rate: i32 = 256, "share_rate", "Map Sharing Rate", Misc,
         Kind::Slider { min: 32, max: 4096, div: 1, unit: " KB/s", zero: None };
     server_map: bool = true, "server_map", "Use the Server's Map", Misc, Kind::Toggle;
+    server_folder: usize = 0, "server_folder", "Server Map Folder", Misc, Kind::Choice(SERVER_FOLDERS);
     info_scale: f32 = 0.7, "ui_scale", "UI Scale", Misc,
         Kind::Slider { min: 40, max: 150, div: 100, unit: "x", zero: None };
 
@@ -2774,6 +2782,50 @@ pub fn safe_name(key: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The key a server's maps and waypoints are kept under: by `mode` (a
+/// `SERVER_FOLDERS` choice), from the address joined and the server list's
+/// (name, address) entries. A server not in the list, or listed without a
+/// name, keeps its address.
+pub fn server_key(mode: usize, address: &str, list: &[(String, String)]) -> String {
+    let address = address.trim().to_lowercase();
+    match mode {
+        FOLDER_NAME => {
+            let named = list
+                .iter()
+                .find(|(_, ip)| ip.trim().to_lowercase() == address)
+                .map(|(name, _)| name.trim())
+                .filter(|name| !name.is_empty());
+            if let Some(name) = named {
+                return format!("server-name-{name}");
+            }
+        }
+        FOLDER_DOMAIN => return format!("server-{}", base_domain(&address)),
+        _ => {}
+    }
+    format!("server-{address}")
+}
+
+/// An address's host cut to its last two labels (an IP address stays
+/// whole), with its port unless it's the default one.
+fn base_domain(address: &str) -> String {
+    let (host, port) = match address.rsplit_once(':') {
+        // Not an IPv6 address's colon.
+        Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        _ => (address, None),
+    };
+    let host = host.trim_end_matches('.');
+    let base = if host.parse::<std::net::IpAddr>().is_ok() || host.trim_matches(['[', ']']).contains(':') {
+        host.to_owned()
+    } else {
+        let labels: Vec<&str> = host.split('.').collect();
+        labels[labels.len().saturating_sub(2)..].join(".")
+    };
+    match port {
+        Some(p) if !p.is_empty() && p != "25565" => format!("{base}:{p}"),
+        _ => base,
+    }
 }
 
 /// The file a world's waypoints are kept in, named after its key.
@@ -5189,7 +5241,7 @@ impl State {
 
         // World and dimension.
         let world = self.world.as_deref().unwrap_or("?");
-        let world = world.strip_prefix("world-").or(world.strip_prefix("server-")).unwrap_or(world).to_owned();
+        let world = world.strip_prefix("world-").or(world.strip_prefix("server-name-")).or(world.strip_prefix("server-")).unwrap_or(world).to_owned();
         for (x, label) in [(left, "World/Server"), (left + half + 4.0, "Sub-World/Dimension")] {
             let tw = out.width(label);
             out.text(label, [(x + (half - tw) / 2.0).round(), 3.0], MUTED);
@@ -6578,6 +6630,29 @@ mod tests {
         ];
         assert_eq!(decode(&encode(&list)), list);
         assert!(decode("garbage\n1\t2").is_empty());
+    }
+
+    #[test]
+    fn server_folders_by_address_name_or_base_domain() {
+        let list = vec![
+            ("  Anarchy ".to_owned(), "Connect.2b2t.org".to_owned()),
+            (String::new(), "unnamed.example.net".to_owned()),
+        ];
+        let key = |mode, address| server_key(mode, address, &list);
+        assert_eq!(key(0, " Connect.2B2T.org "), "server-connect.2b2t.org");
+        assert_eq!(key(FOLDER_NAME, "connect.2b2t.org"), "server-name-Anarchy");
+        // Not listed, or listed without a name: the address.
+        assert_eq!(key(FOLDER_NAME, "other.net:25570"), "server-other.net:25570");
+        assert_eq!(key(FOLDER_NAME, "unnamed.example.net"), "server-unnamed.example.net");
+        assert_eq!(key(FOLDER_DOMAIN, "connect.2b2t.org"), "server-2b2t.org");
+        assert_eq!(key(FOLDER_DOMAIN, "a.b.example.net:25565"), "server-example.net");
+        assert_eq!(key(FOLDER_DOMAIN, "a.example.net:25570"), "server-example.net:25570");
+        assert_eq!(key(FOLDER_DOMAIN, "localhost"), "server-localhost");
+        assert_eq!(key(FOLDER_DOMAIN, "192.168.1.20:25565"), "server-192.168.1.20");
+        assert_eq!(key(FOLDER_DOMAIN, "[::1]:25570"), "server-[::1]:25570");
+        assert_eq!(key(FOLDER_DOMAIN, "example.net."), "server-example.net");
+        // Whatever the name, the folder is a plain name.
+        assert_eq!(safe_name(&key(FOLDER_NAME, "connect.2b2t.org")), "server-name-Anarchy");
     }
 
     #[test]
@@ -8058,7 +8133,8 @@ mod tests {
     fn every_setting_does_something() {
         // Those the game side reads: it must read them.
         let bridge = std::fs::read_to_string("mixins/atlas/bridge.rs").unwrap();
-        const GAME_SIDE: [(&str, &str); 19] = [
+        const GAME_SIDE: [(&str, &str); 20] = [
+            ("server_folder", "settings.server_folder"),
             ("obsidian_roof", "settings.obsidian_roof"),
             ("roof_y", "settings.roof_y"),
             ("share_map", "settings.share_map"),
