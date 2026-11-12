@@ -28,6 +28,8 @@ pub const VERSION: &str = "0.2.0";
 pub const DESCRIPTION: &str = "A smooth minimap, a world map of everywhere you have been and waypoints on both. M opens the map, B makes a waypoint, U lists them.";
 /// The file the settings are kept in, in the mod's folder.
 pub const SETTINGS_FILE: &str = "settings.txt";
+/// The settings file's first line (see `Settings::read`).
+const SETTINGS_VERSION: &str = "version=2";
 /// The keys' names and defaults (`key.atlas.map` in `horizon-mods.txt`).
 pub const KEY_SETTINGS: &str = "settings";
 pub const DEFAULT_SETTINGS: &str = "key.keyboard.y";
@@ -1364,7 +1366,7 @@ settings! {
     color_mode: usize = 0, "color_mode", "Block Color Mode", BlockMap, Kind::Choice(COLOR_MODES);
     auto_cave: usize = 0, "auto_cave", "Auto Cave Mode", BlockMap, Kind::Choice(AUTO_CAVE);
     cave_nether: bool = true, "cave_nether", "Cave Mode in the Nether", BlockMap, Kind::Toggle;
-    cave_depth: i32 = 16, "cave_depth", "Cave Mode Depth", BlockMap,
+    cave_depth: i32 = 30, "cave_depth", "Cave Mode Depth", BlockMap,
         Kind::Slider { min: 8, max: 64, div: 1, unit: "", zero: None };
     cave_timer: i32 = 1000, "cave_timer", "Cave Mode Toggle Timer", BlockMap,
         Kind::Slider { min: 0, max: 5000, div: 1, unit: " ms", zero: None };
@@ -1389,14 +1391,14 @@ settings! {
     names: usize = 0, "names", "Display Names", Radar, Kind::Choice(NAME_MODES);
     entity_limit: i32 = 1000, "entity_limit", "Entity Number", Radar,
         Kind::Slider { min: 10, max: 1000, div: 1, unit: "", zero: None };
-    height_limit: i32 = 0, "height_limit", "Entity Height Limit", Radar,
+    height_limit: i32 = 20, "height_limit", "Entity Height Limit", Radar,
         Kind::Slider { min: 0, max: 256, div: 1, unit: "", zero: Some((0, "OFF")) };
     depth_fade: bool = true, "depth_fade", "Show Entity Depth", Radar, Kind::Toggle;
     fade_from: i32 = 8, "fade_from", "Min Y Distance For Depth Fade", Radar,
         Kind::Slider { min: 0, max: 64, div: 1, unit: "", zero: None };
     entity_height: bool = false, "entity_height", "Display Entity Height", Radar, Kind::Toggle;
     main_entity: usize = 1, "main_entity", "Main Entity As", Radar, Kind::Choice(MAIN_ENTITY);
-    arrow_scale: f32 = 1.0, "arrow_scale", "Arrow Scale", Radar,
+    arrow_scale: f32 = 1.5, "arrow_scale", "Arrow Scale", Radar,
         Kind::Slider { min: 50, max: 300, div: 100, unit: "x", zero: None };
     arrow_color: usize = 0, "arrow_color", "Arrow Color", Radar, Kind::Choice(ARROW_COLORS);
     arrow_opacity: i32 = 100, "arrow_opacity", "Arrow Opacity", Radar,
@@ -1416,14 +1418,14 @@ settings! {
     old_chunks: bool = false, "old_chunks", "Old Chunks", Overlay, Kind::Toggle;
 
     coords: bool = true, "coords", "Coordinates", Info, Kind::Toggle;
-    biome: bool = true, "biome", "Biome", Info, Kind::Toggle;
-    time: bool = true, "time", "Time of Day", Info, Kind::Toggle;
+    biome: bool = false, "biome", "Biome", Info, Kind::Toggle;
+    time: bool = false, "time", "Time of Day", Info, Kind::Toggle;
     facing: bool = false, "facing", "Facing", Info, Kind::Toggle;
     dimension_line: bool = false, "dimension", "Dimension", Info, Kind::Toggle;
     chunk_line: bool = false, "chunk", "Chunk", Info, Kind::Toggle;
     light_line: bool = false, "light", "Light Level", Info, Kind::Toggle;
     weather_line: bool = false, "weather", "Weather", Info, Kind::Toggle;
-    info_bg: i32 = 40, "info_bg", "Info Display Background Opacity", Info,
+    info_bg: i32 = 0, "info_bg", "Info Display Background Opacity", Info,
         Kind::Slider { min: 0, max: 100, div: 1, unit: "", zero: None };
     info_align: usize = 0, "info_align", "Info Text Alignment", Info, Kind::Choice(ALIGNMENTS);
 
@@ -1596,17 +1598,29 @@ impl Settings {
     /// or broken.
     pub fn read(get: impl Fn(&str) -> Option<String>) -> Self {
         let mut s = Settings::default();
-        for line in get(SETTINGS_FILE).unwrap_or_default().lines() {
+        let text = get(SETTINGS_FILE).unwrap_or_default();
+        for line in text.lines() {
             if let Some((key, value)) = line.split_once('=') {
                 let _ = s.set(key.trim(), value.trim());
             }
         }
+        // Files from before version 2 kept the arrow scale where 1.0 was
+        // today's 1.5x (Xaero's default): keep their arrows the same size.
+        if !text.is_empty() && !text.lines().any(|l| l.trim() == SETTINGS_VERSION) {
+            s.arrow_scale = (s.arrow_scale * 1.5).min(3.0);
+        }
         s
+    }
+
+    /// The player marker's size: Xaero's default 1.5x draws it at the size
+    /// measured from Xaero's map.
+    pub fn arrow_size(&self) -> f32 {
+        self.arrow_scale / 1.5
     }
 
     /// The settings file's text: `key=value` lines.
     pub fn to_text(&self) -> String {
-        let mut out = String::new();
+        let mut out = format!("{SETTINGS_VERSION}\n");
         for (i, o) in OPTS.iter().enumerate() {
             out.push_str(&format!("{}={}\n", o.key, o.stored(self.raw(i))));
         }
@@ -4563,14 +4577,14 @@ impl State {
         // The player: a red arrow as Xaero's, a crosshair or a dot.
         let facing = if self.turning() { 0.0 } else { 180.0 + here.yaw };
         let color = st.arrow_argb();
-        let len = (side / 18.0).clamp(4.0, 7.0) * st.arrow_scale;
+        let len = (side / 18.0).clamp(4.0, 7.0) * st.arrow_size();
         match st.main_entity {
             MAIN_ARROW => arrow(&mut draws, mid, facing, len, color),
             1 => {
                 // As Xaero's: 2.5% of the map across, arms 0.7% thick, white
                 // with a faint edge.
-                let l = (side * 0.0105).max(1.0) * st.arrow_scale;
-                let w = (side * 0.0036).max(0.35) * st.arrow_scale;
+                let l = (side * 0.0105).max(1.0) * st.arrow_size();
+                let w = (side * 0.0036).max(0.35) * st.arrow_size();
                 let alpha = color & 0xFF00_0000;
                 let edge = (alpha >> 25) << 24 | 0x30_3040;
                 draws.push(Draw::Fill([mid[0] - l - 0.3, mid[1] - w - 0.3, l * 2.0 + 0.6, w * 2.0 + 0.6], edge));
@@ -4721,7 +4735,7 @@ impl State {
         if let Some((pos, yaw)) = player {
             let at = self.map.screen(pos[0], pos[2], size);
             let st = self.settings();
-            arrow(&mut out.draws, at, 180.0 + yaw, 10.0 * st.arrow_scale, st.arrow_argb());
+            arrow(&mut out.draws, at, 180.0 + yaw, 10.0 * st.arrow_size(), st.arrow_argb());
         }
 
         // Top left: the scale (pixels a block).
@@ -5823,6 +5837,8 @@ mod tests {
         let mut s = State::default();
         s.settings = Some(Settings {
             lock_north: true,
+            biome: true,
+            time: true,
             ..Settings::default()
         });
         s.waypoints.push(Waypoint {
@@ -6064,6 +6080,7 @@ mod tests {
     #[test]
     fn dots_show_on_the_level_the_map_shows() {
         let mut s = State::default();
+        s.settings = Some(Settings { height_limit: 0, ..Settings::default() });
         s.maps.store(Cut::Surface).put(0, 0, grass(64));
         let at = |y: f64| Dot { pos: [5.0, y, 5.0], kind: DotKind::Mob, ..Dot::default() };
         let kept = |s: &mut State, y: f64| !s.visible_dots(vec![at(y)], 65.0).is_empty();
@@ -6157,6 +6174,10 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_commands_set_them() {
+        // A file from before version 2 keeps its arrow the same size.
+        let old = "arrow_scale=1.00\nheight_limit=0\n".to_string();
+        let old_file = Settings::read(|k: &str| (k == SETTINGS_FILE).then(|| old.clone()));
+        assert_eq!((old_file.arrow_scale, old_file.arrow_size(), old_file.height_limit), (1.5, 1.0, 0));
         let s = Settings::read(|_| None);
         assert_eq!(s, Settings::default());
         let mut s = s;
@@ -6359,6 +6380,7 @@ mod tests {
             light_line: true,
             weather_line: true,
             mode: MapMode::Layer,
+            height_limit: 0,
             ..Settings::default()
         };
         for (i, o) in OPTS.iter().enumerate() {
