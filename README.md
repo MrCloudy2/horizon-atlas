@@ -114,7 +114,7 @@ All but Tab can be changed in Options > Mods > Atlas.
 ## Install
 
 Download `atlas-0.2.0.hnmod` from [Releases](https://github.com/MrCloudy2/horizon-atlas/releases), add it to your native
-mods in the Horizon launcher, and build. Atlas is pinned to Horizon Nightly 2026-11-05 (`f319701`), because it reads the
+mods in the Horizon launcher, and build. Atlas is pinned to Horizon Nightly 2026-11-13 (`9f42064`), because it reads the
 game's world directly, so a newer Nightly may need a new release. Turn off Horizon's own Minimap so you don't get two.
 
 Everything Atlas keeps is in `horizon-mods/.horizon-mod-data/atlas/` in the game folder: `settings.txt`, waypoints and

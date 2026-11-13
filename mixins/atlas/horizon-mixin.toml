@@ -8,7 +8,7 @@ priority = 100
 # world folder and the connected server's address, none of which the stable
 # hook points offer.
 [compatibility]
-horizon_revision = "f319701e8c9ab657ff562250b3ba07b2d654e3bc"
+horizon_revision = "9f42064c11efe7ef3e5ed2baad7ddc2a3b36eea0"
 
 [[module]]
 id = "core"

@@ -8,6 +8,9 @@ L=$HOME/.local/share/horizon-launcher
 REV=$(python3 -c "import json;print(json.load(open('$ROOT/compatibility.json'))['horizon_revision'])")
 MIXREV=$(python3 -c "import json;print(json.load(open('$ROOT/compatibility.json'))['horizon_mixins_revision'])")
 SRC=$L/native/source/$REV
+# Else a release's horizon-source.tar.gz unpacked outside any git repository
+# (horizon-mixins reads the revision from an enclosing one).
+[ -d "$SRC" ] || SRC=$HOME/.cache/horizon-atlas/$REV
 TOOL=$L/native/tools/$(echo "$MIXREV" | cut -c1-12)/bin/horizon-mixins
 OUT=$ROOT/target/hcheck
 [ -d "$SRC" ] || { echo "no Horizon source for $REV (build it once in the launcher)"; exit 1; }

@@ -738,17 +738,18 @@ fn scan(game: &Game<'_>, cut: m::Cut, settings: &m::Settings) {
 
 /// The map texture slot for slot key `id`, and whether it was just claimed
 /// (blank: upload into it).
-fn slot_for(game: &mut Game<'_>, id: i32) -> (usize, bool) {
+/// None when every slot is drawn this frame: try again on the next.
+fn slot_for(game: &mut Game<'_>, id: i32) -> Option<(usize, bool)> {
     if let Some(slot) = game.maps.slots.show(&id) {
-        return (slot, false);
+        return Some((slot, false));
     }
-    let (slot, old) = game.maps.slots.claim(id);
+    let (slot, old) = game.maps.slots.claim(id)?;
     if let Some(old) = old {
         m::with(|s| {
             s.images.forget_id(old);
         });
     }
-    (slot, true)
+    Some((slot, true))
 }
 
 /// Uploads a 128 x 128 image into map texture slot `slot`.
@@ -800,7 +801,11 @@ fn upload_map_tiles(game: &mut Game<'_>) {
     let mut budget = 6;
     for (key, _) in tiles {
         let id = m::with(|s| s.images.id(key));
-        let (slot, fresh) = slot_for(game, id);
+        let Some((slot, fresh)) = slot_for(game, id) else {
+            // No slot free this frame: not drawn till one is.
+            m::with(|s| s.images.slots.remove(&key));
+            continue;
+        };
         let (stamp, shown) = m::with(|s| (s.tile_stamp(key), s.images.stamps.get(&key).copied()));
         if !fresh && shown == Some(stamp) {
             m::with(|s| s.images.slots.insert(key, slot));
@@ -868,7 +873,9 @@ fn read_png(path: &std::path::Path) -> Option<(usize, Vec<u8>)> {
 
 /// Keeps the mob face sheet in a map texture slot: 16 x 16 texel cells.
 fn upload_faces(game: &mut Game<'_>) {
-    let (slot, fresh) = slot_for(game, m::FACES_SLOT_KEY);
+    let Some((slot, fresh)) = slot_for(game, m::FACES_SLOT_KEY) else {
+        return;
+    };
     if !fresh && m::with(|s| s.face_slot == Some(slot)) {
         return;
     }
