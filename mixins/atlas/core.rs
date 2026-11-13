@@ -24,7 +24,7 @@ use std::time::Instant;
 /// The mod's id (its data folder and its keys' lines), name and version.
 pub const ID: &str = "atlas";
 pub const NAME: &str = "Horizon Atlas";
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.3.0";
 pub const DESCRIPTION: &str = "A smooth minimap, a world map of everywhere you have been and waypoints on both. M opens the map, B makes a waypoint, U lists them.";
 /// Where bugs and ideas go: the last button of Options > Mods > Atlas.
 pub const ISSUES_URL: &str = "https://github.com/MrCloudy2/horizon-atlas/issues";
