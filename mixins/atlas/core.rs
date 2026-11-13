@@ -760,8 +760,8 @@ pub const REGION: i32 = 32;
 const REGION_CHUNKS: usize = (REGION * REGION) as usize;
 /// The most regions kept in memory (a megabyte each at most).
 const MAX_REGIONS: usize = 160;
-/// The most regions' overviews kept (12 KB each): 64 x 64 regions, 32768
-/// blocks square.
+/// The most regions' overviews kept (8 KB each, a store): 64 x 64
+/// regions, 32768 blocks square.
 const MAX_OVERVIEWS: usize = 4096;
 /// Region files the world map may read in a frame (about 0.6 MB each).
 pub const MAP_READS: u32 = 3;
@@ -775,17 +775,29 @@ const NOT_READ: u64 = u64::MAX;
 /// region itself is let go.
 #[derive(Debug)]
 struct Overview {
-    columns: Vec<Option<Column>>,
+    columns: Vec<Column>,
+    /// Which chunks were seen, a bit each.
+    seen: [u64; REGION_CHUNKS / 64],
     revision: u64,
     used: u64,
 }
 
 impl Overview {
     fn of(region: &Region) -> Self {
-        let columns = (0..REGION_CHUNKS)
-            .map(|i| region.chunks[i].as_ref().map(|t| t.column(8, 8)))
-            .collect();
-        Self { columns, revision: region.revision, used: 0 }
+        let mut o = Self { columns: vec![(0, 0, 0, 0); REGION_CHUNKS], seen: [0; REGION_CHUNKS / 64], revision: region.revision, used: 0 };
+        for (i, chunk) in region.chunks.iter().enumerate() {
+            if let Some(t) = chunk {
+                o.set(i, t.column(8, 8));
+            }
+        }
+        o
+    }
+    fn set(&mut self, i: usize, column: Column) {
+        self.columns[i] = column;
+        self.seen[i / 64] |= 1 << (i % 64);
+    }
+    fn get(&self, i: usize) -> Option<Column> {
+        (self.seen[i / 64] >> (i % 64) & 1 == 1).then(|| self.columns[i])
     }
 }
 const MAGIC: &[u8; 4] = b"ATL3";
@@ -1026,7 +1038,7 @@ impl Store {
         region.revision = revision;
         match self.overviews.get_mut(&r) {
             Some(o) => {
-                o.columns[region_index(cx, cz)] = Some(centre);
+                o.set(region_index(cx, cz), centre);
                 o.revision = revision;
             }
             None => {
@@ -1105,7 +1117,7 @@ impl Store {
     pub fn overview_column(&mut self, x: i32, z: i32) -> Option<Column> {
         let (cx, cz) = (x >> 4, z >> 4);
         let r = (region_of(cx), region_of(cz));
-        self.overview(r)?.columns[region_index(cx, cz)]
+        self.overview(r)?.get(region_index(cx, cz))
     }
 
     /// Region `r`'s overview: kept, else made from it in memory or read.
@@ -1745,7 +1757,11 @@ pub fn command_words() -> Vec<CommandWord> {
                     let named = zero.map(|(_, name)| name.to_ascii_lowercase()).into_iter().collect();
                     (named, Some((f64::from(min) / f64::from(div), f64::from(max) / f64::from(div), div <= 1)))
                 }
-                Kind::Steps { steps, div, .. } => (steps.iter().map(|&s| number_text(s, div)).collect(), None),
+                Kind::Steps { steps, div, .. } => {
+                    // Any value from the first to the last, the steps suggested.
+                    let range = (f64::from(steps[0]) / f64::from(div), f64::from(steps[steps.len() - 1]) / f64::from(div), div <= 1);
+                    (steps.iter().map(|&s| number_text(s, div)).collect(), Some(range))
+                }
             };
             CommandWord { key: o.key, values, number }
         })
@@ -2302,6 +2318,9 @@ pub const MAX_BPP: f64 = 64.0;
 /// The most images the world map shows at once (of the game's 256 map
 /// texture slots): past it, the next level's fewer, coarser ones.
 pub const MAX_TILES: usize = 120;
+/// The most regions the world map shows at full detail: of the
+/// `MAX_REGIONS` held, the rest for the minimap.
+const MAX_VIEW_REGIONS: usize = 120;
 
 impl TileKey {
     /// The blocks `[x0, z0, x1, z1]` (inclusive) the image covers.
@@ -2408,6 +2427,13 @@ impl MapView {
             (n(x0, x1) * n(z0, z1)) as usize
         };
         let mut level = map_level(self.bpp / f64::from(scale.max(1.0)));
+        // Below the overviews' levels every region shown is held: no more
+        // than fit, or they would be read again and again.
+        let region = f64::from(REGION * 16);
+        let regions = ((x1 - x0) / region + 2.0) * ((z1 - z0) / region + 2.0);
+        if level < OVERVIEW_LEVEL && regions > MAX_VIEW_REGIONS as f64 {
+            level = OVERVIEW_LEVEL;
+        }
         while level < MAX_LEVEL && count(level) > MAX_TILES {
             level += 1;
         }
@@ -3578,6 +3604,8 @@ impl State {
         if self.world == key {
             return;
         }
+        // A line being drawn belongs to the world it was drawn on.
+        self.draw.stroke = None;
         self.set = DEFAULT_SET.to_owned();
         self.selected = None;
         self.waypoints = key
@@ -4437,6 +4465,10 @@ impl State {
             return "Atlas: join a server first".into();
         };
         self.share_answer = Some(yes);
+        if !yes {
+            // What already came is kept; what was on its way isn't taken.
+            self.maps.shared.inbox.clear();
+        }
         let text = if yes { "on" } else { "off" };
         let _ = std::fs::create_dir_all(&dir).and_then(|()| write_whole(&dir.join(download_file(&key)), text.as_bytes()));
         if yes {
@@ -5242,11 +5274,17 @@ impl State {
         (gui[1] * share).min(gui[0] * 0.45).max(24.0).floor()
     }
 
+    /// The GUI scale of a `gui` screen of `physical` pixels, kept.
+    pub fn set_gui_scale(&mut self, gui: [f32; 2], physical: [f32; 2]) -> f32 {
+        let scale = if gui[1] > 0.0 { physical[1] / gui[1] } else { 1.0 };
+        self.gui_scale = scale.max(1.0);
+        scale
+    }
+
     /// Sizes the minimap's image for a `gui` screen of `physical` pixels:
     /// a texel a screen pixel, so nothing is stretched.
     pub fn size_image(&mut self, gui: [f32; 2], physical: [f32; 2]) {
-        let scale = if gui[1] > 0.0 { physical[1] / gui[1] } else { 1.0 };
-        self.gui_scale = scale.max(1.0);
+        let scale = self.set_gui_scale(gui, physical);
         let n = (self.mini_side(gui) * scale).round() as usize + 1;
         // Even, so the player sits on the grid.
         self.mini_n = (n + n % 2).clamp(32, MINI_MAX);
@@ -7396,7 +7434,10 @@ mod tests {
         let mut again = State::default();
         again.load_world(Some("server-example.net".into()), dir.clone());
         assert!(again.share_wanted());
+        again.maps.shared.inbox.push_back(Shared::Done(7));
         assert!(again.command("download never").contains("won't"));
+        // What was on its way isn't taken.
+        assert!(again.maps.shared.inbox.is_empty());
         let mut third = State::default();
         third.load_world(Some("server-example.net".into()), dir.clone());
         third.share_link.offered = true;
@@ -9141,6 +9182,23 @@ mod tests {
         }
         let near = MapView { bpp: 1.0, ..view };
         assert!(near.tiles([960.0, 540.0], Cut::Surface, 4.0).len() <= MAX_TILES);
+        // Below the overviews' levels, never more regions than are held.
+        for size in [[427.0, 240.0], [640.0, 360.0], [960.0, 540.0], [1280.0, 720.0]] {
+            for scale in [1.0, 2.0, 3.0, 4.0] {
+                let mut bpp = MIN_BPP;
+                while bpp <= MAX_BPP {
+                    let v = MapView { bpp, ..near.clone() };
+                    let tiles = v.tiles(size, Cut::Surface, scale);
+                    let level = tiles[0].0.level;
+                    assert!(tiles.len() <= MAX_TILES);
+                    if level < OVERVIEW_LEVEL {
+                        let blocks = |n: f32| f64::from(n) * bpp / f64::from(REGION * 16) + 2.0;
+                        assert!(blocks(size[0]) * blocks(size[1]) <= MAX_VIEW_REGIONS as f64, "{size:?} {scale} {bpp}");
+                    }
+                    bpp *= 2.0;
+                }
+            }
+        }
     }
 
     #[test]

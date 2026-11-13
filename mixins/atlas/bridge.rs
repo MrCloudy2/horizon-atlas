@@ -560,6 +560,11 @@ fn server_key(address: &str, mode: usize) -> String {
 
 /// The world or server being played, naming its waypoints and maps.
 fn world_key(game: &Game<'_>, folder: usize) -> Option<String> {
+    let on_server = matches!((&game.integrated, &game.remote), (None, Some(_)));
+    if !on_server {
+        // Between connections: the list is read again (a server renamed).
+        SERVER_KEY.with(|k| *k.borrow_mut() = None);
+    }
     game.native_player()?;
     if let (None, Some(remote)) = (&game.integrated, &game.remote) {
         return Some(server_key(&remote.session.address, folder));
@@ -800,6 +805,10 @@ fn upload_minimap(game: &mut Game<'_>) {
 
 /// Composes and uploads the world map's tiles that changed, a few a frame.
 fn upload_map_tiles(game: &mut Game<'_>) {
+    if let Some([pw, ph]) = game.native_physical_window_size() {
+        let (w, h) = game.gui_size();
+        m::with(|s| s.set_gui_scale([w, h], [pw as f32, ph as f32]));
+    }
     let tiles = m::with(|s| {
         s.begin_map_frame();
         s.map.tiles(s.screen_size, s.map_cut(), s.gui_scale)
@@ -1475,7 +1484,8 @@ pub(super) fn share_from_server(channel: &str, data: &[u8]) {
             s.maps.shared.hello_for = None;
             return;
         }
-        if !s.settings().server_map {
+        // Only what the player said yes to.
+        if !s.settings().server_map || !s.share_wanted() {
             return;
         }
         if let Some(dimension) = s.map_dimension.clone() {
