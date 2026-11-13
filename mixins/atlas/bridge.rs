@@ -569,13 +569,18 @@ fn world_key(game: &Game<'_>, folder: usize) -> Option<String> {
     if let (None, Some(remote)) = (&game.integrated, &game.remote) {
         return Some(server_key(&remote.session.address, folder));
     }
+    // The single player world's save folder, which the connection keeps
+    // (worlds can share a name, never a folder).
+    if let Some(folder) = game.remote.as_ref().and_then(|r| r.save_folder.as_deref()) {
+        return Some(format!("world-{folder}"));
+    }
     if let Some(folder) = game
         .world_icon
         .as_ref()
         .and_then(|icon| icon.path.parent()?.file_name())
     {
-        // The single player world's save folder: the window keeps it for the
-        // world's icon from the moment its server starts.
+        // Else the icon's: the window keeps it from the moment its server
+        // starts till the world has one.
         return Some(format!("world-{}", folder.to_string_lossy()));
     }
     // The icon is taken and forgotten: the world stays the one loaded.
@@ -835,10 +840,15 @@ fn upload_map_tiles(game: &mut Game<'_>) {
             continue;
         }
         budget -= 1;
-        let image = m::with(|s| s.compose_tile(key));
+        let (image, whole) = m::with(|s| s.compose_tile(key));
         if upload(game, slot, image) {
             m::with(|s| {
-                s.images.stamps.insert(key, stamp);
+                // Not whole: made again once the rest of it is read.
+                if whole {
+                    s.images.stamps.insert(key, stamp);
+                } else {
+                    s.images.stamps.remove(&key);
+                }
                 s.images.slots.insert(key, slot);
             });
         }

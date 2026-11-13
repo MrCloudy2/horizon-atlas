@@ -960,6 +960,8 @@ pub struct Store {
     overviews: HashMap<(i32, i32), Overview>,
     /// Region files the world map may still read this frame; None: no limit.
     pub view_budget: Option<u32>,
+    /// A region the world map asked for was left to read on a later frame.
+    pub view_short: bool,
     /// The regions with a file, listed once: zoomed far out, the thousands
     /// never explored are known at once instead of each costing a read.
     files: Option<HashSet<(i32, i32)>>,
@@ -1006,7 +1008,13 @@ impl Store {
                 return None;
             };
             self.trim();
-            self.keep_overview(r, Overview::of(&region));
+            let mut region = region;
+            match self.overviews.get(&r) {
+                // Read again after it was let go (written first): the same
+                // columns, so the same revision, and no image made again.
+                Some(o) => region.revision = o.revision,
+                None => self.keep_overview(r, Overview::of(&region)),
+            }
             self.regions.insert(r, region);
         }
         let clock = self.clock;
@@ -1076,7 +1084,10 @@ impl Store {
         }
         match &mut self.view_budget {
             None => true,
-            Some(0) => false,
+            Some(0) => {
+                self.view_short = true;
+                false
+            }
             Some(n) => {
                 *n -= 1;
                 true
@@ -1139,26 +1150,25 @@ impl Store {
         Some(o)
     }
 
-    /// [`Store::stamp`] for the world map: by overviews from
-    /// `OVERVIEW_LEVEL` on, and changing once a region left to read is.
-    pub fn view_stamp(&mut self, x0: i32, z0: i32, x1: i32, z1: i32, overview: bool) -> u64 {
+    /// [`Store::stamp`] for the world map, by the regions' overviews, and
+    /// changing once a region left to read is.
+    pub fn view_stamp(&mut self, x0: i32, z0: i32, x1: i32, z1: i32) -> u64 {
         let mut stamp = 0u64;
         for rz in region_of(z0 >> 4)..=region_of(z1 >> 4) {
             for rx in region_of(x0 >> 4)..=region_of(x1 >> 4) {
                 let r = (rx, rz);
+                // By the overviews at every level: they follow every change
+                // and outlast the regions, so a screen of any size needn't
+                // hold all it shows.
                 let rev = if self.missing.contains(&r) {
                     0
-                } else if overview {
+                } else {
                     match self.overview(r).map(|o| o.revision) {
                         Some(rev) => rev,
                         // Read and found to have no file, else left for later.
                         None if self.missing.contains(&r) => 0,
                         None => NOT_READ,
                     }
-                } else if self.view_ready(r) {
-                    self.region(r).map_or(0, |reg| reg.revision)
-                } else {
-                    NOT_READ
                 };
                 stamp = stamp.wrapping_mul(0x100_0000_01B3).wrapping_add(rev);
             }
@@ -2317,10 +2327,7 @@ pub const MIN_BPP: f64 = 1.0 / 8.0;
 pub const MAX_BPP: f64 = 64.0;
 /// The most images the world map shows at once (of the game's 256 map
 /// texture slots): past it, the next level's fewer, coarser ones.
-pub const MAX_TILES: usize = 120;
-/// The most regions the world map shows at full detail: of the
-/// `MAX_REGIONS` held, the rest for the minimap.
-const MAX_VIEW_REGIONS: usize = 120;
+pub const MAX_TILES: usize = 180;
 
 impl TileKey {
     /// The blocks `[x0, z0, x1, z1]` (inclusive) the image covers.
@@ -2427,13 +2434,6 @@ impl MapView {
             (n(x0, x1) * n(z0, z1)) as usize
         };
         let mut level = map_level(self.bpp / f64::from(scale.max(1.0)));
-        // Below the overviews' levels every region shown is held: no more
-        // than fit, or they would be read again and again.
-        let region = f64::from(REGION * 16);
-        let regions = ((x1 - x0) / region + 2.0) * ((z1 - z0) / region + 2.0);
-        if level < OVERVIEW_LEVEL && regions > MAX_VIEW_REGIONS as f64 {
-            level = OVERVIEW_LEVEL;
-        }
         while level < MAX_LEVEL && count(level) > MAX_TILES {
             level += 1;
         }
@@ -4949,8 +4949,7 @@ impl State {
     pub fn tile_stamp(&mut self, key: TileKey) -> u64 {
         let [x0, z0, x1, z1] = key.blocks();
         let sky = self.shading(key.cut).sky.to_bits();
-        let far = key.level >= OVERVIEW_LEVEL;
-        self.view_maps().store(key.cut).view_stamp(x0, z0, x1, z1, far) ^ u64::from(sky) << 40
+        self.view_maps().store(key.cut).view_stamp(x0, z0, x1, z1) ^ u64::from(sky) << 40
     }
 
     /// The day time `ticks` now, None where there is no sky (or no clock):
@@ -4977,12 +4976,15 @@ impl State {
         self.view_maps().store(cut).view_budget = Some(MAP_READS);
     }
 
-    /// World map image `key`, 128 x 128 RGBA.
-    pub fn compose_tile(&mut self, key: TileKey) -> Vec<u8> {
+    /// World map image `key`, 128 x 128 RGBA, and whether it is whole (no
+    /// region of it left to read on a later frame: it is made again then).
+    pub fn compose_tile(&mut self, key: TileKey) -> (Vec<u8>, bool) {
         let mut out = Vec::new();
         let how = self.shading(key.cut);
-        compose_map_tile(self.view_maps().store(key.cut), key, how, &mut out);
-        out
+        let store = self.view_maps().store(key.cut);
+        store.view_short = false;
+        compose_map_tile(store, key, how, &mut out);
+        (out, !std::mem::take(&mut store.view_short))
     }
 
     /// The block under the world map's GUI pixel `at`: x, the height the
@@ -8292,7 +8294,8 @@ mod tests {
         assert_eq!(s.map.centre, [20.0, 10.0], "where the player would be there");
         assert!(!s.map.follow);
         // Its tiles come from the Nether's map, not the Overworld's.
-        let tile = s.compose_tile(TileKey { cut: Cut::Below(40), level: 0, x: 0, z: 0 });
+        let (tile, whole) = s.compose_tile(TileKey { cut: Cut::Below(40), level: 0, x: 0, z: 0 });
+        assert!(whole);
         let o = ((20 * MAP_TEXELS + 20) * 4) as usize;
         assert_ne!(tile[o + 3], 0);
         assert_eq!(tile[(4 * MAP_TEXELS * 4 + 4 * 4) as usize + 3], 0, "the Overworld's chunk (0, 0) isn't in it");
@@ -8939,7 +8942,7 @@ mod tests {
             let list = s.screen(gui, [0.0, 0.0], Some(&h), &measure).0;
             s.open_map(Some(&h), None);
             let map = s.screen(gui, [0.0, 0.0], Some(&h), &measure).0;
-            let tile = s.compose_tile(TileKey { cut, level: 0, x: 0, z: 0 });
+            let tile = s.compose_tile(TileKey { cut, level: 0, x: 0, z: 0 }).0;
             let tile: u64 = tile.iter().fold(7, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(*b)));
             out.push_str(&format!("{image} {tile} {hud:?} {labels:?} {list:?} {map:?} {} {}", s.mini_n, s.mini_reach()));
         }
@@ -9182,19 +9185,18 @@ mod tests {
         }
         let near = MapView { bpp: 1.0, ..view };
         assert!(near.tiles([960.0, 540.0], Cut::Surface, 4.0).len() <= MAX_TILES);
-        // Below the overviews' levels, never more regions than are held.
+        // A 2560 x 1440 screen at GUI scale 3, 8 blocks a GUI pixel: no
+        // coarser than 4 blocks a texel (2.7 a screen pixel), whatever the
+        // regions it covers.
+        let big = MapView { bpp: 8.0, ..near.clone() };
+        let tiles = big.tiles([853.0, 480.0], Cut::Surface, 3.0);
+        assert!(tiles.len() <= MAX_TILES && tiles[0].0.level <= 2, "{} {}", tiles.len(), tiles[0].0.level);
         for size in [[427.0, 240.0], [640.0, 360.0], [960.0, 540.0], [1280.0, 720.0]] {
             for scale in [1.0, 2.0, 3.0, 4.0] {
                 let mut bpp = MIN_BPP;
                 while bpp <= MAX_BPP {
                     let v = MapView { bpp, ..near.clone() };
-                    let tiles = v.tiles(size, Cut::Surface, scale);
-                    let level = tiles[0].0.level;
-                    assert!(tiles.len() <= MAX_TILES);
-                    if level < OVERVIEW_LEVEL {
-                        let blocks = |n: f32| f64::from(n) * bpp / f64::from(REGION * 16) + 2.0;
-                        assert!(blocks(size[0]) * blocks(size[1]) <= MAX_VIEW_REGIONS as f64, "{size:?} {scale} {bpp}");
-                    }
+                    assert!(v.tiles(size, Cut::Surface, scale).len() <= MAX_TILES);
                     bpp *= 2.0;
                 }
             }
@@ -9225,7 +9227,7 @@ mod tests {
         loop {
             frames += 1;
             again.view_budget = Some(MAP_READS);
-            let stamp = again.view_stamp(x0, z0, x1, z1, true);
+            let stamp = again.view_stamp(x0, z0, x1, z1);
             again.view_budget = Some(MAP_READS);
             compose_map_tile(&mut again, key, Shading::default(), &mut img);
             if stamp == last {
@@ -9242,23 +9244,44 @@ mod tests {
         assert!(drawn >= 64, "{drawn}");
         // Far from anything explored: known at once, with no read spent.
         again.view_budget = Some(0);
-        let empty = again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191, true);
+        let empty = again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191);
         again.view_budget = Some(MAP_READS);
-        assert_eq!(again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191, true), empty);
+        assert_eq!(again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191), empty);
         assert_eq!(again.view_budget, Some(MAP_READS));
+        // Full detail, its region let go: its stamp still needs no read, and
+        // its image, read once the frame allows, says whether it is whole.
+        let near_key = TileKey { cut: Cut::Surface, level: 0, x: 0, z: 0 };
+        let [nx0, nz0, nx1, nz1] = near_key.blocks();
+        let before = again.view_stamp(nx0, nz0, nx1, nz1);
+        for i in 0..MAX_REGIONS as i32 + 5 {
+            again.put((200 + i) * REGION, 0, grass(64));
+        }
+        again.view_budget = Some(0);
+        assert_eq!(again.view_stamp(nx0, nz0, nx1, nz1), before, "the stamp read or changed");
+        let mut s = State::default();
+        std::mem::swap(s.maps.store(Cut::Surface), &mut again);
+        let (_, whole) = s.compose_tile(near_key);
+        assert!(!whole);
+        s.maps.store(Cut::Surface).view_budget = Some(MAP_READS);
+        let (_, whole) = s.compose_tile(near_key);
+        assert!(whole);
+        // Read again, the same revision: no image is made again for it.
+        s.maps.store(Cut::Surface).view_budget = Some(0);
+        assert_eq!(s.maps.store(Cut::Surface).view_stamp(nx0, nz0, nx1, nz1), before);
+        std::mem::swap(s.maps.store(Cut::Surface), &mut again);
         // Regions let go keep their overviews: drawing again reads nothing.
         for i in 0..MAX_REGIONS as i32 + 5 {
             again.put((100 + i) * REGION, 0, grass(64));
         }
         again.view_budget = Some(0);
-        assert_eq!(again.view_stamp(x0, z0, x1, z1, true), last);
+        assert_eq!(again.view_stamp(x0, z0, x1, z1), last);
         let mut img2 = Vec::new();
         compose_map_tile(&mut again, key, Shading::default(), &mut img2);
         assert_eq!(img, img2);
         // A change shows: its region's overview follows the store.
         again.put(3, 3, grass(90));
         again.view_budget = Some(0);
-        assert_ne!(again.view_stamp(x0, z0, x1, z1, true), last);
+        assert_ne!(again.view_stamp(x0, z0, x1, z1), last);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
