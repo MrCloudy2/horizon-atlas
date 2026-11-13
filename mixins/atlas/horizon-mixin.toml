@@ -167,15 +167,6 @@ bindings = [
 ]
 
 [[injection]]
-id = "commands"
-kind = "HEAD"
-target = "horizon_client::game::native_hooks::Game<'_>::native_commands"
-helper = "commands.rs"
-bindings = [
-  { name = "commands", ty = "&mut Vec<&'static str>", value = "&mut *commands" },
-]
-
-[[injection]]
 id = "command"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_command"

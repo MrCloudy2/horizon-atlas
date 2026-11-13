@@ -12,14 +12,15 @@ Drawn at your screen's own resolution, so every block is crisp. It scrolls smoot
 and scales with your window. Height steps are drawn as fine contour lines, so cliffs and hills read at a glance.
 
 Entities show as diamonds: yellow mobs, white players, red dropped items, purple everything else, fading the further
-they are above or below you. **Hold Tab** for mob faces, player faces and item icons.
+they are above or below you. **Hold Tab** for mob faces (64 kinds, fish and cats included), player faces and item icons.
 
 <p align="center"><img src="docs/images/minimap-tab.png" width="640" alt="The minimap with dots, and with mob faces while Tab is held"></p>
 
 ## World map
 
 Press **M**. It shows everything you have explored, saved per world, server and dimension. Drag to move, scroll to
-zoom, and press **B** over any spot to make a waypoint there. The dimension button shows another dimension's map
+zoom (from 8 pixels a block out to 64 blocks a pixel: zoomed far out it draws each chunk once and fills in over a
+moment), and press **B** over any spot to make a waypoint there. The dimension button shows another dimension's map
 from wherever you are (the Nether's centred where you would be there), and the pointer's line gives the same spot's
 Nether or Overworld coordinates.
 
@@ -71,13 +72,15 @@ and ones made in the Nether are saved as the Overworld's.
 - **Miscellaneous**: minimap FPS limit, map sharing, Server Map Folder (keep a server's maps and waypoints under its
   address, its name in your server list, or its base domain, so `connect.example.net` and `example.net` share one)
 
-`/atlas <setting> <value>` in chat sets any of them exactly, and `/atlas help` lists them:
+`/atlas <setting> <value>` in chat sets any of them exactly, and Tab completes every setting and what it takes.
+`/atlas help` explains the commands and `/atlas help <page>` lists a page's settings with their values:
 
 ```
 /atlas size 30           minimap side, percent of the window's height
 /atlas zoom 2            blocks per minimap pixel
 /atlas mode layer 40     auto | cave | layer [height]
 /atlas seed <seed>       this world's seed, for slime chunks (a server never sends it)
+/atlas download          download this server's map (or: download never)
 ```
 
 ## Map sharing
@@ -89,7 +92,9 @@ player who runs Atlas, nearest first, and changes follow as the server sees them
   from a world of your own opened to LAN. Set it to Operators, Everyone or OFF (`share_map=ops` in the server's
   `settings.txt`, or `/atlas share_map all` in your own world). Map Sharing Rate caps what each player is sent, 256 KB/s
   by default. The shared map is kept in the world's folder, `atlas-share/`.
-- **On the client**: nothing to do; turn off Use the Server's Map to keep only what you see yourself.
+- **On the client**: when a server offers its map, chat says so and the world map asks: Download, Not now or Never.
+  The answer is kept for that server (`/atlas download` or `/atlas download never` changes it); turn off Use the
+  Server's Map to never be asked.
 - **How**: the server offers it when you join (players without Atlas never hear of it), your Atlas says what it already
   has, and the rest comes in the background. It sends each column's blocks rather than colours, so your own settings and
   resource pack colour them. Your own view of a chunk wins over the server's.

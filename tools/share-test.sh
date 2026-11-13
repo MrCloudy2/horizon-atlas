@@ -31,6 +31,9 @@ fi
 rm -rf "$ROOT/target/home2"
 mkdir -p "$ROOT/target/home2"
 echo 'soundCategory_master:0.0' > "$ROOT/target/home2/options.txt"
+# The guest said Download to this server's offer (the world map asks).
+mkdir -p "$ROOT/target/home2/$DATA"
+printf 'on' > "$ROOT/target/home2/$DATA/server-127.0.0.1_$PORT.download"
 
 echo "host: starting"
 HORIZON_HOME=$ROOT/target/home HORIZON_CONTROL=$ROOT/target/ctl.sock \

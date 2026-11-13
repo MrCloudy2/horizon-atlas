@@ -474,6 +474,10 @@ pub enum Action {
     ToggleAll,
     /// The Layer mode's height up or down a block (16 with Shift).
     LayerStep(i32),
+    /// The server's map offer: download it (and from now on), not now, never.
+    ShareDownload,
+    ShareLater,
+    ShareNever,
     /// The drawing tool on or off.
     ToggleDraw,
     /// The drawing tool's next pen.
@@ -756,6 +760,34 @@ pub const REGION: i32 = 32;
 const REGION_CHUNKS: usize = (REGION * REGION) as usize;
 /// The most regions kept in memory (a megabyte each at most).
 const MAX_REGIONS: usize = 160;
+/// The most regions' overviews kept (12 KB each): 64 x 64 regions, 32768
+/// blocks square.
+const MAX_OVERVIEWS: usize = 4096;
+/// Region files the world map may read in a frame (about 0.6 MB each).
+pub const MAP_READS: u32 = 3;
+/// From this level on (16 blocks a texel), the world map draws from the
+/// regions' overviews, so zoomed out it needn't hold every region shown.
+pub const OVERVIEW_LEVEL: u8 = 4;
+/// A stamp's part for a region not read yet: it changes once it is.
+const NOT_READ: u64 = u64::MAX;
+
+/// A region seen from afar: each chunk's centre column, kept after the
+/// region itself is let go.
+#[derive(Debug)]
+struct Overview {
+    columns: Vec<Option<Column>>,
+    revision: u64,
+    used: u64,
+}
+
+impl Overview {
+    fn of(region: &Region) -> Self {
+        let columns = (0..REGION_CHUNKS)
+            .map(|i| region.chunks[i].as_ref().map(|t| t.column(8, 8)))
+            .collect();
+        Self { columns, revision: region.revision, used: 0 }
+    }
+}
 const MAGIC: &[u8; 4] = b"ATL3";
 /// The format before block light, still read.
 const MAGIC_2: &[u8; 4] = b"ATL2";
@@ -913,6 +945,12 @@ pub struct Store {
     missing: HashSet<(i32, i32)>,
     clock: u64,
     next_revision: u64,
+    overviews: HashMap<(i32, i32), Overview>,
+    /// Region files the world map may still read this frame; None: no limit.
+    pub view_budget: Option<u32>,
+    /// The regions with a file, listed once: zoomed far out, the thousands
+    /// never explored are known at once instead of each costing a read.
+    files: Option<HashSet<(i32, i32)>>,
 }
 
 impl Store {
@@ -956,6 +994,7 @@ impl Store {
                 return None;
             };
             self.trim();
+            self.keep_overview(r, Overview::of(&region));
             self.regions.insert(r, region);
         }
         let clock = self.clock;
@@ -981,10 +1020,138 @@ impl Store {
         if slot.as_deref() == Some(&tile) {
             return false;
         }
+        let centre = tile.column(8, 8);
         *slot = Some(Box::new(tile));
         region.dirty = true;
         region.revision = revision;
+        match self.overviews.get_mut(&r) {
+            Some(o) => {
+                o.columns[region_index(cx, cz)] = Some(centre);
+                o.revision = revision;
+            }
+            None => {
+                let o = self.regions.get(&r).map(Overview::of);
+                if let Some(o) = o {
+                    self.keep_overview(r, o);
+                }
+            }
+        }
         true
+    }
+
+    /// Keeps region `r`'s overview, the least recently used let go past
+    /// `MAX_OVERVIEWS`.
+    fn keep_overview(&mut self, r: (i32, i32), mut overview: Overview) {
+        if !self.overviews.contains_key(&r) && self.overviews.len() >= MAX_OVERVIEWS {
+            let oldest = self.overviews.iter().min_by_key(|(_, o)| o.used).map(|(k, _)| *k);
+            if let Some(oldest) = oldest {
+                self.overviews.remove(&oldest);
+            }
+        }
+        overview.used = self.clock;
+        self.overviews.insert(r, overview);
+    }
+
+    /// Whether region `r` can be had for the world map this frame: in
+    /// memory, known to have no file, or one of the frame's reads left.
+    fn view_ready(&mut self, r: (i32, i32)) -> bool {
+        if self.regions.contains_key(&r) || self.missing.contains(&r) {
+            return true;
+        }
+        if !self.has_file(r) {
+            self.missing.insert(r);
+            return true;
+        }
+        match &mut self.view_budget {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+
+    /// Whether region `r` has a file (the folder listed the first time).
+    fn has_file(&mut self, r: (i32, i32)) -> bool {
+        let dir = self.dir.clone();
+        let files = self.files.get_or_insert_with(|| {
+            let Some(entries) = dir.and_then(|d| std::fs::read_dir(d).ok()) else {
+                return HashSet::new();
+            };
+            entries
+                .filter_map(|e| {
+                    let name = e.ok()?.file_name();
+                    let mut parts = name.to_str()?.strip_prefix("r.")?.strip_suffix(".atl")?.split('.');
+                    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+                })
+                .collect()
+        });
+        files.contains(&r)
+    }
+
+    /// Column `(x, z)` for the world map: None also where its region is
+    /// left to read on a later frame.
+    pub fn view_column(&mut self, x: i32, z: i32) -> Option<Column> {
+        let r = (region_of(x >> 4), region_of(z >> 4));
+        if !self.view_ready(r) {
+            return None;
+        }
+        self.column(x, z)
+    }
+
+    /// The centre column of the chunk at `(x, z)`, from its region's
+    /// overview (the region read for it once, when the frame allows).
+    pub fn overview_column(&mut self, x: i32, z: i32) -> Option<Column> {
+        let (cx, cz) = (x >> 4, z >> 4);
+        let r = (region_of(cx), region_of(cz));
+        self.overview(r)?.columns[region_index(cx, cz)]
+    }
+
+    /// Region `r`'s overview: kept, else made from it in memory or read.
+    fn overview(&mut self, r: (i32, i32)) -> Option<&mut Overview> {
+        self.clock += 1;
+        if !self.overviews.contains_key(&r) {
+            if !self.view_ready(r) {
+                return None;
+            }
+            let made = self.region(r).map(|region| Overview::of(region));
+            // Read just now: kept by `region`; else made from memory here.
+            if !self.overviews.contains_key(&r) {
+                self.keep_overview(r, made?);
+            }
+        }
+        let clock = self.clock;
+        let o = self.overviews.get_mut(&r)?;
+        o.used = clock;
+        Some(o)
+    }
+
+    /// [`Store::stamp`] for the world map: by overviews from
+    /// `OVERVIEW_LEVEL` on, and changing once a region left to read is.
+    pub fn view_stamp(&mut self, x0: i32, z0: i32, x1: i32, z1: i32, overview: bool) -> u64 {
+        let mut stamp = 0u64;
+        for rz in region_of(z0 >> 4)..=region_of(z1 >> 4) {
+            for rx in region_of(x0 >> 4)..=region_of(x1 >> 4) {
+                let r = (rx, rz);
+                let rev = if self.missing.contains(&r) {
+                    0
+                } else if overview {
+                    match self.overview(r).map(|o| o.revision) {
+                        Some(rev) => rev,
+                        // Read and found to have no file, else left for later.
+                        None if self.missing.contains(&r) => 0,
+                        None => NOT_READ,
+                    }
+                } else if self.view_ready(r) {
+                    self.region(r).map_or(0, |reg| reg.revision)
+                } else {
+                    NOT_READ
+                };
+                stamp = stamp.wrapping_mul(0x100_0000_01B3).wrapping_add(rev);
+            }
+        }
+        stamp
     }
 
     #[cfg(test)]
@@ -1055,6 +1222,9 @@ impl Store {
         }
         done?;
         region.dirty = false;
+        if let Some(files) = &mut self.files {
+            files.insert(r);
+        }
         Ok(())
     }
 
@@ -1543,7 +1713,68 @@ fn number_text(v: i32, div: i32) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
+/// The settings pages by the word `/atlas help` takes.
+pub const HELP_PAGES: [(&str, Page); 8] = [
+    ("minimap", Page::Main),
+    ("view", Page::View),
+    ("blockmap", Page::BlockMap),
+    ("radar", Page::Radar),
+    ("overlay", Page::Overlay),
+    ("info", Page::Info),
+    ("waypoints", Page::Waypoints),
+    ("misc", Page::Misc),
+];
+
+/// What the chat box suggests after `/atlas <key>`: the words it takes, and
+/// the range of a number it takes (whole or not).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandWord {
+    pub key: &'static str,
+    pub values: Vec<String>,
+    pub number: Option<(f64, f64, bool)>,
+}
+
+/// Every setting as the chat box completes it.
+pub fn command_words() -> Vec<CommandWord> {
+    OPTS.iter()
+        .map(|o| {
+            let (values, number) = match o.kind {
+                Kind::Toggle => (vec!["on".to_owned(), "off".to_owned()], None),
+                Kind::Choice(names) => (names.iter().map(|n| n.0.to_owned()).collect(), None),
+                Kind::Slider { min, max, div, zero, .. } => {
+                    let named = zero.map(|(_, name)| name.to_ascii_lowercase()).into_iter().collect();
+                    (named, Some((f64::from(min) / f64::from(div), f64::from(max) / f64::from(div), div <= 1)))
+                }
+                Kind::Steps { steps, div, .. } => (steps.iter().map(|&s| number_text(s, div)).collect(), None),
+            };
+            CommandWord { key: o.key, values, number }
+        })
+        .collect()
+}
+
 impl Opt {
+    /// What it takes, in words: `on or off`, `a, b or c`, `0 to 100%`.
+    pub fn takes(&self) -> String {
+        let or = |words: Vec<String>| match words.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => words.concat(),
+        };
+        match self.kind {
+            Kind::Toggle => "on or off".into(),
+            Kind::Choice(names) => or(names.iter().map(|n| n.0.to_owned()).collect()),
+            Kind::Slider { min, max, div, unit, zero } => {
+                let range = format!("{} to {}{}", number_text(min, div), number_text(max, div), unit.trim());
+                match zero {
+                    Some((_, name)) => format!("{range}, or {}", name.to_ascii_lowercase()),
+                    None => range,
+                }
+            }
+            Kind::Steps { steps, div, unit } => {
+                format!("{}{}", or(steps.iter().map(|&s| number_text(s, div)).collect()), unit.trim())
+            }
+        }
+    }
+
     /// The table's index of setting `key`.
     pub fn index(key: &str) -> Option<usize> {
         OPTS.iter().position(|o| o.key == key)
@@ -1716,9 +1947,33 @@ impl Settings {
         let words: Vec<&str> = args.split_whitespace().collect();
         match words.as_slice() {
             [] | ["help"] => {
-                let keys: Vec<&str> = OPTS.iter().map(|o| o.key).collect();
-                (format!("/atlas <setting> <value>, or seed <seed>. Settings: {}", keys.join(" ")), false)
+                let pages: Vec<&str> = HELP_PAGES.iter().map(|p| p.0).collect();
+                let lines = [
+                    "Atlas commands (Tab completes them):".to_owned(),
+                    "  /atlas <setting>: what it is and what it takes".to_owned(),
+                    "  /atlas <setting> <value>: change it, e.g. /atlas zoom 2".to_owned(),
+                    "  /atlas mode layer <y>: the maps at one height".to_owned(),
+                    "  /atlas seed <seed> (or off): slime chunks on a server".to_owned(),
+                    "  /atlas dimension: both maps show the next dimension".to_owned(),
+                    "  /atlas download (or download never): this server's map".to_owned(),
+                    format!("  /atlas help <page>: a page's settings ({})", pages.join(", ")),
+                    "All settings are also on the settings screen (Y).".to_owned(),
+                ];
+                (lines.join("\n"), false)
             }
+            ["help", page] => match HELP_PAGES.iter().find(|p| p.0.eq_ignore_ascii_case(page)) {
+                Some(&(_, page)) => {
+                    let mut lines = vec![format!("{}:", page.title())];
+                    for (i, o) in OPTS.iter().enumerate().filter(|(_, o)| o.page == page) {
+                        lines.push(format!("  {} = {} ({}): {}", o.key, o.stored(self.raw(i)), o.label, o.takes()));
+                    }
+                    (lines.join("\n"), false)
+                }
+                None => {
+                    let pages: Vec<&str> = HELP_PAGES.iter().map(|p| p.0).collect();
+                    (format!("Atlas: no page {page}; pages: {}", pages.join(", ")), false)
+                }
+            },
             ["mode", m, y] => {
                 let before = *self;
                 match self.set("mode", m).and_then(|()| self.set("layer", y)) {
@@ -1734,7 +1989,10 @@ impl Settings {
                 Err(e) => (format!("Atlas: {e}"), false),
             },
             [key] => match Opt::index(key) {
-                Some(i) => (format!("Atlas: {key} is {}", OPTS[i].stored(self.raw(i))), false),
+                Some(i) => {
+                    let o = OPTS[i];
+                    (format!("Atlas: {key} ({}) is {}; it takes {}", o.label, o.stored(self.raw(i)), o.takes()), false)
+                }
                 None => (format!("Atlas: no setting {key} (/atlas help)"), false),
             },
             _ => ("Atlas: /atlas help lists the settings".into(), false),
@@ -2036,11 +2294,14 @@ pub struct TileKey {
 }
 
 pub const MAP_TEXELS: i32 = 128;
-/// The deepest level: 8 blocks a texel.
-pub const MAX_LEVEL: u8 = 3;
+/// The deepest level: 128 blocks a texel.
+pub const MAX_LEVEL: u8 = 7;
 /// Blocks per GUI pixel, zoomed in and out the most.
 pub const MIN_BPP: f64 = 1.0 / 8.0;
-pub const MAX_BPP: f64 = 8.0;
+pub const MAX_BPP: f64 = 64.0;
+/// The most images the world map shows at once (of the game's 256 map
+/// texture slots): past it, the next level's fewer, coarser ones.
+pub const MAX_TILES: usize = 120;
 
 impl TileKey {
     /// The blocks `[x0, z0, x1, z1]` (inclusive) the image covers.
@@ -2051,7 +2312,8 @@ impl TileKey {
     }
 }
 
-/// The level whose texels show at a GUI pixel or more at `bpp`.
+/// The level whose texels show at a pixel or more at `bpp` blocks a
+/// pixel (a screen pixel: blocks a GUI pixel over the GUI scale).
 pub fn map_level(bpp: f64) -> u8 {
     if bpp <= 1.0 {
         return 0;
@@ -2066,7 +2328,8 @@ pub fn compose_map_tile(store: &mut Store, key: TileKey, how: Shading, out: &mut
     let [x0, z0, ..] = key.blocks();
     out.clear();
     out.resize((MAP_TEXELS * MAP_TEXELS * 4) as usize, 0);
-    let mut column = |x: i32, z: i32| store.column(x, z);
+    let far = key.level >= OVERVIEW_LEVEL;
+    let mut column = |x: i32, z: i32| if far { store.overview_column(x, z) } else { store.view_column(x, z) };
     for j in 0..MAP_TEXELS {
         for i in 0..MAP_TEXELS {
             let (x, z) = (x0 + i * n + n / 2, z0 + j * n + n / 2);
@@ -2134,12 +2397,21 @@ impl MapView {
         self.centre[1] -= f64::from(delta[1]) * self.bpp;
         self.follow = false;
     }
-    /// The images a `size` screen shows, with where each goes.
-    pub fn tiles(&self, size: [f32; 2], cut: Cut) -> Vec<(TileKey, [f32; 4])> {
-        let level = map_level(self.bpp);
-        let span = f64::from(MAP_TEXELS << level);
+    /// The images a `size` screen at GUI `scale` shows, with where each
+    /// goes: a texel a screen pixel, or coarser past `MAX_TILES` images.
+    pub fn tiles(&self, size: [f32; 2], cut: Cut, scale: f32) -> Vec<(TileKey, [f32; 4])> {
         let [x0, z0] = self.world([0.0, 0.0], size);
         let [x1, z1] = self.world(size, size);
+        let count = |level: u8| {
+            let span = f64::from(MAP_TEXELS << level);
+            let n = |a: f64, b: f64| ((b / span).floor() - (a / span).floor() + 1.0).max(1.0);
+            (n(x0, x1) * n(z0, z1)) as usize
+        };
+        let mut level = map_level(self.bpp / f64::from(scale.max(1.0)));
+        while level < MAX_LEVEL && count(level) > MAX_TILES {
+            level += 1;
+        }
+        let span = f64::from(MAP_TEXELS << level);
         let mut out = Vec::new();
         for tz in (z0 / span).floor() as i32..=(z1 / span).floor() as i32 {
             for tx in (x0 / span).floor() as i32..=(x1 / span).floor() as i32 {
@@ -2655,6 +2927,15 @@ pub struct State {
     pub map_dimension: Option<String>,
     /// Whether the server shares its map.
     pub share_link: ShareLink,
+    /// Whether to download this server's map when it offers it: asked on
+    /// the world map, kept per server; None until answered.
+    pub share_answer: Option<bool>,
+    /// Not now: asked again on the next connection.
+    pub share_later: bool,
+    /// The chat was told of the offer.
+    pub share_told: bool,
+    /// A line for this player's own chat (never sent), once.
+    pub tell: Option<String>,
     /// What both maps show now.
     pub cut: Cut,
     /// A change of cut waiting for the toggle timer.
@@ -2731,6 +3012,10 @@ impl Default for State {
             scans: HashMap::new(),
             map_dimension: None,
             share_link: ShareLink::default(),
+            share_answer: None,
+            share_later: false,
+            share_told: false,
+            tell: None,
             cut: Cut::Surface,
             pending_cut: None,
             mini_key: None,
@@ -2923,6 +3208,11 @@ fn base_domain(address: &str) -> String {
 /// The file a world's waypoints are kept in, named after its key.
 pub fn world_file(key: &str) -> String {
     format!("{}.txt", safe_name(key))
+}
+
+/// The file whether to download a server's map is kept in.
+pub fn download_file(key: &str) -> String {
+    format!("{}.download", safe_name(key))
 }
 
 /// The file a world's seed is kept in.
@@ -3299,6 +3589,12 @@ impl State {
             .as_deref()
             .and_then(|k| std::fs::read_to_string(dir.join(seed_file(k))).ok())
             .and_then(|t| t.trim().parse().ok());
+        self.share_answer = key
+            .as_deref()
+            .and_then(|k| std::fs::read_to_string(dir.join(download_file(k))).ok())
+            .and_then(|t| parse_flag(t.trim()));
+        self.share_later = false;
+        self.share_told = false;
         self.mini_key = None;
         self.world = key;
         self.dir = Some(dir);
@@ -3340,6 +3636,11 @@ impl State {
     /// What to say back.
     pub fn command(&mut self, args: &str) -> String {
         let words: Vec<&str> = args.split_whitespace().collect();
+        match words.as_slice() {
+            ["download"] => return self.answer_share(true),
+            ["download", "never" | "no" | "off"] => return self.answer_share(false),
+            _ => {}
+        }
         if words.first() == Some(&"seed") {
             let rest = args.trim_start().strip_prefix("seed").unwrap_or("").trim();
             return self.set_seed(rest);
@@ -4103,6 +4404,9 @@ impl State {
                     self.centre_on(h);
                 }
             }
+            Action::ShareDownload => self.tell = Some(self.answer_share(true)),
+            Action::ShareNever => self.tell = Some(self.answer_share(false)),
+            Action::ShareLater => self.share_later = true,
             Action::ToggleDraw => {
                 self.end_stroke();
                 self.draw.on = !self.draw.on;
@@ -4113,6 +4417,62 @@ impl State {
                     self.save_sheet();
                 }
             }
+        }
+    }
+
+    /// Whether this server's map is to be downloaded (asked first).
+    pub fn share_wanted(&self) -> bool {
+        self.share_answer == Some(true)
+    }
+
+    /// Whether the world map asks about the server's offer now.
+    pub fn share_asks(&self) -> bool {
+        self.share_link.offered && self.share_answer.is_none() && !self.share_later && self.settings().server_map
+    }
+
+    /// Download this server's map (or never), kept for the next time.
+    /// What to say back.
+    pub fn answer_share(&mut self, yes: bool) -> String {
+        let (Some(dir), Some(key)) = (self.dir.clone(), self.world.clone()) else {
+            return "Atlas: join a server first".into();
+        };
+        self.share_answer = Some(yes);
+        let text = if yes { "on" } else { "off" };
+        let _ = std::fs::create_dir_all(&dir).and_then(|()| write_whole(&dir.join(download_file(&key)), text.as_bytes()));
+        if yes {
+            "Atlas: downloading this server's map (/atlas download never to stop)".into()
+        } else {
+            "Atlas: this server's map won't be downloaded (/atlas download to change that)".into()
+        }
+    }
+
+    /// A line for the player's own chat: an answer's, else once an offer
+    /// the one pointing to the world map's question.
+    pub fn take_share_hint(&mut self) -> Option<String> {
+        if let Some(line) = self.tell.take() {
+            return Some(line);
+        }
+        if !self.share_asks() || std::mem::replace(&mut self.share_told, true) {
+            return None;
+        }
+        Some("Atlas: this server shares its map. Open the world map (M) to download it.".into())
+    }
+
+    /// The world map's question about the server's map, centred near the top.
+    fn draw_share_ask(&self, out: &mut Out<'_>, size: [f32; 2]) {
+        let line = "This server shares its map. Download it into yours?";
+        let w = (out.width(line) + 16.0).max(240.0).min(size[0] - 8.0);
+        let (x, y) = (((size[0] - w) / 2.0).round(), 28.0);
+        out.boxed([x, y, w, 40.0], PANEL_EDGE, PANEL);
+        let tw = out.width(line);
+        out.text(line, [(size[0] - tw) / 2.0, y + 5.0], INK);
+        let buttons = [("Download", Action::ShareDownload), ("Not now", Action::ShareLater), ("Never", Action::ShareNever)];
+        let widths: Vec<f32> = buttons.iter().map(|(l, _)| out.width(l) + 12.0).collect();
+        let total: f32 = widths.iter().sum::<f32>() + 6.0 * (buttons.len() - 1) as f32;
+        let mut bx = ((size[0] - total) / 2.0).round();
+        for ((label, action), bw) in buttons.into_iter().zip(widths) {
+            out.button([bx, y + 20.0, bw, 14.0], label, action, false);
+            bx += bw + 6.0;
         }
     }
 
@@ -4557,7 +4917,8 @@ impl State {
     pub fn tile_stamp(&mut self, key: TileKey) -> u64 {
         let [x0, z0, x1, z1] = key.blocks();
         let sky = self.shading(key.cut).sky.to_bits();
-        self.view_maps().store(key.cut).stamp(x0, z0, x1, z1) ^ u64::from(sky) << 40
+        let far = key.level >= OVERVIEW_LEVEL;
+        self.view_maps().store(key.cut).view_stamp(x0, z0, x1, z1, far) ^ u64::from(sky) << 40
     }
 
     /// The day time `ticks` now, None where there is no sky (or no clock):
@@ -4576,6 +4937,12 @@ impl State {
     pub fn shading(&self, cut: Cut) -> Shading {
         let sky = if cut == Cut::Surface { self.sky } else { 15.0 };
         Shading { sky, ..self.settings().shading() }
+    }
+
+    /// A new frame of the world map's images: its few region reads again.
+    pub fn begin_map_frame(&mut self) {
+        let cut = self.map_cut();
+        self.view_maps().store(cut).view_budget = Some(MAP_READS);
     }
 
     /// World map image `key`, 128 x 128 RGBA.
@@ -5059,7 +5426,7 @@ impl State {
         // Dots a little under 1/40 of the map across, as Xaero's, or icons.
         let dot = (side / 100.0).clamp(0.5, 2.0) * st.dot_size as f32 / 2.0;
         let icons = st.icons == 2 || (st.icons == 1 && self.tab_held);
-        let icon = (side / 15.0).clamp(4.5, 10.0) * st.icon_size;
+        let icon = (side / 20.0).clamp(3.5, 7.5) * st.icon_size;
         if st.dots {
             let mut sorted: Vec<&Dot> = dots.iter().collect();
             sorted.sort_by_key(|d| d.kind.layer());
@@ -5234,7 +5601,7 @@ impl State {
             self.centre_on(h);
         }
         out.fill([0.0, 0.0, size[0], size[1]], MAP_VOID);
-        for (key, dst) in self.map.tiles(size, self.map_cut()) {
+        for (key, dst) in self.map.tiles(size, self.map_cut(), self.gui_scale) {
             if let Some(&slot) = self.images.slots.get(&key) {
                 let t = MAP_TEXELS as f32;
                 out.draws.push(Draw::Image(slot, [0.0, 0.0, t, t], dst, 0xFFFF_FFFF));
@@ -5284,7 +5651,11 @@ impl State {
         }
 
         // Top left: the scale (pixels a block).
-        let scale = format!("Scale: {}x", trim_float(1.0 / self.map.bpp));
+        let scale = if self.map.bpp > 1.0 {
+            format!("Scale: 1/{}x", trim_float(self.map.bpp))
+        } else {
+            format!("Scale: {}x", trim_float(1.0 / self.map.bpp))
+        };
         out.text(&scale, [4.0, 4.0], INK);
 
         // Top centre: the block under the pointer.
@@ -5362,6 +5733,9 @@ impl State {
         };
         let hint = out.fit(&hint, x - 8.0);
         out.text(&hint, [4.0, size[1] - 14.0], MUTED);
+        if live && self.share_asks() {
+            self.draw_share_ask(out, size);
+        }
     }
 
     /// The world map's portal highlights and the server's view distance
@@ -6996,6 +7370,47 @@ mod tests {
     }
 
     #[test]
+    fn a_servers_map_downloads_only_once_the_player_says_so() {
+        let dir = std::env::temp_dir().join(format!("atlas-ask-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let measure = |t: &str| t.len() as f32 * 6.0;
+        let h = here(OVERWORLD);
+        let mut s = State::default();
+        s.load_world(Some("server-example.net".into()), dir.clone());
+        assert!(!s.share_asks() && s.take_share_hint().is_none());
+        s.share_link.offered = true;
+        // Offered: not downloading, asked once in chat and on the world map.
+        assert!(!s.share_wanted() && s.share_asks());
+        assert!(s.take_share_hint().is_some_and(|l| l.contains("world map")));
+        assert!(s.take_share_hint().is_none());
+        s.open_map(Some(&h), None);
+        let (_, widgets) = s.screen([480.0, 270.0], [0.0, 0.0], Some(&h), &measure);
+        let download = widgets.iter().find(|w| w.action == Action::ShareDownload).expect("asked");
+        let at = [download.rect[0] + 1.0, download.rect[1] + 1.0];
+        s.press(0, at, &widgets, Some(&h));
+        assert!(s.share_wanted() && !s.share_asks());
+        // Said in this player's own chat, not sent to the server.
+        assert!(s.take_say().is_none());
+        assert!(s.take_share_hint().is_some_and(|l| l.contains("downloading")));
+        // Kept for this server.
+        let mut again = State::default();
+        again.load_world(Some("server-example.net".into()), dir.clone());
+        assert!(again.share_wanted());
+        assert!(again.command("download never").contains("won't"));
+        let mut third = State::default();
+        third.load_world(Some("server-example.net".into()), dir.clone());
+        third.share_link.offered = true;
+        assert!(!third.share_wanted() && !third.share_asks());
+        // Another server asks again; Not now only till the next connection.
+        third.load_world(Some("server-other.net".into()), dir.clone());
+        third.share_link.offered = true;
+        assert!(third.share_asks());
+        third.act(Action::ShareLater, Some(&h));
+        assert!(!third.share_asks() && !third.share_wanted());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn world_files_are_plain_names() {
         assert_eq!(world_file("server-mc.hypixel.net:25565"), "server-mc.hypixel.net_25565.txt");
         assert_eq!(world_file("world-New World"), "world-New_World.txt");
@@ -8339,7 +8754,28 @@ mod tests {
         let i = Opt::index("zoom").unwrap();
         assert_eq!(OPTS[i].text(back.raw(i)), "Blocks per Pixel: 2");
         let mut back = back;
-        assert_eq!(back.command("zoom").0, "Atlas: zoom is 2");
+        assert_eq!(back.command("zoom").0, "Atlas: zoom (Blocks per Pixel) is 2; it takes 0.25, 0.5, 1, 2, 4, 8 or 16");
+        // Help: the commands, then any page's settings with their values.
+        let help = back.command("").0;
+        assert!(help.lines().count() >= 6 && help.contains("/atlas help <page>"), "{help}");
+        assert_eq!(back.command("help").0, help);
+        let misc = back.command("help misc").0;
+        assert!(misc.starts_with("Miscellaneous Settings:"), "{misc}");
+        assert!(misc.contains("share_map = auto (Share Map with Players): auto, off, ops or all"), "{misc}");
+        assert!(back.command("help nowhere").0.contains("pages: minimap"));
+        // Every setting is on some page's help, and the chat box completes
+        // each with what it takes.
+        let all: String = HELP_PAGES.iter().map(|p| back.command(&format!("help {}", p.0)).0).collect();
+        let words = command_words();
+        assert_eq!(words.len(), OPTS.len());
+        for w in &words {
+            assert!(all.contains(&format!("  {} = ", w.key)), "{} on no page", w.key);
+            assert!(!w.values.is_empty() || w.number.is_some(), "{} completes nothing", w.key);
+            for v in &w.values {
+                let mut probe = back;
+                assert!(probe.set(w.key, v).is_ok(), "{} {v}", w.key);
+            }
+        }
         // Options > Mods: a title that does nothing, then the main switches.
         let mut s = Settings::default();
         s.click(0);
@@ -8668,12 +9104,14 @@ mod tests {
         assert_eq!(map_level(1.0), 0);
         assert_eq!(map_level(1.5), 1);
         assert_eq!(map_level(8.0), 3);
+        assert_eq!(map_level(64.0), 6);
+        assert_eq!(map_level(1000.0), MAX_LEVEL);
         let view = MapView {
             centre: [0.0, 0.0],
             bpp: 2.0,
             ..MapView::default()
         };
-        let tiles = view.tiles([400.0, 200.0], Cut::Surface);
+        let tiles = view.tiles([400.0, 200.0], Cut::Surface, 1.0);
         // 800 x 400 blocks at 256 blocks a tile: x -400..400, z -200..200.
         assert_eq!(tiles.len(), 4 * 2);
         let (key, dst) = tiles[0];
@@ -8687,6 +9125,83 @@ mod tests {
         assert_eq!(img[3], 255);
         let o = (20 * 128 + 20) * 4;
         assert_eq!(img[o + 3], 0);
+    }
+
+    #[test]
+    fn world_map_detail_follows_screen_pixels_with_a_cap_on_images() {
+        let view = MapView { centre: [0.0, 0.0], bpp: 4.0, ..MapView::default() };
+        // 4 blocks a GUI pixel at GUI scale 4: a block a screen pixel.
+        assert_eq!(view.tiles([400.0, 200.0], Cut::Surface, 4.0)[0].0.level, 0);
+        assert_eq!(view.tiles([400.0, 200.0], Cut::Surface, 1.0)[0].0.level, 2);
+        // The furthest out on a big screen: never past the cap.
+        for scale in [1.0, 2.0, 3.0, 4.0] {
+            let far = MapView { bpp: MAX_BPP, ..view.clone() };
+            let tiles = far.tiles([960.0, 540.0], Cut::Surface, scale);
+            assert!(tiles.len() <= MAX_TILES, "{scale}: {}", tiles.len());
+        }
+        let near = MapView { bpp: 1.0, ..view };
+        assert!(near.tiles([960.0, 540.0], Cut::Surface, 4.0).len() <= MAX_TILES);
+    }
+
+    #[test]
+    fn zoomed_out_the_map_reads_a_few_regions_a_frame_and_keeps_their_overviews() {
+        let dir = std::env::temp_dir().join(format!("atlas-overview-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::default();
+        store.open(Some(dir.clone()));
+        // A chunk in each of 8 x 8 regions: 4096 blocks square, a level 5
+        // image, whose texels (2 chunks) show their second chunk's centre.
+        for rz in 0..8 {
+            for rx in 0..8 {
+                store.put(rx * REGION + 1, rz * REGION + 1, grass(64));
+            }
+        }
+        assert!(store.save());
+        let key = TileKey { cut: Cut::Surface, level: 5, x: 0, z: 0 };
+        let [x0, z0, x1, z1] = key.blocks();
+        let mut again = Store::default();
+        again.open(Some(dir.clone()));
+        let mut img = Vec::new();
+        let mut frames = 0;
+        let mut last = 0;
+        loop {
+            frames += 1;
+            again.view_budget = Some(MAP_READS);
+            let stamp = again.view_stamp(x0, z0, x1, z1, true);
+            again.view_budget = Some(MAP_READS);
+            compose_map_tile(&mut again, key, Shading::default(), &mut img);
+            if stamp == last {
+                break;
+            }
+            last = stamp;
+            assert!(frames < 64, "never all read");
+        }
+        // 64 regions at 3 a frame (stamps and images both): 11 frames, and
+        // one more to see it settled.
+        assert!((11..=23).contains(&frames), "{frames}");
+        assert!(again.regions_loaded() <= MAX_REGIONS);
+        let drawn = img.chunks(4).filter(|p| p[3] == 255).count();
+        assert!(drawn >= 64, "{drawn}");
+        // Far from anything explored: known at once, with no read spent.
+        again.view_budget = Some(0);
+        let empty = again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191, true);
+        again.view_budget = Some(MAP_READS);
+        assert_eq!(again.view_stamp(100_000, 100_000, 100_000 + 8191, 100_000 + 8191, true), empty);
+        assert_eq!(again.view_budget, Some(MAP_READS));
+        // Regions let go keep their overviews: drawing again reads nothing.
+        for i in 0..MAX_REGIONS as i32 + 5 {
+            again.put((100 + i) * REGION, 0, grass(64));
+        }
+        again.view_budget = Some(0);
+        assert_eq!(again.view_stamp(x0, z0, x1, z1, true), last);
+        let mut img2 = Vec::new();
+        compose_map_tile(&mut again, key, Shading::default(), &mut img2);
+        assert_eq!(img, img2);
+        // A change shows: its region's overview follows the store.
+        again.put(3, 3, grass(90));
+        again.view_budget = Some(0);
+        assert_ne!(again.view_stamp(x0, z0, x1, z1, true), last);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

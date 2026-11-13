@@ -14,5 +14,7 @@ fn atlas_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool
         return;
     }
     let said = m::with(|s| s.command(args));
-    game.native_chat(&said);
+    for line in said.lines() {
+        game.native_chat(line);
+    }
 }

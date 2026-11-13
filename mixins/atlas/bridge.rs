@@ -590,6 +590,9 @@ pub(super) fn frame(game: &mut Game<'_>) {
     if let Some(changed) = m::with(|s| s.take_changed_settings()) {
         game.native_set_setting(m::ID, m::SETTINGS_FILE, &changed.to_text());
     }
+    if let Some(remote) = game.remote.as_mut() {
+        chat_tree(&mut remote.chat_tree);
+    }
     let key = world_key(game, settings.server_folder);
     let dimension = game.native_player().map(|p| p.dimension.to_owned());
     m::with(|s| {
@@ -797,8 +800,13 @@ fn upload_minimap(game: &mut Game<'_>) {
 
 /// Composes and uploads the world map's tiles that changed, a few a frame.
 fn upload_map_tiles(game: &mut Game<'_>) {
-    let tiles = m::with(|s| s.map.tiles(s.screen_size, s.map_cut()));
+    let tiles = m::with(|s| {
+        s.begin_map_frame();
+        s.map.tiles(s.screen_size, s.map_cut(), s.gui_scale)
+    });
     let mut budget = 6;
+    // Composing far out reads many columns: a few milliseconds a frame at most.
+    let started = Instant::now();
     for (key, _) in tiles {
         let id = m::with(|s| s.images.id(key));
         let Some((slot, fresh)) = slot_for(game, id) else {
@@ -811,7 +819,7 @@ fn upload_map_tiles(game: &mut Game<'_>) {
             m::with(|s| s.images.slots.insert(key, slot));
             continue;
         }
-        if budget == 0 {
+        if budget == 0 || started.elapsed() > Duration::from_millis(4) {
             if fresh {
                 m::with(|s| s.images.slots.remove(&key));
             }
@@ -848,7 +856,56 @@ const FACES: &[(&str, &str, [u32; 4])] = &[
     ("witch", "witch", [8, 8, 8, 10]),
     ("wolf", "wolf/wolf", [4, 4, 6, 6]),
     ("iron_golem", "iron_golem/iron_golem", [8, 8, 8, 10]),
+    ("cat", "cat/cat_tabby", [5, 5, 5, 4]),
+    ("ocelot", "cat/ocelot", [5, 5, 5, 4]),
+    ("cod", "fish/cod", [0, 7, 7, 4]),
+    ("salmon", "fish/salmon", [0, 8, 8, 5]),
+    ("pufferfish", "fish/pufferfish", [8, 8, 8, 8]),
+    ("tropical_fish", "fish/tropical_a", [0, 6, 6, 3]),
+    ("fox", "fox/fox", [7, 11, 8, 6]),
+    ("bee", "bee/bee", [10, 10, 7, 7]),
+    ("axolotl", "axolotl/axolotl_lucy", [5, 6, 8, 5]),
+    ("panda", "panda/panda", [9, 15, 13, 10]),
+    ("polar_bear", "bear/polarbear", [7, 7, 7, 7]),
+    ("squid", "squid/squid", [12, 12, 12, 16]),
+    ("glow_squid", "squid/glow_squid", [12, 12, 12, 16]),
+    ("slime", "slime/slime", [8, 8, 8, 8]),
+    ("magma_cube", "slime/magmacube", [8, 8, 8, 8]),
+    ("ghast", "ghast/ghast", [32, 32, 32, 32]),
+    ("piglin", "piglin/piglin", [8, 8, 10, 8]),
+    ("zombified_piglin", "piglin/zombified_piglin", [8, 8, 10, 8]),
+    ("piglin_brute", "piglin/piglin_brute", [8, 8, 10, 8]),
+    ("hoglin", "hoglin/hoglin", [80, 4, 16, 10]),
+    ("zoglin", "hoglin/zoglin", [80, 4, 16, 10]),
+    ("strider", "strider/strider", [16, 16, 16, 14]),
+    ("guardian", "guardian/guardian", [16, 16, 12, 12]),
+    ("elder_guardian", "guardian/guardian_elder", [16, 16, 12, 12]),
+    ("pillager", "illager/pillager", [8, 8, 8, 10]),
+    ("vindicator", "illager/vindicator", [8, 8, 8, 10]),
+    ("evoker", "illager/evoker", [8, 8, 8, 10]),
+    ("ravager", "illager/ravager", [16, 16, 16, 20]),
+    ("zombie_villager", "zombie_villager/zombie_villager", [8, 8, 8, 10]),
+    ("wandering_trader", "wandering_trader/wandering_trader", [8, 8, 8, 10]),
+    ("horse", "horse/horse_brown", [0, 16, 10, 8]),
+    ("donkey", "horse/donkey", [0, 16, 10, 8]),
+    ("mule", "horse/mule", [0, 16, 10, 8]),
+    ("llama", "llama/llama_creamy", [9, 9, 4, 4]),
+    ("trader_llama", "llama/llama_creamy", [9, 9, 4, 4]),
+    ("phantom", "phantom/phantom", [5, 5, 7, 3]),
+    ("warden", "warden/warden", [10, 42, 16, 16]),
+    ("allay", "allay/allay", [5, 5, 5, 5]),
+    ("snow_golem", "snow_golem/snow_golem", [8, 8, 8, 8]),
+    ("wither", "wither/wither", [8, 8, 8, 8]),
+    ("bogged", "skeleton/bogged", [8, 8, 8, 8]),
+    ("breeze", "breeze/breeze", [8, 8, 8, 8]),
+    ("dolphin", "dolphin/dolphin", [6, 6, 8, 7]),
+    ("mooshroom", "cow/mooshroom_red", [6, 6, 8, 8]),
+    ("bat", "bat/bat", [0, 7, 9, 6]),
+    ("blaze", "blaze/blaze", [8, 8, 8, 8]),
 ];
+
+// The sheet is 8 x 8 cells.
+const _: () = assert!(FACES.len() <= 64);
 
 /// A PNG as (width, RGBA).
 fn read_png(path: &std::path::Path) -> Option<(usize, Vec<u8>)> {
@@ -887,16 +944,19 @@ fn upload_faces(game: &mut Game<'_>) {
             continue;
         };
         let (cx, cy) = (i % 8 * 16, i / 8 * 16);
-        for y in 0..*fh as usize {
-            for x in 0..*fw as usize {
-                let from = ((*fy as usize + y) * width + *fx as usize + x) * 4;
+        // Faces over 16 texels (a ghast's 32) every k-th texel: a cell's 16.
+        let k = (*fw.max(fh)).div_ceil(16) as usize;
+        let (w, h) = ((*fw as usize / k).max(1), (*fh as usize / k).max(1));
+        for y in 0..h {
+            for x in 0..w {
+                let from = ((*fy as usize + y * k) * width + *fx as usize + x * k) * 4;
                 let to = ((cy + y) * m::MINI + cx + x) * 4;
                 if let (Some(px), Some(out)) = (rgba.get(from..from + 4), sheet.get_mut(to..to + 4)) {
                     out.copy_from_slice(px);
                 }
             }
         }
-        faces.insert(format!("minecraft:{mob}"), [cx as f32, cy as f32, *fw as f32, *fh as f32]);
+        faces.insert(format!("minecraft:{mob}"), [cx as f32, cy as f32, w as f32, h as f32]);
     }
     if upload(game, slot, sheet) {
         m::with(|s| {
@@ -1428,16 +1488,22 @@ pub(super) fn share_from_server(channel: &str, data: &[u8]) {
 /// (again for each dimension), and the shared chunks coloured within a
 /// budget. The player's own scan of a loaded chunk wins over the server's.
 fn share_client(game: &mut Game<'_>, settings: &m::Settings) {
-    if game.remote.is_none() {
-        // Not on a server: an offer is of the next one only.
+    // Not on a server, or on one's own (single player, a world opened to
+    // LAN): an offer is of the next one only; one's own map is already here.
+    if game.remote.is_none() || game.integrated.is_some() {
         m::with(|s| s.share_link = m::ShareLink::default());
         return;
     }
     if !settings.server_map {
         return;
     }
+    if let Some(hint) = m::with(|s| s.take_share_hint()) {
+        game.native_chat(&hint);
+    }
+    // Downloaded only once the player said so (the world map asks).
     let (offered, dir, hello_for, since, dimension) = m::with(|s| {
-        (s.share_link.offered, s.maps.dir.clone(), s.maps.shared.hello_for.clone(), s.maps.shared.since, s.map_dimension.clone())
+        let offered = s.share_link.offered && s.share_wanted();
+        (offered, s.maps.dir.clone(), s.maps.shared.hello_for.clone(), s.maps.shared.since, s.map_dimension.clone())
     });
     if offered
         && dir.is_some()
@@ -1505,4 +1571,54 @@ fn share_client(game: &mut Game<'_>, settings: &m::Settings) {
             m::with(|s| s.put_shared(key, tile));
         }
     });
+}
+
+/// `/atlas` in the chat box's tree, once a frame when the tree has none (a
+/// new one each connection and when the server sends its own): each
+/// subcommand and setting and what each takes, so the chat box lists and
+/// completes them. The command still runs as the mod's own (`native_command`).
+fn chat_tree(tree: &mut horizon_client::command::Dispatcher) {
+    use horizon_client::command::{ArgType, Dispatcher, MOD_COMMAND};
+    // A server's own /atlas keeps its tree.
+    if tree.find("atlas").is_some() {
+        return;
+    }
+    fn word(d: &mut Dispatcher, parent: usize, name: &str) -> usize {
+        let node = d.literal(parent, name);
+        d.executes(node, MOD_COMMAND)
+    }
+    fn arg(d: &mut Dispatcher, parent: usize, name: &str, ty: ArgType) -> usize {
+        let node = d.argument(parent, name, ty);
+        d.executes(node, MOD_COMMAND)
+    }
+    let d = tree;
+    let root = word(d, 0, "atlas");
+    let help = word(d, root, "help");
+    for (page, _) in m::HELP_PAGES {
+        word(d, help, page);
+    }
+    word(d, root, "dimension");
+    let download = word(d, root, "download");
+    word(d, download, "never");
+    let seed = word(d, root, "seed");
+    word(d, seed, "off");
+    arg(d, seed, "seed", ArgType::Greedy);
+    for w in m::command_words() {
+        let key = word(d, root, w.key);
+        for v in &w.values {
+            let node = word(d, key, v);
+            // `/atlas mode layer <y>`: the Layer mode at a height.
+            if w.key == "mode" && v == "layer" {
+                arg(d, node, "y", ArgType::Integer { min: -2048, max: 2048 });
+            }
+        }
+        if let Some((min, max, whole)) = w.number {
+            let ty = if whole {
+                ArgType::Integer { min: min as i32, max: max as i32 }
+            } else {
+                ArgType::Double { min, max }
+            };
+            arg(d, key, "value", ty);
+        }
+    }
 }
